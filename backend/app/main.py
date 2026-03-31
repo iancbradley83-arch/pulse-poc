@@ -176,3 +176,10 @@ if __name__ == "__main__":
     import os
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
+else:
+    # When imported by uvicorn directly, ensure PORT is respected
+    import os
+    _port = os.getenv("PORT")
+    if _port:
+        import logging
+        logging.getLogger("uvicorn").info(f"PORT env var detected: {_port}")
