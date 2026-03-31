@@ -270,7 +270,8 @@ function renderPrematchCard(card, index) {
   const stats = renderStats(card.stats);
   const progress = card.progress ? renderProgress(card.progress) : '';
   const tweets = card.tweets.map(renderTweet).join('');
-  const market = m ? renderMarket(m) : '';
+  const gameLabel = `${g.home_team.short_name} vs ${g.away_team.short_name}`;
+  const market = m ? renderMarket(m, false, gameLabel) : '';
 
   return `
     <div class="card animate-in" style="animation-delay:${index * 0.06}s">
@@ -312,7 +313,8 @@ function renderLiveCard(card, index) {
   const stats = renderStats(card.stats);
   const progress = card.progress ? renderProgress(card.progress) : '';
   const tweets = card.tweets.map(renderTweet).join('');
-  const market = m ? renderMarket(m, true) : '';
+  const gameLabel = `${g.home_team.short_name} vs ${g.away_team.short_name}`;
+  const market = m ? renderMarket(m, true, gameLabel) : '';
 
   const homeLeading = g.home_score >= g.away_score;
 
@@ -427,7 +429,7 @@ function renderTweet(tw) {
     </div>`;
 }
 
-function renderMarket(m, isLive = false) {
+function renderMarket(m, isLive = false, gameLabel = '') {
   // Detect if odds have moved
   const hasMovement = m.selections.some(s => s.previous_odds);
   let movementHtml = '';
@@ -436,6 +438,8 @@ function renderMarket(m, isLive = false) {
   }
 
   const suspended = m.status === 'suspended';
+  const safeMLabel = m.label.replace(/'/g, "\\'");
+  const safeGame = gameLabel.replace(/'/g, "\\'");
 
   const selections = m.selections.map((sel, i) => {
     const isFirst = i === 0;
@@ -444,8 +448,12 @@ function renderMarket(m, isLive = false) {
     const prevOdds = sel.previous_odds && !suspended
       ? `<div class="odds-prev">was ${sel.previous_odds}</div>` : '';
     const oddsColor = suspended ? 'neutral' : (isFirst ? '' : 'neutral');
+    const safeSelLabel = sel.label.replace(/'/g, "\\'");
+    const clickHandler = suspended
+      ? ''
+      : `onclick="openBetSlip('${safeSelLabel}', '${sel.odds}', '${safeMLabel}', '${safeGame}', '${m.id || ''}')"`;
     return `
-      <div class="market-btn ${highlighted} ${suspClass}">
+      <div class="market-btn ${highlighted} ${suspClass}" ${clickHandler}>
         <div class="selection">${sel.label}</div>
         <div class="odds ${oddsColor}">${suspended ? '—' : sel.odds}</div>
         ${prevOdds}
@@ -460,6 +468,85 @@ function renderMarket(m, isLive = false) {
       </div>
       <div class="market-options">${selections}</div>
     </div>`;
+}
+
+// ── Bet Slip ──
+let _betOdds = null;
+
+function openBetSlip(selLabel, odds, marketLabel, gameLabel, marketId) {
+  _betOdds = odds;
+
+  document.getElementById('bss-selection-label').textContent = selLabel;
+  document.getElementById('bss-odds-badge').textContent = odds;
+  document.getElementById('bss-market-label').textContent = marketLabel;
+  document.getElementById('bss-game-label').textContent = gameLabel || '';
+
+  // Reset state
+  document.getElementById('stake-input').value = '';
+  document.getElementById('payout-value').textContent = '—';
+  document.getElementById('payout-profit').textContent = '—';
+  document.getElementById('place-bet-btn').disabled = true;
+  document.getElementById('place-bet-btn').style.display = '';
+  document.getElementById('bet-confirmed').style.display = 'none';
+
+  document.getElementById('bet-slip-overlay').classList.add('open');
+  document.getElementById('bet-slip-drawer').classList.add('open');
+
+  // Focus stake input after transition
+  setTimeout(() => document.getElementById('stake-input').focus(), 450);
+}
+
+function closeBetSlip() {
+  document.getElementById('bet-slip-overlay').classList.remove('open');
+  document.getElementById('bet-slip-drawer').classList.remove('open');
+}
+
+function setStake(amount) {
+  document.getElementById('stake-input').value = amount;
+  updatePayout();
+}
+
+function updatePayout() {
+  const stakeInput = document.getElementById('stake-input');
+  const stake = parseFloat(stakeInput.value);
+  const btn = document.getElementById('place-bet-btn');
+
+  if (!stake || stake <= 0 || !_betOdds) {
+    document.getElementById('payout-value').textContent = '—';
+    document.getElementById('payout-profit').textContent = '—';
+    btn.disabled = true;
+    return;
+  }
+
+  // Parse American odds to payout multiplier
+  const oddsNum = parseInt(_betOdds.toString().replace(/[^0-9-+]/g, ''), 10);
+  let profit;
+  if (oddsNum > 0) {
+    profit = stake * (oddsNum / 100);
+  } else {
+    profit = stake * (100 / Math.abs(oddsNum));
+  }
+  const payout = stake + profit;
+
+  document.getElementById('payout-value').textContent = `$${payout.toFixed(2)}`;
+  document.getElementById('payout-profit').textContent = `+$${profit.toFixed(2)}`;
+  btn.disabled = false;
+}
+
+function placeBet() {
+  const stake = parseFloat(document.getElementById('stake-input').value);
+  const selLabel = document.getElementById('bss-selection-label').textContent;
+  const odds = document.getElementById('bss-odds-badge').textContent;
+  const payout = document.getElementById('payout-value').textContent;
+
+  // Show confirmation state
+  document.getElementById('place-bet-btn').style.display = 'none';
+  document.getElementById('confirmed-desc').textContent =
+    `${selLabel} @ ${odds} — potential payout ${payout}`;
+  document.getElementById('bet-confirmed').style.display = '';
+
+  // Auto-close after a moment
+  setTimeout(() => closeBetSlip(), 2200);
 }
 
 // ── Momentum Chart (for momentum shift events) ──

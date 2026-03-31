@@ -90,6 +90,63 @@
     <div class="sim-controls" id="sim-controls" style="display:none;">
       <button onclick="startSimulator()" id="sim-btn">&#9654; Start Sim</button>
     </div>
+
+    <!-- Bet Slip Overlay -->
+    <div class="bet-slip-overlay" id="bet-slip-overlay" onclick="closeBetSlip()"></div>
+
+    <!-- Bet Slip Drawer -->
+    <div class="bet-slip-drawer" id="bet-slip-drawer">
+      <div class="bet-slip-handle"></div>
+      <div class="bet-slip-header">
+        <div>
+          <div class="bet-slip-title" id="bss-market-label">Market</div>
+          <div class="bet-slip-subtitle" id="bss-game-label">Game</div>
+        </div>
+        <div class="bet-slip-close" onclick="closeBetSlip()">&#10005;</div>
+      </div>
+
+      <div class="bss-selection-row">
+        <div class="bss-pill" id="bss-selection-label">Over</div>
+        <div class="bss-odds-badge" id="bss-odds-badge">-110</div>
+      </div>
+
+      <div class="stake-section">
+        <div class="stake-label-row">
+          <span class="stake-label">Stake</span>
+          <span class="stake-balance">Balance: $500.00</span>
+        </div>
+        <div class="stake-input-wrap">
+          <span class="stake-currency">$</span>
+          <input type="number" id="stake-input" class="stake-input" placeholder="0.00" min="1" step="0.50" oninput="updatePayout()">
+        </div>
+        <div class="quick-stakes">
+          <button class="quick-stake-btn" onclick="setStake(5)">$5</button>
+          <button class="quick-stake-btn" onclick="setStake(10)">$10</button>
+          <button class="quick-stake-btn" onclick="setStake(25)">$25</button>
+          <button class="quick-stake-btn" onclick="setStake(50)">$50</button>
+        </div>
+      </div>
+
+      <div class="payout-section">
+        <div class="payout-row">
+          <span class="payout-label">Potential payout</span>
+          <span class="payout-value" id="payout-value">—</span>
+        </div>
+        <div class="payout-row payout-row-profit">
+          <span class="payout-label">Profit</span>
+          <span class="payout-profit" id="payout-profit">—</span>
+        </div>
+      </div>
+
+      <button class="place-bet-btn" id="place-bet-btn" onclick="placeBet()" disabled>Place Bet</button>
+
+      <!-- Confirmation state (hidden) -->
+      <div class="bet-confirmed" id="bet-confirmed" style="display:none;">
+        <div class="confirmed-icon">&#10003;</div>
+        <div class="confirmed-title">Bet Placed!</div>
+        <div class="confirmed-desc" id="confirmed-desc">Your bet has been placed.</div>
+      </div>
+    </div>
   </div>
 </div>
 
