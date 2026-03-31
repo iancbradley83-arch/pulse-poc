@@ -1,0 +1,91 @@
+[
+  {
+    "id": "mkt_lebron_pts", "game_id": "game_lal_bos", "market_type": "player_prop",
+    "label": "LeBron Points O/U 27.5", "player_id": "lebron", "stat_type": "points", "line": 27.5,
+    "selections": [
+      {"label": "Over 27.5", "odds": "-115"},
+      {"label": "Under 27.5", "odds": "-105"}
+    ]
+  },
+  {
+    "id": "mkt_lebron_3pt", "game_id": "game_lal_bos", "market_type": "player_prop",
+    "label": "LeBron 3+ Three-Pointers", "player_id": "lebron", "stat_type": "threes", "line": 2.5,
+    "selections": [
+      {"label": "Over 2.5", "odds": "+140"},
+      {"label": "Under 2.5", "odds": "-170"}
+    ]
+  },
+  {
+    "id": "mkt_lal_bos_spread", "game_id": "game_lal_bos", "market_type": "spread",
+    "label": "Spread", "team_id": "bos", "line": -2.5,
+    "selections": [
+      {"label": "LAL +2.5", "odds": "-110"},
+      {"label": "BOS -2.5", "odds": "-110"}
+    ]
+  },
+  {
+    "id": "mkt_lal_bos_total", "game_id": "game_lal_bos", "market_type": "over_under",
+    "label": "Total Points O/U 220.5", "line": 220.5,
+    "selections": [
+      {"label": "Over 220.5", "odds": "-110"},
+      {"label": "Under 220.5", "odds": "-110"}
+    ]
+  },
+  {
+    "id": "mkt_tatum_pts", "game_id": "game_lal_bos", "market_type": "player_prop",
+    "label": "Tatum Points O/U 26.5", "player_id": "tatum", "stat_type": "points", "line": 26.5,
+    "selections": [
+      {"label": "Over 26.5", "odds": "-120"},
+      {"label": "Under 26.5", "odds": "+100"}
+    ]
+  },
+  {
+    "id": "mkt_ars_che_result", "game_id": "game_ars_che", "market_type": "match_result",
+    "label": "Match Result", "line": null,
+    "selections": [
+      {"label": "Arsenal", "odds": "-130"},
+      {"label": "Draw", "odds": "+260"},
+      {"label": "Chelsea", "odds": "+340"}
+    ]
+  },
+  {
+    "id": "mkt_ars_che_total", "game_id": "game_ars_che", "market_type": "over_under",
+    "label": "Total Goals O/U 2.5", "line": 2.5,
+    "selections": [
+      {"label": "Over 2.5", "odds": "-125"},
+      {"label": "Under 2.5", "odds": "+105"}
+    ]
+  },
+  {
+    "id": "mkt_saka_goal", "game_id": "game_ars_che", "market_type": "player_prop",
+    "label": "Saka Anytime Goalscorer", "player_id": "saka", "stat_type": "goals", "line": 0.5,
+    "selections": [
+      {"label": "Yes", "odds": "+210"},
+      {"label": "No", "odds": "-260"}
+    ]
+  },
+  {
+    "id": "mkt_kc_phi_spread", "game_id": "game_kc_phi", "market_type": "spread",
+    "label": "Spread", "team_id": "kc", "line": -4.0,
+    "selections": [
+      {"label": "KC -4.0", "odds": "-110"},
+      {"label": "PHI +4.0", "odds": "-110"}
+    ]
+  },
+  {
+    "id": "mkt_mahomes_td", "game_id": "game_kc_phi", "market_type": "player_prop",
+    "label": "Mahomes O/U 2.5 TD Passes", "player_id": "mahomes", "stat_type": "touchdowns", "line": 2.5,
+    "selections": [
+      {"label": "Over 2.5", "odds": "+120"},
+      {"label": "Under 2.5", "odds": "-140"}
+    ]
+  },
+  {
+    "id": "mkt_mahomes_yds", "game_id": "game_kc_phi", "market_type": "player_prop",
+    "label": "Mahomes O/U 275.5 Pass Yds", "player_id": "mahomes", "stat_type": "pass_yards", "line": 275.5,
+    "selections": [
+      {"label": "Over 275.5", "odds": "-115"},
+      {"label": "Under 275.5", "odds": "-105"}
+    ]
+  }
+]

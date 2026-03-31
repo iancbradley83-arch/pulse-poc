@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>PULSE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div id="app">
+  <!-- Phone Frame -->
+  <div class="phone-frame">
+    <!-- Status Bar -->
+    <div class="status-bar">
+      <span class="time" id="clock">9:41</span>
+      <div class="status-icons">
+        <span>&#9679;&#9679;&#9679;&#9679;&#9675;</span>
+        <span>5G</span>
+        <span>100%</span>
+      </div>
+    </div>
+
+    <!-- Top Nav -->
+    <div class="top-nav">
+      <div class="app-logo">PULSE</div>
+      <div class="nav-icons">
+        <div class="nav-icon" onclick="refreshFeed()">&#8635;</div>
+      </div>
+    </div>
+
+    <!-- Tab-specific content area -->
+    <div id="feed-tab-content">
+      <!-- Sport filters -->
+      <div class="filter-bar" id="sport-filter-bar">
+        <div class="chip active" data-sport="">&#9889; For You</div>
+        <div class="chip" data-sport="nba">NBA</div>
+        <div class="chip" data-sport="nfl">NFL</div>
+        <div class="chip" data-sport="epl">EPL</div>
+      </div>
+      <!-- Badge type filters -->
+      <div class="filter-bar" id="badge-filter-bar">
+        <div class="chip-sm active" data-badge="">All</div>
+        <div class="chip-sm" data-badge="milestone">&#127942; Milestone</div>
+        <div class="chip-sm" data-badge="trending">&#128293; Trending</div>
+        <div class="chip-sm" data-badge="news">&#128240; News</div>
+        <div class="chip-sm" data-badge="stat">&#128202; Stat Alert</div>
+      </div>
+    </div>
+
+    <div id="live-tab-content" style="display:none;">
+      <!-- Live game strip -->
+      <div class="live-games-strip" id="live-games-strip"></div>
+      <!-- Live card type filters -->
+      <div class="filter-bar" id="live-filter-bar">
+        <div class="chip-sm active" data-live-badge="">All</div>
+        <div class="chip-sm" data-live-badge="score_change">&#9889; Just In</div>
+        <div class="chip-sm" data-live-badge="momentum_shift">&#128293; Momentum</div>
+        <div class="chip-sm" data-live-badge="threshold_approach">&#127919; On Track</div>
+        <div class="chip-sm" data-live-badge="milestone">&#127942; Record Watch</div>
+      </div>
+    </div>
+
+    <!-- Feed container -->
+    <div class="feed" id="feed"></div>
+
+    <!-- Bottom Tab Bar -->
+    <div class="tab-bar">
+      <div class="tab-item active" data-tab="prematch" onclick="switchTab('prematch')">
+        <span class="tab-icon">&#9889;</span>
+        Feed
+        <div class="tab-dot"></div>
+      </div>
+      <div class="tab-item" data-tab="live" onclick="switchTab('live')">
+        <span class="tab-icon">&#127915;</span>
+        Live
+      </div>
+      <div class="tab-item" data-tab="bets" onclick="switchTab('bets')">
+        <span class="tab-icon">&#128196;</span>
+        My Bets
+      </div>
+      <div class="tab-item" data-tab="profile" onclick="switchTab('profile')">
+        <span class="tab-icon">&#128100;</span>
+        Profile
+      </div>
+    </div>
+
+    <!-- Simulator Controls (dev only) -->
+    <div class="sim-controls" id="sim-controls" style="display:none;">
+      <button onclick="startSimulator()" id="sim-btn">&#9654; Start Sim</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

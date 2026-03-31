@@ -1,0 +1,37 @@
+[
+  {
+    "id": "tw1", "author_name": "Shams Charania", "author_handle": "@ShamsCharania", "author_avatar": "S",
+    "body": "LeBron James is expected to start tonight vs Boston and is \"locked in\" on breaking the record at home, per sources.",
+    "time_ago": "2h ago", "player_ids": ["lebron"], "team_ids": ["lal"], "game_id": "game_lal_bos"
+  },
+  {
+    "id": "tw2", "author_name": "Shams Charania", "author_handle": "@ShamsCharania", "author_avatar": "S",
+    "body": "LeBron is hunting every possession. 26 pts on 10/14 shooting — looks like the record falls tonight.",
+    "time_ago": "3m", "player_ids": ["lebron"], "team_ids": ["lal"], "game_id": "game_lal_bos"
+  },
+  {
+    "id": "tw3", "author_name": "Lakers Nation", "author_handle": "@LakersNation", "author_avatar": "L",
+    "body": "Lakers have completely taken over this quarter. 12-2 run and the Celtics have called timeout. Energy in the building is unreal.",
+    "time_ago": "1m", "player_ids": [], "team_ids": ["lal", "bos"], "game_id": "game_lal_bos"
+  },
+  {
+    "id": "tw4", "author_name": "James Olley", "author_handle": "@JamesOlley", "author_avatar": "J",
+    "body": "Saka looks sharp. That's his first goal since the injury — took the shot early, keeper had no chance. Arsenal completely dominant now.",
+    "time_ago": "30s", "player_ids": ["saka"], "team_ids": ["ars"], "game_id": "game_ars_che"
+  },
+  {
+    "id": "tw5", "author_name": "Ian Rapoport", "author_handle": "@RapSheet", "author_avatar": "I",
+    "body": "Mahomes is moving like himself again. That TD to Kelce was vintage — 22-yard strike on the run. Ankle looks like a non-issue right now.",
+    "time_ago": "2m", "player_ids": ["mahomes"], "team_ids": ["kc"], "game_id": "game_kc_phi"
+  },
+  {
+    "id": "tw6", "author_name": "Adam Schefter", "author_handle": "@AdamSchefter", "author_avatar": "A",
+    "body": "Patrick Mahomes looked \"explosive\" in practice today according to teammates. He's been dealing with ankle injury since Week 12.",
+    "time_ago": "45m", "player_ids": ["mahomes"], "team_ids": ["kc"], "game_id": "game_kc_phi"
+  },
+  {
+    "id": "tw7", "author_name": "Sky Sports", "author_handle": "@SkySports", "author_avatar": "S",
+    "body": "Arsenal are unbeaten in 14 straight home matches. Chelsea haven't won at the Emirates since 2021.",
+    "time_ago": "1h", "player_ids": [], "team_ids": ["ars", "che"], "game_id": "game_ars_che"
+  }
+]

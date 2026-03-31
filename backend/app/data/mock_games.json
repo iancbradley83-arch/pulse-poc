@@ -1,0 +1,50 @@
+[
+  {
+    "id": "game_lal_bos",
+    "sport": "nba",
+    "home_team": {
+      "id": "lal", "name": "Los Angeles Lakers", "short_name": "LAL",
+      "color": "#552583", "sport": "nba"
+    },
+    "away_team": {
+      "id": "bos", "name": "Boston Celtics", "short_name": "BOS",
+      "color": "#007A33", "sport": "nba"
+    },
+    "status": "scheduled",
+    "home_score": 0, "away_score": 0,
+    "clock": "", "period": "",
+    "broadcast": "TNT", "start_time": "7:30 PM ET"
+  },
+  {
+    "id": "game_ars_che",
+    "sport": "epl",
+    "home_team": {
+      "id": "ars", "name": "Arsenal", "short_name": "ARS",
+      "color": "#EF0107", "sport": "epl"
+    },
+    "away_team": {
+      "id": "che", "name": "Chelsea", "short_name": "CHE",
+      "color": "#034694", "sport": "epl"
+    },
+    "status": "scheduled",
+    "home_score": 0, "away_score": 0,
+    "clock": "", "period": "",
+    "broadcast": "Peacock", "start_time": "12:30 PM ET"
+  },
+  {
+    "id": "game_kc_phi",
+    "sport": "nfl",
+    "home_team": {
+      "id": "kc", "name": "Kansas City Chiefs", "short_name": "KC",
+      "color": "#E31837", "sport": "nfl"
+    },
+    "away_team": {
+      "id": "phi", "name": "Philadelphia Eagles", "short_name": "PHI",
+      "color": "#004C54", "sport": "nfl"
+    },
+    "status": "scheduled",
+    "home_score": 0, "away_score": 0,
+    "clock": "", "period": "",
+    "broadcast": "CBS", "start_time": "4:25 PM ET"
+  }
+]

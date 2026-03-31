@@ -1,0 +1,32 @@
+[
+  {
+    "id": "lebron", "name": "LeBron James", "team_id": "lal", "position": "SF",
+    "season_stats": {"ppg": 27.2, "rpg": 7.8, "apg": 8.1},
+    "career_stats": {"total_points": 38376, "all_time_record": 38388, "games_played": 1492}
+  },
+  {
+    "id": "tatum", "name": "Jayson Tatum", "team_id": "bos", "position": "SF",
+    "season_stats": {"ppg": 26.9, "rpg": 8.1, "apg": 4.6},
+    "career_stats": {}
+  },
+  {
+    "id": "saka", "name": "Bukayo Saka", "team_id": "ars", "position": "RW",
+    "season_stats": {"goals": 14, "assists": 11, "matches": 28},
+    "career_stats": {}
+  },
+  {
+    "id": "palmer", "name": "Cole Palmer", "team_id": "che", "position": "AM",
+    "season_stats": {"goals": 18, "assists": 8, "matches": 30},
+    "career_stats": {}
+  },
+  {
+    "id": "mahomes", "name": "Patrick Mahomes", "team_id": "kc", "position": "QB",
+    "season_stats": {"pass_yds": 4200, "pass_td": 32, "int": 10, "comp_pct": 67.2},
+    "career_stats": {}
+  },
+  {
+    "id": "hurts", "name": "Jalen Hurts", "team_id": "phi", "position": "QB",
+    "season_stats": {"pass_yds": 3600, "pass_td": 24, "rush_td": 12},
+    "career_stats": {}
+  }
+]
