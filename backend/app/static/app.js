@@ -217,6 +217,13 @@ function prependCard(card) {
   // Cache into live cards array
   liveCards.unshift(card);
 
+  // If the bet slip is open, don't touch the DOM or trigger scroll — just
+  // flag that a refresh is needed so we catch up when the slip closes.
+  if (betSlipIsOpen()) {
+    _betSlipPendingRefresh = true;
+    return;
+  }
+
   // If there's an active live filter and this card doesn't match, skip rendering
   if (currentLiveBadge) {
     const evType = card._event_type || '';
@@ -472,6 +479,11 @@ function renderMarket(m, isLive = false, gameLabel = '') {
 
 // ── Bet Slip ──
 let _betOdds = null;
+let _betSlipPendingRefresh = false;
+
+function betSlipIsOpen() {
+  return document.getElementById('bet-slip-drawer').classList.contains('open');
+}
 
 function openBetSlip(selLabel, odds, marketLabel, gameLabel, marketId) {
   _betOdds = odds;
@@ -499,6 +511,12 @@ function openBetSlip(selLabel, odds, marketLabel, gameLabel, marketId) {
 function closeBetSlip() {
   document.getElementById('bet-slip-overlay').classList.remove('open');
   document.getElementById('bet-slip-drawer').classList.remove('open');
+
+  // Re-render the live feed if any cards arrived while the slip was open
+  if (_betSlipPendingRefresh && currentTab === 'live') {
+    _betSlipPendingRefresh = false;
+    renderFilteredLive();
+  }
 }
 
 function setStake(amount) {
