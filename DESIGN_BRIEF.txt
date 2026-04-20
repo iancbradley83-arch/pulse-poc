@@ -1,0 +1,222 @@
+PULSE — DESIGN BRIEF
+====================
+
+Live site: https://pulse-poc-production.up.railway.app/
+Admin table: https://pulse-poc-production.up.railway.app/admin/candidates
+Repo: https://github.com/iancbradley83-arch/pulse-poc
+
+
+1. WHAT PULSE IS
+----------------
+
+Pulse is a standalone, embeddable sports-content widget. Operators (sportsbooks
+like Apuesta Total, Bet365, DraftKings, etc.) embed Pulse on their site to give
+punters a news-driven feed of betting angles.
+
+Every card on the feed is triggered by a real-world news event — an injury, a
+team news story, a transfer, a manager quote, a tactical preview, a price move,
+a goal scored. The card explains WHY a specific market (single, combo, or Bet
+Builder) is interesting RIGHT NOW, and deep-links into the operator's bet slip.
+
+It is NOT:
+- A full sportsbook
+- A pure odds board
+- A stats-first calculator
+- Operator-specific (it's content that plugs INTO operators)
+
+It IS:
+- A news-first content layer with markets as the action
+- Mobile-first (but must render well inside iframe on desktop too)
+- Themable (operators pass brand tokens: colors, font, radius, logo)
+- Dark-mode native (sportsbook UIs skew dark — match that default)
+
+
+2. TARGET USER
+--------------
+
+Casual-to-serious sports bettor browsing during the day, looking for reasons
+to bet. Not a pro sharp. They want:
+- A quick scan of what happened today that's bet-worthy
+- A clear "here's the story, here's the bet" angle
+- One-tap handoff to the operator bet slip
+- Feeling like this is editorial curation, not a spammy feed
+
+
+3. CURRENT STAGE
+----------------
+
+Stage 2 of the roadmap — news-driven recommendation engine + validation surface
+is live. Cards are real:
+- Fixtures come from Rogue API (Apuesta Total, ~1,800 soccer events catalogue)
+- News comes from Claude Haiku 4.5 + web search per fixture
+- Entity resolver maps mentions to fixtures, candidate builder picks markets,
+  scorer + policy layer gates what reaches the feed
+
+Two surfaces need design love:
+
+  A. PUBLIC FEED (main consumer view)
+     https://pulse-poc-production.up.railway.app/
+     - Feed of pre-match cards
+     - Mobile-phone-shell mock around it (Stage 5 removes the phone chrome
+       when we ship the real embed widget)
+
+  B. ADMIN /CANDIDATES TABLE (operator / editorial review)
+     https://pulse-poc-production.up.railway.app/admin/candidates
+     - Read-only table for humans to review what the engine produced,
+       spot bad picks, tune thresholds
+     - Desktop-first, dense
+
+
+4. DESIGN PROBLEMS TO FIX (public feed)
+---------------------------------------
+
+Look at the live site. You'll see:
+
+- Narrative body is a 6-line wall of text. No hierarchy. Should have a
+  punchy headline + optional "read more" expand for the body.
+
+- "Tonight's games" header is wrong — the cards cover fixtures over the next
+  14 days, not just tonight.
+
+- Filter chips at the top say "For You / NBA / NFL / EPL". Pulse is soccer-only
+  for MVP. Chips should reflect what the content actually is: leagues
+  (Premier League, La Liga, UCL, Serie A, Bundesliga), or hook types
+  (Injuries, Team News, Transfers, Tactical), or both.
+
+- Team avatars are flat 1-letter circles. Feels generic. Needs either real
+  club badges (hard — licensing) or a more intentional typographic treatment
+  (2–3 letter short code, team color accent).
+
+- Hook-type pill (NEWS) is identical regardless of whether it's an injury,
+  transfer, tactical story, etc. Needs differentiation — distinct color /
+  icon per hook type (injury = red cross, team_news = team icon,
+  transfer = arrow, tactical = formation icon, manager_quote = speech bubble,
+  preview = reading icon, article = newspaper).
+
+- "Score: 0.81" at the bottom of each card is a debug field. Should be
+  hidden from the consumer view (the number is for the admin table).
+
+- The "selected" highlight on one of the three 1X2 selections (e.g. Elche
+  with purple gradient + green odds) has no reason to exist on a pre-match
+  card. Either remove it or give it meaning ("recommended leg").
+
+- Odds tiles are OK but could feel more tactile — touch targets, hover/tap
+  state, and clearly tappable (they'll deep-link to the operator bet slip
+  in Stage 5).
+
+- No sense of recency / freshness. A 2-hour-old injury scoop should feel
+  different from a 6-hour-old preview. Add subtle time-ago indicators
+  (e.g. "2h ago" chip).
+
+- No visible source attribution. The card was scouted from Sky Sports or
+  BBC — that credibility should show up (small source line under the
+  headline).
+
+- The phone-shell mock around the feed made sense for a mockup. Now that
+  we're embedding for real, we need an embedded-iframe layout variant:
+  no phone chrome, edge-to-edge, responsive to container width.
+
+
+5. DESIGN PROBLEMS TO FIX (admin table)
+---------------------------------------
+
+- Dense table, but already functional. What it needs:
+  - Better affordances for reviewing a candidate: click a row to expand
+    and see the full news summary + score breakdown + reason
+  - Color-coded hook column (same palette as the public feed)
+  - "≥thr" column is cryptic — should be a clearer pass/fail visual
+  - Filters are serviceable but could be chips instead of selects
+  - Counts-by-(hook × status) at the bottom could become a small chart
+    (heatmap or stacked bar) at the top
+  - Empty / loading states
+  - An "open in feed" link per row — jump to the card as a user would see it
+
+
+6. BRAND / AESTHETIC DIRECTION
+------------------------------
+
+- Dark mode default (sportsbook-native).
+- Accent color: currently a blue-purple `#7c5cff` — open to changing, but
+  the product needs a single strong accent.
+- Typographic: clean, editorial. Headlines should feel like a sports site,
+  not a banking app. Reference points: The Athletic, ESPN, BBC Sport.
+- Data density: lean toward dense, not sparse. Users are scanning fast.
+- Animation: subtle. New cards slide in from top. Odds tiles have a small
+  tap/press animation. Nothing gimmicky.
+- Themable via CSS variables — operators override accent color, font,
+  radius, logo. Design system should be defined in terms of tokens.
+
+
+7. KEY SCREENS / COMPONENTS TO DESIGN
+-------------------------------------
+
+a. FEED CARD (main atom). Variants:
+   - Single-bet card (market has one selection to highlight)
+   - Combo / accumulator card (multi-leg, total odds)
+   - Bet Builder card (multi-selection same-event, total odds)
+   - Live moment card (Stage 7 — goal scored, red card, suspension)
+   - Price-move card (Stage 6 — line shifted)
+
+b. HOOK-TYPE VISUAL SYSTEM (8 hooks)
+   injury, team_news, transfer, manager_quote, tactical, preview, article,
+   price_move, live_moment
+   Needs: icon, color, pill style.
+
+c. FEED PAGE (embedded mode)
+   - Header: operator logo (if configured) + Pulse branding
+   - Filter strip (chips): league | hook | sort
+   - Feed (infinite scroll or paginated — your call)
+   - Empty state ("no news-driven cards right now, check back in an hour")
+
+d. ADMIN /CANDIDATES PAGE (desktop-dense)
+   - Counts summary (chart/heatmap)
+   - Filter bar
+   - Table with expandable rows
+   - Per-row "open in feed" link
+
+e. DEEP-LINK CTA (future-proof)
+   When a user taps a card / selection, we deep-link to the operator's bet
+   slip. The CTA element needs to look clearly actionable and ideally carry
+   the operator's brand (so users know they're being sent to THEIR operator).
+
+
+8. CONSTRAINTS / NICE-TO-HAVES
+------------------------------
+
+- Mobile-first (375px width minimum)
+- Tablet fine (iframe on operator desktop site — 600px–1200px typical embed)
+- No per-card photography (we don't have rights to team images)
+- Icons: open to bringing in a set like Lucide, Phosphor, or custom simple ones
+- Font: system default is fine; if recommending a custom face, Inter is
+  already loaded via the existing mock
+- Language: English for MVP (Pulse is going into Apuesta Total, a Peruvian
+  operator, whose primary language is Spanish — keep English cleanly
+  translatable)
+
+
+9. WHAT TO DELIVER
+------------------
+
+- Feed card system (all variants)
+- Hook-type visual system
+- Public feed page (mobile + iframe-desktop responsive)
+- Admin /candidates redesign (desktop)
+- CSS token strategy for operator theming
+
+Out of scope for this pass:
+- Motion / full animation spec
+- iOS/Android native app design
+- Marketing site
+
+
+10. FEEDBACK I'VE GOTTEN FROM THE PRODUCT LEAD
+----------------------------------------------
+
+"We're trying to bring context to a market. The reason why someone bets —
+that can be statistics, but I personally think it should be news-driven.
+Statistics can be part of it, but the trigger should be something has
+happened that makes this market interesting. Or this builder or this
+combo."
+
+Design should reflect this hierarchy. News on top. Market below. Stats as
+evidence, not the headline.

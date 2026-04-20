@@ -1,649 +1,393 @@
-// PULSE POC — Frontend Application
-const API = '';  // same origin
-let ws = null;
-let currentTab = 'prematch';
-let currentSport = '';
-let currentBadge = '';
-let currentLiveBadge = '';
+/* =====================================================================
+ *  PULSE — vanilla-JS port of the Hero Comfortable design handoff
+ *  Fetches the public feed from /api/feed?type=prematch and renders
+ *  each card in the Hero Leg variant. No build step, no framework.
+ *  WebSocket live updates not yet wired (Stage 6+).
+ * ===================================================================== */
 
-// Card caches for client-side filtering
-let prematchCards = [];
-let liveCards = [];
-
-// ── Initialize ──
-document.addEventListener('DOMContentLoaded', () => {
-  updateClock();
-  setInterval(updateClock, 60000);
-  setupChips();
-  loadFeed('prematch');
-});
-
-function updateClock() {
-  const now = new Date();
-  document.getElementById('clock').textContent =
-    now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: false });
-}
-
-// ── Tab Switching ──
-function switchTab(tab) {
-  currentTab = tab;
-  document.querySelectorAll('.tab-item').forEach(t => t.classList.remove('active'));
-  document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
-
-  // Show/hide tab-specific content
-  document.getElementById('feed-tab-content').style.display = tab === 'prematch' ? '' : 'none';
-  document.getElementById('live-tab-content').style.display = tab === 'live' ? '' : 'none';
-  document.getElementById('sim-controls').style.display = tab === 'live' ? '' : 'none';
-
-  if (tab === 'prematch') {
-    disconnectWS();
-    loadFeed('prematch');
-  } else if (tab === 'live') {
-    loadFeed('live');
-    loadLiveGames();
-    connectWS();
-  } else {
-    disconnectWS();
-    document.getElementById('feed').innerHTML = `
-      <div style="padding:60px 20px;text-align:center;color:var(--text-tri);">
-        <div style="font-size:40px;margin-bottom:12px;">${tab === 'bets' ? '📋' : '👤'}</div>
-        <div style="font-size:14px;font-weight:600;">${tab === 'bets' ? 'My Bets' : 'Profile'}</div>
-        <div style="font-size:12px;margin-top:4px;">Coming soon</div>
-      </div>`;
-  }
-}
-
-// ── Filter Chips ──
-function setupChips() {
-  // Sport filter (pre-match)
-  document.querySelectorAll('#sport-filter-bar .chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      document.querySelectorAll('#sport-filter-bar .chip').forEach(c => c.classList.remove('active'));
-      chip.classList.add('active');
-      currentSport = chip.dataset.sport;
-      renderFilteredPrematch();
-    });
-  });
-
-  // Badge filter (pre-match)
-  document.querySelectorAll('#badge-filter-bar .chip-sm').forEach(chip => {
-    chip.addEventListener('click', () => {
-      document.querySelectorAll('#badge-filter-bar .chip-sm').forEach(c => c.classList.remove('active'));
-      chip.classList.add('active');
-      currentBadge = chip.dataset.badge;
-      renderFilteredPrematch();
-    });
-  });
-
-  // Live card type filter
-  document.querySelectorAll('#live-filter-bar .chip-sm').forEach(chip => {
-    chip.addEventListener('click', () => {
-      document.querySelectorAll('#live-filter-bar .chip-sm').forEach(c => c.classList.remove('active'));
-      chip.classList.add('active');
-      currentLiveBadge = chip.dataset.liveBadge;
-      renderFilteredLive();
-    });
-  });
-}
-
-function renderFilteredPrematch() {
-  let cards = prematchCards;
-  if (currentSport) {
-    cards = cards.filter(c => c.game.sport === currentSport);
-  }
-  if (currentBadge) {
-    cards = cards.filter(c => c.badge === currentBadge);
-  }
-  renderFeed(cards, 'prematch');
-}
-
-function renderFilteredLive() {
-  let cards = liveCards;
-  if (currentLiveBadge) {
-    cards = cards.filter(c => {
-      // Match on the event type stored in event_trigger
-      const evType = c._event_type || '';
-      return evType === currentLiveBadge;
-    });
-  }
-  renderFeed(cards, 'live');
-}
-
-// ── Load Feed ──
-async function loadFeed(type) {
-  const params = new URLSearchParams({ type });
-
-  try {
-    const res = await fetch(`${API}/api/feed?${params}`);
-    const data = await res.json();
-
-    if (type === 'prematch') {
-      prematchCards = data.cards;
-      renderFilteredPrematch();
-    } else {
-      liveCards = data.cards;
-      renderFilteredLive();
-    }
-  } catch (e) {
-    console.error('Feed load error:', e);
-  }
-}
-
-function refreshFeed() {
-  loadFeed(currentTab === 'live' ? 'live' : 'prematch');
-}
-
-// ── Load Live Games ──
-async function loadLiveGames() {
-  try {
-    const res = await fetch(`${API}/api/games`);
-    const data = await res.json();
-    renderLiveGames(data.games);
-  } catch (e) {
-    console.error('Games load error:', e);
-  }
-}
-
-// ── WebSocket ──
-function connectWS() {
-  if (ws) return;
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${location.host}/ws/feed`);
-
-  ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.type === 'new_card') {
-      // Tag the card with its event type for filtering
-      const card = msg.card;
-      if (card.event_trigger) {
-        // Map icon_type back to event type for filtering
-        const typeMap = {
-          'score': 'score_change',
-          'momentum': 'momentum_shift',
-          'stat': 'threshold_approach',
-          'milestone': 'milestone',
-          'injury': 'injury',
-        };
-        card._event_type = typeMap[card.event_trigger.icon_type] || '';
-      }
-      prependCard(card);
-    } else if (msg.type === 'game_update') {
-      updateGamePill(msg.game);
-    }
+const PULSE = (() => {
+  // ── Hook registry (matches the design handoff README table) ─────────
+  const HOOKS = {
+    injury:        { label: 'Injury',     color: '#FF4D6D', icon: 'cross',     short: 'INJURY'   },
+    team_news:     { label: 'Team News',  color: '#4FB2FF', icon: 'shield',    short: 'TEAM'     },
+    transfer:      { label: 'Transfer',   color: '#FFB547', icon: 'arrows',    short: 'TRANSFER' },
+    manager_quote: { label: 'Manager',    color: '#B08CFF', icon: 'quote',     short: 'QUOTE'    },
+    tactical:      { label: 'Tactical',   color: '#5EE2A0', icon: 'formation', short: 'TACTICAL' },
+    preview:       { label: 'Preview',    color: '#6EE7F9', icon: 'book',      short: 'PREVIEW'  },
+    article:       { label: 'Article',    color: '#A1A1AA', icon: 'news',      short: 'ARTICLE'  },
+    price_move:    { label: 'Price Move', color: '#C6FF3D', icon: 'trend',     short: 'MOVE'     },
+    live_moment:   { label: 'Live',       color: '#FF2D87', icon: 'pulse',     short: 'LIVE'     },
   };
 
-  ws.onclose = () => { ws = null; };
-  ws.onerror = () => { ws = null; };
-}
+  // Filter chips (hook axis)
+  const HOOK_CHIPS = [
+    'injury', 'team_news', 'transfer', 'manager_quote', 'tactical',
+    'preview', 'price_move', 'live_moment',
+  ];
 
-function disconnectWS() {
-  if (ws) { ws.close(); ws = null; }
-}
+  // League chips — keyed on substring match against the league string we get
+  // back from the API (Rogue returns things like "England - Premier League").
+  const LEAGUE_CHIPS = [
+    { label: 'Premier League', match: /premier league/i },
+    { label: 'La Liga',        match: /la liga|laliga/i },
+    { label: 'UCL',            match: /champions league/i },
+    { label: 'Bundesliga',     match: /bundesliga/i },
+    { label: 'Serie A',        match: /serie a/i },
+    { label: 'Ligue 1',        match: /ligue 1/i },
+  ];
 
-// ── Simulator ──
-async function startSimulator() {
-  const btn = document.getElementById('sim-btn');
-  try {
-    const res = await fetch(`${API}/api/simulator/start`, { method: 'POST' });
-    const data = await res.json();
-    btn.textContent = data.status === 'started' ? '⏸ Running...' : '⏸ Running...';
-    btn.disabled = true;
-    setTimeout(() => { btn.textContent = '▶ Start Sim'; btn.disabled = false; }, 20000);
-  } catch (e) {
-    console.error('Sim error:', e);
-  }
-}
+  // ── State ───────────────────────────────────────────────────────────
+  let allCards = [];
+  let activeHook = 'all';
+  let activeLeague = 'all';
 
-// ── Render Feed ──
-function renderFeed(cards, type) {
-  const feed = document.getElementById('feed');
-  if (!cards.length) {
-    feed.innerHTML = `<div style="padding:40px 20px;text-align:center;color:var(--text-tri);font-size:13px;">
-      ${type === 'live' ? 'No live cards yet. Start the simulator!' : 'No cards found.'}
-    </div>`;
-    return;
-  }
-
-  const sectionLabel = type === 'prematch'
-    ? '<div class="feed-section">Tonight\'s Games</div>'
-    : '<div class="feed-section"><span class="live-dot"></span> Live Now</div>';
-
-  feed.innerHTML = sectionLabel + cards.map((card, i) =>
-    card.card_type === 'live_event' ? renderLiveCard(card, i) : renderPrematchCard(card, i)
-  ).join('');
-}
-
-function prependCard(card) {
-  // Cache into live cards array
-  liveCards.unshift(card);
-
-  // If the bet slip is open, don't touch the DOM or trigger scroll — just
-  // flag that a refresh is needed so we catch up when the slip closes.
-  if (betSlipIsOpen()) {
-    _betSlipPendingRefresh = true;
-    return;
+  // ── Icons ───────────────────────────────────────────────────────────
+  // Matches the handoff's HookGlyph SVG paths (16x16 viewBox).
+  function hookGlyph(type, size = 12, color = '#0A0A0F') {
+    const common = `width="${size}" height="${size}" viewBox="0 0 16 16" fill="none" stroke="${color}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"`;
+    switch (type) {
+      case 'cross':
+        return `<svg ${common}><path d="M5 2h6v3h3v6h-3v3h-6v-3h-3v-6h3z" fill="${color}" stroke="none"/></svg>`;
+      case 'shield':
+        return `<svg ${common}><path d="M8 1.5l5 1.5v5c0 3.5-2.5 5.5-5 6.5-2.5-1-5-3-5-6.5v-5z"/></svg>`;
+      case 'arrows':
+        return `<svg ${common}><path d="M2 5h10m-3-3l3 3-3 3M14 11H4m3 3l-3-3 3-3"/></svg>`;
+      case 'quote':
+        return `<svg ${common}><path d="M3 12l-0.5 2.5L6 12M3 3h10a1 1 0 011 1v7a1 1 0 01-1 1H3a1 1 0 01-1-1V4a1 1 0 011-1z"/></svg>`;
+      case 'formation':
+        return `<svg ${common} stroke="none" fill="${color}"><circle cx="4" cy="4" r="1.4"/><circle cx="12" cy="4" r="1.4"/><circle cx="4" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="8" cy="8" r="1.4" opacity="0.5"/></svg>`;
+      case 'book':
+        return `<svg ${common}><path d="M2 3a1 1 0 011-1h5v12H3a1 1 0 01-1-1V3zM8 2h5a1 1 0 011 1v10a1 1 0 01-1 1H8V2z"/></svg>`;
+      case 'news':
+        return `<svg ${common}><rect x="2" y="3" width="12" height="10" rx="1"/><path d="M5 6h6M5 9h6M5 11h3"/></svg>`;
+      case 'trend':
+        return `<svg ${common}><path d="M2 11l4-4 3 3 5-5M10 5h4v4"/></svg>`;
+      case 'pulse':
+        return `<svg ${common}><path d="M1 8h3l2-5 3 10 2-5h4"/></svg>`;
+      default:
+        return `<svg ${common}><circle cx="8" cy="8" r="6"/></svg>`;
+    }
   }
 
-  // If there's an active live filter and this card doesn't match, skip rendering
-  if (currentLiveBadge) {
-    const evType = card._event_type || '';
-    if (evType !== currentLiveBadge) return;
+  // ── Helpers ─────────────────────────────────────────────────────────
+
+  function isLightColor(hex) {
+    const c = (hex || '').replace('#', '');
+    if (c.length !== 6) return false;
+    const r = parseInt(c.slice(0, 2), 16);
+    const g = parseInt(c.slice(2, 4), 16);
+    const b = parseInt(c.slice(4, 6), 16);
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 140;
   }
 
-  const feed = document.getElementById('feed');
-  const html = card.card_type === 'live_event' ? renderLiveCard(card, 0) : renderPrematchCard(card, 0);
-  const temp = document.createElement('div');
-  temp.innerHTML = html;
-  const cardEl = temp.firstElementChild;
-
-  // Remove any initial animation classes from renderLiveCard, we'll control it here
-  cardEl.classList.remove('animate-in');
-
-  // Start invisible, then reveal with staged animation
-  cardEl.style.opacity = '0';
-  cardEl.style.transform = 'translateY(20px)';
-
-  // Insert after the section label
-  const firstCard = feed.querySelector('.card');
-  if (firstCard) {
-    feed.insertBefore(cardEl, firstCard);
-  } else {
-    feed.appendChild(cardEl);
+  function formatAgo(mins) {
+    if (mins == null) return 'now';
+    if (mins < 1) return 'now';
+    if (mins < 60) return `${mins}m`;
+    const h = Math.floor(mins / 60);
+    if (h < 24) return `${h}h`;
+    const d = Math.floor(h / 24);
+    return `${d}d`;
   }
 
-  // Trigger animation on next frame so the DOM has settled
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      cardEl.style.opacity = '';
-      cardEl.style.transform = '';
-      cardEl.classList.add('new-arrival', 'reveal');
+  function formatKickoff(raw) {
+    if (!raw) return '';
+    // Catalogue loader returns "21 Apr 19:00 UTC". Show "21 Apr · 19:00".
+    const m = raw.match(/^(\d{1,2}\s+\w+)\s+(\d{1,2}:\d{2})/);
+    return m ? `${m[1]} · ${m[2]}` : raw;
+  }
 
-      // Scroll to top smoothly so the new card is visible
-      feed.scrollTo({ top: 0, behavior: 'smooth' });
+  function selectionsFromMarket(market) {
+    // Design expects legs: [{label, sub?, odds, recommended?, drift?}]
+    // Our API serves Market.selections: [{label, odds: "1.85", ...}]
+    if (!market || !market.selections) return [];
+    return market.selections.map((sel, i) => {
+      const odds = parseFloat(sel.odds);
+      return {
+        label: sel.label,
+        odds: Number.isFinite(odds) ? odds : 0,
+        recommended: i === 0 && (market.market_type === 'match_result'),
+      };
+    }).filter(l => l.odds > 0);
+  }
 
-      // Clean up animation classes after they finish
-      setTimeout(() => {
-        cardEl.classList.remove('new-arrival', 'reveal');
-      }, 2500);
+  function pickLeg(legs) {
+    return legs.find(l => l.recommended) || legs[0];
+  }
+
+  // Deterministic "pick rate" from card score so the bar has a stable value
+  // per render. Range 55..92.
+  function pseudoPickRate(score) {
+    const s = Math.max(0, Math.min(1, score || 0));
+    return 55 + Math.round(s * 37);
+  }
+
+  function escape(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[ch]));
+  }
+
+  // ── Render ──────────────────────────────────────────────────────────
+
+  function renderHeroCard(card) {
+    const hookId = card.hook_type || (card.badge === 'news' ? 'article' : 'preview');
+    const hook = HOOKS[hookId] || HOOKS.article;
+    const legs = selectionsFromMarket(card.market);
+    const pick = pickLeg(legs);
+    const pickRate = pseudoPickRate(card.relevance_score);
+
+    const home = card.game?.home_team || {};
+    const away = card.game?.away_team || {};
+    const league = card.game?.broadcast || '';
+
+    const headline = card.headline || card.narrative_hook || '';
+    const angle = card.narrative_hook && card.headline && card.narrative_hook !== card.headline
+      ? card.narrative_hook
+      : '';
+
+    const sourceName = card.source_name || '';
+    const ago = formatAgo(card.ago_minutes);
+
+    const totalOdds = pick?.odds || 0;
+
+    // Hook-color CSS vars for per-card tint
+    const style = [
+      `--hook-color:${hook.color}`,
+      `--hook-color-08:${hook.color}1A`,   // ~10% alpha
+      `--hook-color-20:${hook.color}33`,   // ~20% alpha
+      `--hook-color-10:${hook.color}20`,   // ~12% alpha
+    ].join(';');
+
+    return `
+      <article class="card-hero" style="${style}">
+        <div class="card-glyph">${hookGlyph(hook.icon, 40, hook.color)}</div>
+        <div class="card-body">
+          <div class="card-head">
+            <span class="hook-pill" style="background:${hook.color};color:#0A0A0F;">
+              ${hook.icon === 'pulse'
+                ? '<span class="pulse" style="width:6px;height:6px;border-radius:99px;background:#0A0A0F;display:inline-block;animation:pulseDot 1.2s ease-in-out infinite;"></span>'
+                : hookGlyph(hook.icon, 12, '#0A0A0F')}
+              <span>${hook.short}</span>
+            </span>
+            ${hookId === 'live_moment'
+              ? `<span class="recency live"><span class="pulse"></span>Live · ${escape(ago)}</span>`
+              : `<span class="recency">${escape(ago)} ago</span>`}
+          </div>
+
+          <h2 class="card-headline">${escape(headline)}</h2>
+
+          <div class="source-match">
+            ${sourceName ? `<span class="source">${escape(sourceName)}</span><span class="dot-sep">·</span>` : ''}
+            ${teamPillHTML(home)}
+            ${teamPillHTML(away)}
+            ${league ? `<span class="kickoff">${escape(league)}</span>` : ''}
+            ${card.game?.start_time ? `<span class="kickoff">· ${escape(formatKickoff(card.game.start_time))}</span>` : ''}
+          </div>
+
+          ${pick ? `
+            <div class="pulse-pick">
+              <div class="pick-meta">
+                <div class="pick-label">Pulse Pick · ${escape(card.market?.label || 'Match Winner')}</div>
+                <div class="pick-selection">${escape(pick.label)}</div>
+              </div>
+              <div class="pick-odds">${pick.odds.toFixed(2)}</div>
+            </div>
+          ` : ''}
+
+          ${angle ? `<p class="card-angle">${escape(angle)}</p>` : ''}
+
+          <button class="cta-button" type="button">
+            <span class="cta-left">
+              Tap to bet
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+            </span>
+            ${totalOdds ? `<span class="cta-odds">${totalOdds.toFixed(2)}</span>` : ''}
+          </button>
+
+          <div class="card-foot">
+            <div class="pick-rate">
+              <div class="bar" style="--pick-pct:${pickRate}%"></div>
+              <span class="pct">${pickRate}%</span>
+              <span>picked</span>
+            </div>
+            <div class="engagement">
+              <button type="button" data-kind="like" aria-label="Like">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"/></svg>
+              </button>
+              <button type="button" data-kind="save" aria-label="Save">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z"/></svg>
+              </button>
+              <button type="button" data-kind="share" aria-label="Share">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 002 2h12a2 2 0 002-2v-8M16 6l-4-4-4 4M12 2v13"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </article>
+    `;
+  }
+
+  function teamPillHTML(team) {
+    if (!team || !team.short_name) return '';
+    const color = team.color || '#666';
+    const light = isLightColor(color);
+    const style = `--team-color:${color};--team-text:${light ? '#fff' : color};`;
+    return `<span class="team-pill" style="${style}"><span class="swatch"></span>${escape(team.short_name)}</span>`;
+  }
+
+  // ── Filter strip ────────────────────────────────────────────────────
+
+  function renderFilterStrip() {
+    const el = document.getElementById('filter-strip');
+    const parts = [];
+
+    // "All" chip
+    parts.push(chipHTML({ id: 'all', label: 'All', active: activeHook === 'all' && activeLeague === 'all' }));
+
+    // Hook label + chips
+    parts.push(`<span class="filter-label">Hook</span>`);
+    for (const id of HOOK_CHIPS) {
+      const h = HOOKS[id];
+      parts.push(chipHTML({
+        id, label: h.label, active: activeHook === id, hook: id, color: h.color,
+      }));
+    }
+
+    parts.push(`<span class="filter-divider" role="separator"></span>`);
+
+    // League label + chips
+    parts.push(`<span class="filter-label">League</span>`);
+    for (const l of LEAGUE_CHIPS) {
+      parts.push(chipHTML({
+        id: `league:${l.label}`, label: l.label,
+        active: activeLeague === l.label,
+      }));
+    }
+
+    el.innerHTML = parts.join('');
+    el.querySelectorAll('.chip').forEach(chip => {
+      chip.addEventListener('click', () => handleChipClick(chip.dataset.id));
     });
-  });
-}
-
-// ── Render Pre-match Card ──
-function renderPrematchCard(card, index) {
-  const g = card.game;
-  const m = card.market;
-  const badge = renderBadge(card.badge, card);
-  const stats = renderStats(card.stats);
-  const progress = card.progress ? renderProgress(card.progress) : '';
-  const tweets = card.tweets.map(renderTweet).join('');
-  const gameLabel = `${g.home_team.short_name} vs ${g.away_team.short_name}`;
-  const market = m ? renderMarket(m, false, gameLabel) : '';
-
-  return `
-    <div class="card animate-in" style="animation-delay:${index * 0.06}s">
-      <div class="card-header">
-        <div class="game-info">
-          <div class="team-logos">
-            <div class="team-logo" style="background:${g.home_team.color}">${g.home_team.short_name[0]}</div>
-            <div class="team-logo" style="background:${g.away_team.color}">${g.away_team.short_name[0]}</div>
-          </div>
-          <div>
-            <div class="game-matchup">${g.home_team.short_name} vs ${g.away_team.short_name}</div>
-            <div class="game-time">${g.start_time || 'TBD'} &middot; ${g.broadcast}</div>
-          </div>
-        </div>
-        ${badge}
-      </div>
-      <div class="narrative">${card.narrative_hook}</div>
-      ${stats}
-      ${progress}
-      ${tweets}
-      <div class="card-divider"></div>
-      ${market}
-      <div class="card-footer">
-        <div class="card-timestamp">Score: ${card.relevance_score.toFixed(2)}</div>
-        <div class="card-actions">
-          <span class="action-btn">&#128278;</span>
-          <span class="action-btn">&#9733;</span>
-        </div>
-      </div>
-    </div>`;
-}
-
-// ── Render Live Card ──
-function renderLiveCard(card, index) {
-  const g = card.game;
-  const m = card.market;
-  const ev = card.event_trigger || {};
-  const badge = renderBadge(card.badge, card);
-  const stats = renderStats(card.stats);
-  const progress = card.progress ? renderProgress(card.progress) : '';
-  const tweets = card.tweets.map(renderTweet).join('');
-  const gameLabel = `${g.home_team.short_name} vs ${g.away_team.short_name}`;
-  const market = m ? renderMarket(m, true, gameLabel) : '';
-
-  const homeLeading = g.home_score >= g.away_score;
-
-  return `
-    <div class="card live-border animate-in" style="animation-delay:${index * 0.06}s">
-      <div class="live-scoreboard">
-        <div class="sb-team ${!homeLeading ? 'trailing' : ''}">
-          <div class="team-logo" style="background:${g.home_team.color}">${g.home_team.short_name[0]}</div>
-          <div class="sb-team-name">${g.home_team.short_name}</div>
-        </div>
-        <div class="sb-center">
-          <div class="sb-scores">
-            <div class="sb-score" ${!homeLeading ? 'style="color:var(--text-tri)"' : ''}>${g.home_score}</div>
-            <div class="sb-divider">-</div>
-            <div class="sb-score" ${homeLeading ? 'style="color:var(--text-tri)"' : ''}>${g.away_score}</div>
-          </div>
-          <div class="sb-clock"><span class="live-dot"></span> ${g.clock}</div>
-        </div>
-        <div class="sb-team ${homeLeading ? 'trailing' : ''}">
-          <div class="sb-team-name">${g.away_team.short_name}</div>
-          <div class="team-logo" style="background:${g.away_team.color}">${g.away_team.short_name[0]}</div>
-        </div>
-      </div>
-      <div style="display:flex;justify-content:flex-end;padding:6px 16px 0;">${badge}</div>
-      ${ev.what ? `
-        <div class="event-trigger">
-          <div class="event-icon ${ev.icon_type || 'score'}">${ev.icon || '⚡'}</div>
-          <div>
-            <div class="event-what">${ev.what}</div>
-            <div class="event-when"><span class="ago">Just now</span> &middot; ${ev.when || ''}</div>
-          </div>
-        </div>` : ''}
-      ${ev.icon_type === 'momentum' ? renderMomentumChart(g.home_team.color, g.away_team.color) : ''}
-      <div class="narrative">${card.narrative_hook}</div>
-      ${progress}
-      ${stats}
-      ${tweets}
-      <div class="card-divider"></div>
-      ${market}
-      <div class="card-footer">
-        <div class="card-timestamp"><span class="live-dot"></span> Updated just now</div>
-        <div class="card-actions">
-          <span class="action-btn">&#128278;</span>
-          <span class="action-btn">&#9733;</span>
-        </div>
-      </div>
-    </div>`;
-}
-
-// ── Render Helpers ──
-function renderBadge(badge, card) {
-  if (!badge) return '';
-
-  // For live cards, use descriptive labels based on event type
-  let label = badge;
-  if (card && card.card_type === 'live_event' && card.event_trigger) {
-    const liveLabels = {
-      'score': 'Just In',
-      'momentum': 'Momentum',
-      'stat': 'On Track',
-      'milestone': 'Record Watch',
-      'injury': 'Injury',
-    };
-    label = liveLabels[card.event_trigger.icon_type] || badge;
   }
 
-  const cls = {
-    milestone: 'badge-milestone', trending: 'badge-trending',
-    hot: 'badge-hot', stat: 'badge-stat', news: 'badge-news'
-  }[badge] || 'badge-trending';
-  const icons = { milestone: '🏆', trending: '🔥', hot: '🔥', stat: '📊', news: '📰' };
-  return `<div class="badge ${cls}">${icons[badge] || ''} ${label}</div>`;
-}
-
-function renderStats(stats) {
-  if (!stats || !stats.length) return '';
-  return `<div class="stats-row">${stats.map(s =>
-    `<div class="stat-box">
-      <div class="stat-value ${s.color || ''}">${s.value}</div>
-      <div class="stat-label">${s.label}</div>
-    </div>`
-  ).join('')}</div>`;
-}
-
-function renderProgress(p) {
-  const pct = p.target > 0 ? Math.min(100, (p.current / p.target) * 100) : 0;
-  return `
-    <div class="progress-section">
-      <div class="progress-header">
-        <span class="progress-label">${p.label}</span>
-        <span class="progress-value">${p.current} / ${p.target}</span>
-      </div>
-      <div class="progress-bar">
-        <div class="progress-fill ${p.fill_color || 'green'}" style="width:${pct}%"></div>
-      </div>
-    </div>`;
-}
-
-function renderTweet(tw) {
-  return `
-    <div class="tweet-embed">
-      <div class="tweet-avatar">${tw.author_avatar || tw.author_name[0]}</div>
-      <div class="tweet-content">
-        <div class="tweet-top">
-          <span class="tweet-name">${tw.author_name}</span>
-          <span class="tweet-handle">${tw.author_handle}</span>
-          <span class="tweet-ago">${tw.time_ago}</span>
-        </div>
-        <div class="tweet-body">${tw.body}</div>
-      </div>
-      <div class="tweet-x">&#120143;</div>
-    </div>`;
-}
-
-function renderMarket(m, isLive = false, gameLabel = '') {
-  // Detect if odds have moved
-  const hasMovement = m.selections.some(s => s.previous_odds);
-  let movementHtml = '';
-  if (hasMovement && isLive) {
-    movementHtml = '<span class="odds-movement up">&#9650; Shifted</span>';
-  }
-
-  const suspended = m.status === 'suspended';
-  const safeMLabel = m.label.replace(/'/g, "\\'");
-  const safeGame = gameLabel.replace(/'/g, "\\'");
-
-  const selections = m.selections.map((sel, i) => {
-    const isFirst = i === 0;
-    const highlighted = isFirst && !suspended ? 'highlighted' : '';
-    const suspClass = suspended ? 'suspended' : '';
-    const prevOdds = sel.previous_odds && !suspended
-      ? `<div class="odds-prev">was ${sel.previous_odds}</div>` : '';
-    const oddsColor = suspended ? 'neutral' : (isFirst ? '' : 'neutral');
-    const safeSelLabel = sel.label.replace(/'/g, "\\'");
-    const clickHandler = suspended
-      ? ''
-      : `onclick="openBetSlip('${safeSelLabel}', '${sel.odds}', '${safeMLabel}', '${safeGame}', '${m.id || ''}')"`;
+  function chipHTML({ id, label, active, hook, color }) {
+    const style = color ? `--chip-color:${color};` : '';
     return `
-      <div class="market-btn ${highlighted} ${suspClass}" ${clickHandler}>
-        <div class="selection">${sel.label}</div>
-        <div class="odds ${oddsColor}">${suspended ? '—' : sel.odds}</div>
-        ${prevOdds}
-      </div>`;
-  }).join('');
-
-  return `
-    <div class="market-section">
-      <div class="market-label">
-        <span>${m.label}</span>
-        ${movementHtml}
-      </div>
-      <div class="market-options">${selections}</div>
-    </div>`;
-}
-
-// ── Bet Slip ──
-let _betOdds = null;
-let _betSlipPendingRefresh = false;
-
-function betSlipIsOpen() {
-  return document.getElementById('bet-slip-drawer').classList.contains('open');
-}
-
-function openBetSlip(selLabel, odds, marketLabel, gameLabel, marketId) {
-  _betOdds = odds;
-
-  document.getElementById('bss-selection-label').textContent = selLabel;
-  document.getElementById('bss-odds-badge').textContent = odds;
-  document.getElementById('bss-market-label').textContent = marketLabel;
-  document.getElementById('bss-game-label').textContent = gameLabel || '';
-
-  // Reset state
-  document.getElementById('stake-input').value = '';
-  document.getElementById('payout-value').textContent = '—';
-  document.getElementById('payout-profit').textContent = '—';
-  document.getElementById('place-bet-btn').disabled = true;
-  document.getElementById('place-bet-btn').style.display = '';
-  document.getElementById('bet-confirmed').style.display = 'none';
-
-  document.getElementById('bet-slip-overlay').classList.add('open');
-  document.getElementById('bet-slip-drawer').classList.add('open');
-
-  // Focus stake input after transition
-  setTimeout(() => document.getElementById('stake-input').focus(), 450);
-}
-
-function closeBetSlip() {
-  document.getElementById('bet-slip-overlay').classList.remove('open');
-  document.getElementById('bet-slip-drawer').classList.remove('open');
-
-  // Re-render the live feed if any cards arrived while the slip was open
-  if (_betSlipPendingRefresh && currentTab === 'live') {
-    _betSlipPendingRefresh = false;
-    renderFilteredLive();
-  }
-}
-
-function setStake(amount) {
-  document.getElementById('stake-input').value = amount;
-  updatePayout();
-}
-
-function updatePayout() {
-  const stakeInput = document.getElementById('stake-input');
-  const stake = parseFloat(stakeInput.value);
-  const btn = document.getElementById('place-bet-btn');
-
-  if (!stake || stake <= 0 || !_betOdds) {
-    document.getElementById('payout-value').textContent = '—';
-    document.getElementById('payout-profit').textContent = '—';
-    btn.disabled = true;
-    return;
+      <button class="chip${active ? ' active' : ''}" data-id="${escape(id)}"
+        ${hook ? `data-hook="${escape(hook)}"` : ''}
+        style="${style}" type="button">
+        ${hook ? `<span class="dot"></span>` : ''}
+        <span>${escape(label)}</span>
+      </button>
+    `;
   }
 
-  // Parse American odds to payout multiplier
-  const oddsNum = parseInt(_betOdds.toString().replace(/[^0-9-+]/g, ''), 10);
-  let profit;
-  if (oddsNum > 0) {
-    profit = stake * (oddsNum / 100);
-  } else {
-    profit = stake * (100 / Math.abs(oddsNum));
+  function handleChipClick(id) {
+    if (id === 'all') {
+      activeHook = 'all';
+      activeLeague = 'all';
+    } else if (id.startsWith('league:')) {
+      const label = id.slice('league:'.length);
+      activeLeague = activeLeague === label ? 'all' : label;
+    } else if (HOOKS[id]) {
+      activeHook = activeHook === id ? 'all' : id;
+    }
+    renderFilterStrip();
+    renderFeed();
   }
-  const payout = stake + profit;
 
-  document.getElementById('payout-value').textContent = `$${payout.toFixed(2)}`;
-  document.getElementById('payout-profit').textContent = `+$${profit.toFixed(2)}`;
-  btn.disabled = false;
-}
-
-function placeBet() {
-  const stake = parseFloat(document.getElementById('stake-input').value);
-  const selLabel = document.getElementById('bss-selection-label').textContent;
-  const odds = document.getElementById('bss-odds-badge').textContent;
-  const payout = document.getElementById('payout-value').textContent;
-
-  // Show confirmation state
-  document.getElementById('place-bet-btn').style.display = 'none';
-  document.getElementById('confirmed-desc').textContent =
-    `${selLabel} @ ${odds} — potential payout ${payout}`;
-  document.getElementById('bet-confirmed').style.display = '';
-
-  // Auto-close after a moment
-  setTimeout(() => closeBetSlip(), 2200);
-}
-
-// ── Momentum Chart (for momentum shift events) ──
-function renderMomentumChart(homeColor, awayColor) {
-  const bars = [];
-  // Generate a visual pattern showing momentum shifting
-  const heights = [30, 15, 45, 20, 35, 25, 50, 30, 65, 80, 90, 100];
-  const teams =   ['b','a','b','a','b','a','b','a','a','a','a','a'];
-  for (let i = 0; i < heights.length; i++) {
-    const isFaded = i < 8;
-    const color = teams[i] === 'a' ? homeColor : awayColor;
-    const opacity = isFaded ? '0.3' : '1';
-    bars.push(`<div class="momentum-bar" style="height:${heights[i]}%;background:${color};opacity:${opacity}"></div>`);
+  function passesFilters(card) {
+    if (activeHook !== 'all') {
+      const ht = card.hook_type || 'article';
+      if (ht !== activeHook) return false;
+    }
+    if (activeLeague !== 'all') {
+      const leaguePattern = LEAGUE_CHIPS.find(l => l.label === activeLeague)?.match;
+      const league = card.game?.broadcast || '';
+      if (!leaguePattern || !leaguePattern.test(league)) return false;
+    }
+    return true;
   }
-  return `<div class="momentum-chart">${bars.join('')}</div>`;
-}
 
-// ── Live Game Pills ──
-function renderLiveGames(games) {
-  const strip = document.getElementById('live-games-strip');
-  strip.innerHTML = games.map(g => {
-    const isLive = g.status === 'live';
-    return `
-      <div class="game-pill ${isLive ? 'active' : ''}" data-game-id="${g.id}">
-        <div class="pill-quarter">${isLive ? '<span class="live-dot"></span> ' + g.clock : g.start_time}</div>
-        <div class="pill-team ${g.home_score < g.away_score ? 'losing' : ''}">
-          <span style="color:${g.home_team.color}">${g.home_team.short_name}</span>
-          <span>${g.home_score}</span>
+  // ── Feed ────────────────────────────────────────────────────────────
+
+  function renderFeed() {
+    const feed = document.getElementById('feed');
+    const endEl = document.getElementById('feed-end');
+    const filtered = allCards.filter(passesFilters);
+
+    if (filtered.length === 0) {
+      feed.innerHTML = `
+        <div class="empty-state">
+          <span class="pulse-icon"></span>
+          Waiting for the next story.
+          ${allCards.length > 0 ? '<br><small style="color:var(--text-dim);">No cards match the current filter.</small>' : ''}
         </div>
-        <div class="pill-team ${g.away_score < g.home_score ? 'losing' : ''}">
-          <span style="color:${g.away_team.color}">${g.away_team.short_name}</span>
-          <span>${g.away_score}</span>
-        </div>
-      </div>`;
-  }).join('');
-}
-
-function updateGamePill(game) {
-  // Find existing pill for this game and update in place
-  const strip = document.getElementById('live-games-strip');
-  const existing = strip.querySelector(`[data-game-id="${game.id}"]`);
-
-  if (existing) {
-    // Update score and clock in place without redrawing
-    const quarter = existing.querySelector('.pill-quarter');
-    const teams = existing.querySelectorAll('.pill-team');
-
-    if (game.status === 'live') {
-      quarter.innerHTML = `<span class="live-dot"></span> ${game.clock}`;
-      existing.classList.add('active');
-    } else if (game.status === 'finished') {
-      quarter.innerHTML = 'FT';
-      quarter.style.color = 'var(--text-tri)';
-      existing.classList.remove('active');
+      `;
+      endEl.hidden = true;
+      feed.setAttribute('aria-busy', 'false');
+      return;
     }
 
-    if (teams[0]) {
-      const scoreEl = teams[0].querySelector('span:last-child');
-      const oldScore = scoreEl.textContent;
-      scoreEl.textContent = game.home_score;
-      // Brief flash when score changes
-      if (oldScore !== String(game.home_score)) {
-        scoreEl.style.color = 'var(--green)';
-        setTimeout(() => { scoreEl.style.color = ''; }, 1500);
-      }
-      teams[0].classList.toggle('losing', game.home_score < game.away_score);
-    }
-    if (teams[1]) {
-      const scoreEl = teams[1].querySelector('span:last-child');
-      const oldScore = scoreEl.textContent;
-      scoreEl.textContent = game.away_score;
-      if (oldScore !== String(game.away_score)) {
-        scoreEl.style.color = 'var(--green)';
-        setTimeout(() => { scoreEl.style.color = ''; }, 1500);
-      }
-      teams[1].classList.toggle('losing', game.away_score < game.home_score);
-    }
-  } else {
-    // First time seeing this game live — rebuild strip
-    loadLiveGames();
+    feed.innerHTML = filtered.map(renderHeroCard).join('');
+    feed.setAttribute('aria-busy', 'false');
+    endEl.hidden = false;
+
+    // Wire engagement buttons
+    feed.querySelectorAll('.engagement button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.dataset.kind === 'share') return;
+        btn.classList.toggle('active');
+      });
+    });
+
+    // CTA placeholder — Stage 5 deep-links to operator bet slip
+    feed.querySelectorAll('.cta-button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        btn.animate([{ transform: 'scale(0.98)' }, { transform: 'scale(1)' }], { duration: 120 });
+      });
+    });
   }
-}
+
+  async function loadFeed() {
+    try {
+      const res = await fetch('/api/feed?type=prematch&limit=100', { cache: 'no-store' });
+      const data = await res.json();
+      allCards = (data.cards || []);
+      // Sort: news-driven first (has hook_type + source_name), newest cards first
+      allCards.sort((a, b) => {
+        const aNews = !!(a.hook_type && a.source_name);
+        const bNews = !!(b.hook_type && b.source_name);
+        if (aNews !== bNews) return aNews ? -1 : 1;
+        return (b.relevance_score || 0) - (a.relevance_score || 0);
+      });
+      renderFeed();
+    } catch (err) {
+      console.error('Feed fetch failed', err);
+      document.getElementById('feed').innerHTML = `
+        <div class="empty-state">Feed unavailable. Try refresh.</div>
+      `;
+    }
+  }
+
+  // ── Init ────────────────────────────────────────────────────────────
+
+  function init() {
+    // Embed mode: strip shell chrome when loaded inside iframe with ?embed=1
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('embed') === '1' || window.self !== window.top) {
+      document.body.classList.add('embed');
+    }
+    renderFilterStrip();
+    loadFeed();
+  }
+
+  return {
+    init,
+    refresh: loadFeed,
+  };
+})();
+
+document.addEventListener('DOMContentLoaded', PULSE.init);

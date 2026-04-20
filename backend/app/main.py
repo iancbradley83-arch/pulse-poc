@@ -224,6 +224,7 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
     published = await candidate_store.list_candidates(
         above_threshold_only=True, status="published", limit=100,
     )
+    import time as _time
     for cand in published:
         game = games_by_id.get(cand.game_id)
         if game is None:
@@ -240,10 +241,19 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
             "tactical": BadgeType.TRENDING, "preview": BadgeType.TRENDING,
             "article": BadgeType.NEWS,
         }.get(cand.hook_type.value, BadgeType.TRENDING)
-        feed.add_prematch_card(assembler.assemble_prematch(
+        card = assembler.assemble_prematch(
             game=game, market=market, narrative=narrative or "",
             badge=badge, relevance=cand.score, stats=[], tweets=[],
-        ))
+        )
+        # Design-handoff fields so the Hero variant has source / recency / hook
+        card.hook_type = cand.hook_type.value
+        card.headline = news.headline if news else (cand.narrative or "")
+        card.source_name = news.source_name if news else None
+        # Rough ago: ingestion time vs now (published_at often missing from LLM output)
+        ingested = news.ingested_at if news else cand.created_at
+        if ingested:
+            card.ago_minutes = max(0, int((_time.time() - ingested) / 60))
+        feed.add_prematch_card(card)
 
 
 async def _load_mock_prematch():

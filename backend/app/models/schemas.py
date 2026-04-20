@@ -169,3 +169,12 @@ class Card(BaseModel):
     relevance_score: float = 0.0
     created_at: float = Field(default_factory=time.time)
     ttl_seconds: int = 600  # 10 min default, shorter for live
+
+    # Stage 2 design handoff — populated for news-driven cards so the Hero
+    # variant can render source / recency / hook styling without joining back
+    # to the candidate store.
+    hook_type: Optional[str] = None          # "injury", "team_news", "tactical", ...
+    headline: Optional[str] = None           # short news headline
+    source_name: Optional[str] = None        # "BBC Sport", "Sky Sports"
+    source_handle: Optional[str] = None      # "@SkySportsNews"
+    ago_minutes: Optional[int] = None        # minutes since news was published/ingested
