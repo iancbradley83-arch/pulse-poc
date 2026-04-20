@@ -63,70 +63,123 @@ Context for pre-match storytelling is sourced externally (Stage 5).
 - Scripted timelines still run in parallel against mock data, behind `/demo`.
 - **Demo unlock:** cards show real pre-match markets + odds for tonight's real soccer fixtures.
 
-### Stage 2 — Embed hooks (the "holes") *(3–5 days)*
+### Stage 2 — News-driven recommendation engine + validation surface *(2–3 weeks)*
 
-Ship the integration surface before building more content on top.
+**Core product insight (north star):** Pulse exists because something has happened in the real world that makes a market, a combo, or a Bet Builder *interesting right now*. The **trigger is news**, not statistics. A news item (injury, team news, transfer, manager quote, tactical story, pre-match preview, post-match reaction, breaking story) arrives → we resolve it to teams/players/fixtures → we find the markets whose interest just changed → we build a candidate card with the news as the hook, the market as the angle, and stats as supporting evidence.
+
+The existing engine in `app/engine/` already encodes this shape — `EventDetector`, `EntityResolver`, `MarketMatcher`, `RelevanceScorer`, `NarrativeGenerator`, `CardAssembler`. The mock cards all follow it: Shams says LeBron is locked in → LeBron points O/U card. Saka returning from injury → Saka goalscorer card. What Stage 2 adds is a **real news pipeline** feeding that engine, a **candidate store** between engine and feed, a **policy layer** for scoring / dedupe / volume control, and a **validation surface** for human review.
+
+**Architecture**
+
+```
+┌───────────────────┐   ┌─────────────────┐   ┌───────────────────┐
+│ News ingestion    │──>│ Entity resolver │──>│ Relevance gate    │
+│ (feeds, articles, │   │ (teams /        │   │ (does any market  │
+│  social, LLM,     │   │  players /      │   │  care about this  │
+│  operator press)  │   │  fixtures)      │   │  news?)           │
+└───────────────────┘   └─────────────────┘   └─────────┬─────────┘
+                                                        ▼
+                                              ┌───────────────────┐
+                                              │ Market matcher    │
+                                              │ (single / combo / │
+                                              │  BB candidates)   │
+                                              └─────────┬─────────┘
+                                                        ▼
+                          ┌────────────────────────────────────────┐
+                          │ Candidate store                        │
+                          │ (every candidate, scored, with reason) │
+                          └────────┬────────────────────┬──────────┘
+                                   ▼                    ▼
+                          ┌────────────────┐   ┌────────────────────┐
+                          │ Policy / rank  │   │ /admin/candidates  │
+                          │ / volume       │   │ table — review,    │
+                          │ controls       │   │ approve, label,    │
+                          └───────┬────────┘   │ tune thresholds    │
+                                  ▼            └────────────────────┘
+                          ┌────────────────┐
+                          │ Public feed    │
+                          │ (user-facing)  │
+                          └────────────────┘
+```
+
+**What Stage 2 specifically builds**
+
+1. **News-ingestion layer.** A `NewsIngester` service that pulls real-world sports news into a normalised `NewsItem` schema (headline, body, source, timestamp, mentions, type). Triggers:
+   - *Articles / editorial* — ESPN, BBC, Sky, The Athletic (LLM + web search is the cheapest v1; dedicated sports news APIs later).
+   - *Team news* — injury updates, starting XI leaks, pressers, tactical tweaks, suspensions.
+   - *Transfers* — confirmed / rumoured moves affecting price-relevant players.
+   - *Social signal* — verified reporters (Shams, Schefter, Fabrizio Romano, Ornstein style). Likely LLM-assisted topic classification over an X/RSS/Bluesky stream.
+   - *Operator-originated* — price moves, new markets opening, early-payout triggers, suspensions (these are "the market itself has news"; produced from Rogue + Rogue SSE in Stage 6/7 but the ingester shape is the same).
+2. **Entity resolution.** Reuse / extend `app/engine/entity_resolver.py` — map each news item's mentions to Rogue entity IDs (team, player, fixture, league).
+3. **Relevance gate.** Reject news that touches no market in the current Rogue catalogue. If the Saka news story breaks but no Saka-related market exists, skip.
+4. **Market / combo matcher.** Extend `MarketMatcher` so a single news item can produce:
+   - *Single*: the primary market the news directly affects.
+   - *Bet Builder*: same-event multi-leg if the story supports it (e.g. Saka fit → Saka scorer + Arsenal win + O2.5 → validated via `/v1/sportsdata/betbuilder/match`).
+   - *Combo*: cross-event accumulator when several same-weekend news items compound (e.g. three different team-news stories all pointing to heavy favourites).
+5. **Candidate store.** New model/table (`CandidateCard`) persisting every candidate whether it publishes or not. Fields: news source(s), hook type, affected entities, market(s) / legs, score, threshold decision, reason, generated_at, expires_at, status (draft / queued / published / rejected / expired), narrative draft.
+6. **Policy layer.** Scoring uses the existing `RelevanceScorer` shape but with news-first weights:
+   - News quality (source credibility, recency, exclusivity)
+   - Entity market-coverage (does the story touch a liquid market?)
+   - Price-movement corroboration (odds shift after the news = strong signal)
+   - Stats support (form / h2h / xG / career numbers back the angle)
+   - Fixture proximity (kickoff within the next N days)
+   Plus global rules: per-fixture dedupe, per-embed volume caps, per-source rate-limit, theme/BB exclusivity.
+7. **Validation surface — `/admin/candidates`.** Table of every candidate from the last run. Columns: timestamp, source, headline, hook type, teams, market/legs, odds, score, threshold ✓/✗, reason, status, narrative draft. Filters: hook type, league, status, date. Default: above-threshold; toggle shows all. Approve-override / reject-override with a reason code → labelled dataset to tune scoring. Counts dashboard: candidates generated today, published, rejected, by hook / source.
+
+**Target volume.** Hundreds of candidates/day across all fixtures is the healthy engine output. The public feed shows the top slice (per user / per embed), ranked and rate-limited. Live betting will multiply candidate volume when it lands.
+
+**What Stage 2 is NOT**
+- Not a schedule-driven "curated picks" product. Themes/combos are generators *inside* the engine, not the primary output.
+- Not a stats-first product. Stats are card supporting evidence, never the trigger.
+- Not the embed/widget delivery layer — that's Stage 5, after the content is good enough to embed.
+
+### Stage 3 — Combo + Bet Builder recommender *(1–2 weeks)*
+
+Builds inside the Stage 2 engine as a specialised candidate generator. A news hook that affects multiple related markets produces a BB or combo candidate instead of (or in addition to) a single. Scheduled theme-based combos run as secondary generators when news density is low.
+
+- **`ComboBuilder`** proposes:
+  - **News-triggered Bet Builders** — e.g. Saka fit → Saka scorer + Arsenal win + O2.5. Validated via Rogue `/v1/sportsdata/betbuilder/match`.
+  - **News-triggered accumulators** — compound stories across same-weekend fixtures.
+  - **Scheduled curated themes** (fallback when news is thin):
+    - *Weekend Safe Lean* — 2 legs, combined odds 2.00–4.00.
+    - *Value Long Shot* — 4–5 legs, 8.00+.
+    - *Goal-fest* — 3 legs, O2.5 + BTTS stacks, 3.00–6.00.
+    - *Derby Bet Builder* — same-event BB on a high-profile fixture.
+    - *Top-League Treble* — 3 legs from EPL/La Liga/UCL 1X2 picks.
+- **New card type** — multi-leg, stacked selections, total odds, single deep-link CTA.
+- **Deep-link shapes** — operator config supports separate templates for single / combo / BB.
+
+### Stage 4 — Stats / supporting-evidence layer *(1 week)*
+
+Stats are *evidence*, never trigger. This stage makes them richer so narratives land harder.
+
+- `StatsEnricher` service — given a fixture + hook, pull relevant recent form / xG / h2h / career numbers.
+- Sources: LLM + web search v1; dedicated stats feed (Opta / SofaScore-style) later.
+- Cache per fixture for the day.
+- Feeds `NarrativeGenerator` and the card's `stats[]` array.
+
+### Stage 5 — Embed delivery (the "holes") *(1 week)*
+
+Ship this once the content is good enough to sell. Up to here Pulse is a standalone URL.
 
 - **URL-param scoping** — `?sport=soccer&leagues=epl,ucl&operator=apuesta-total&theme=dark`.
 - **Embed modes** — iframe (MVP), JS snippet / shadow DOM (later).
-- **Deep-link template system** — operator config stores a URL pattern; every card's CTA renders through it. Supports single-bet, combo, and Bet Builder link shapes. Per-operator.
-- **Theme tokens** — CSS variables for colors / fonts / radius / logo, driven by operator config.
-- **Auth token passthrough** — accept a token via URL param or `postMessage`; store for session; pass through on deep-link clicks (pre-populated bet slip). Validation is operator-specific — stubbed until Stage 7 docs arrive.
+- **Deep-link template system** — per-operator config stores URL patterns for single / combo / BB bet-slip handoff.
+- **Theme tokens** — CSS variables (colors / fonts / radius / logo).
+- **Auth token passthrough** — URL param or `postMessage`; stored for session; included on deep-link clicks. Validation stub until Stage 8.
 - **CORS + domain allowlist** — embed tokens tied to licensed operator domains.
-- **Admin config** — minimal YAML/JSON config file per operator for v1 (licence, domains, deep-link template, theme). Proper dashboard later.
+- **Admin config** — minimal YAML/JSON per operator for v1. Proper dashboard later.
 
-### Stage 3 — Singles recommender (narrative-driven pre-match cards) *(1 week)*
+### Stage 6 — Live pulse: SSE odds overlay *(2–3 days)*
 
-Reshape the existing engine for pre-match singles on real soccer fixtures.
+- Subscribe to Rogue SSE for in-play events inside the embed's scope.
+- Piped odds updates feed the candidate engine as a new hook type (*price move*) and update displayed prices on live cards.
+- Cards de-list if markets close / teams suspend.
 
-- `PreMatchEventDetector` — generates angle-based events from Rogue data + context:
-  - Value line detected (odds favourably moved vs market consensus)
-  - Form streak (from enriched context — comes online in Stage 5)
-  - Top league fixture of the day
-  - BB-enabled high-interest match
-- `MarketMatcher` extended to handle Rogue's full market tree (AH, BTTS, player props).
-- `NarrativeGenerator` reworked for soccer-specific angles.
-- Cards show a single market, a reason, and a deep-link CTA.
-- **Demo unlock:** a real pre-match feed. Ugly narrative until Stage 5, but real data end-to-end.
-
-### Stage 4 — Combo + Bet Builder recommender *(1–2 weeks)*
-
-The new product wedge. Separate engine component.
-
-- **`ComboBuilder` engine** that proposes:
-  - **Same-game Bet Builders** — multiple selections from one event. Validated via Rogue `/v1/sportsdata/betbuilder/match` before offering to the user (drops combinations the book rejects).
-  - **Cross-event accumulators** — 2–4 legs from different fixtures in the day's scope.
-- **Selection logic — curated themes only for v1.** Each theme is a named editorial slot with its own rules. Starter set:
-  - *Weekend Safe Lean* — 2 legs, short-priced favourites, combined odds 2.00–4.00.
-  - *Value Long Shot* — 4–5 legs, combined odds 8.00+.
-  - *Goal-fest* — 3 legs across events, O2.5 + BTTS stacks, 3.00–6.00.
-  - *Derby Bet Builder* — same-event BB on a high-profile fixture, 3 legs.
-  - *Top-League Treble* — 3 legs from EPL/La Liga/UCL 1X2 picks.
-- **Leg count is per-theme**, not global. Easy to add/remove themes without reshaping code.
-- Automation can backfill once we have real running data; defer.
-- **New card type** — multi-leg card with stacked selections, total odds, and a single deep-link CTA that loads the full combo into the operator's bet slip.
-- **Deep-link shapes** — operator config supports separate templates for single / combo / BB (different operators assemble bet slips differently).
-- **Demo unlock:** combo + BB recs alongside singles. The "why would I use Pulse instead of just opening my sportsbook" answer.
-
-### Stage 5 — Pre-match context enrichment *(1–2 weeks)*
-
-**Source: LLM + web search at card-assembly time.** Cheapest POC route, lowest pipeline overhead.
-
-- New `ContextEnricher` service — takes fixture details (teams, league, kickoff) and returns a structured blob: recent form, injury news, head-to-head note, hook sentence.
-- Called once per fixture at card-assembly time; cached on the fixture ID for the day (avoid repeated API spend).
-- Feeds `NarrativeGenerator` (card copy) and `ComboBuilder` theme selection (e.g. injury news → skip that fixture in "safe lean").
-- Model + prompt TBD; measure cost per card early and budget accordingly.
-
-### Stage 6 — Live pulse: SSE odds overlay *(2–3 days, post-MVP)*
-
-- Subscribe to Rogue SSE for the in-play events inside the embed's scope.
-- Piped odds updates mark cards as "line moved" and update the displayed prices.
-- Cards can de-list if markets close / teams suspend.
-
-### Stage 7 — Live event detection *(~1 week, post-MVP)*
+### Stage 7 — Live event detection *(~1 week)*
 
 - `SSEEventDetector` for score changes, suspensions, odds moves, new markets.
-- Live-specific card types: momentum, line-moved, market-opened, early-payout.
+- Live-specific candidate hooks: goal scored, red card, suspension, momentum shift, line moved, market opened, early-payout triggered.
 
 ### Stage 8 — Operator auth handoff *(1–2 weeks, pending operator docs)*
 
@@ -144,7 +197,7 @@ The new product wedge. Separate engine component.
 
 ## MVP definition
 
-**"Pre-match soccer Pulse, embedded in one operator, recommending singles + combos + Bet Builder."**
+**"Pre-match soccer Pulse — news-driven feed, singles + combos + Bet Builder, with an admin validation surface, embedded in one operator."**
 
 That's Stages 1 → 5. Everything after is enhancement.
 
@@ -153,17 +206,21 @@ That's Stages 1 → 5. Everything after is enhancement.
 ## Decisions made
 
 1. **Built standalone, embedded into operators.** Pulse is its own product; operators are distribution channels.
-2. **Soccer only for MVP.** Other sports deferred.
-3. **Pre-match only for MVP.** Live deferred to Stage 6+.
-4. **Singles + combos + Bet Builder** all in MVP scope. Bet Builder validation via Rogue `/betbuilder/match`.
-5. **Content scope: international leagues.** EPL, La Liga, Bundesliga, Serie A, Ligue 1, UCL, Europa.
-6. **Demo mode permanent.** Scripted LAL/ARS/KC lives at `/demo` forever.
-7. **Monetization: fixed embed licence.** No click attribution tracking needed.
+2. **News is the trigger; stats are supporting evidence.** Every card answers "what just happened that makes this market interesting?" Not the reverse.
+3. **Soccer only for MVP.** Other sports deferred.
+4. **Pre-match only for MVP.** Live deferred to Stage 6+.
+5. **Singles + combos + Bet Builder** all in MVP scope. BB validation via Rogue `/betbuilder/match`.
+6. **Content scope: international leagues.** EPL, La Liga, Bundesliga, Serie A, Ligue 1, UCL, Europa.
+7. **Demo mode permanent.** Scripted LAL/ARS/KC lives at `/demo` forever.
+8. **Monetization: fixed embed licence.** No click attribution tracking needed.
+9. **Validation surface in-app.** `/admin/candidates` table; default above-threshold, toggle for shadow candidates.
+10. **Volume target:** hundreds of candidates/day engine-side; published feed is a top-slice, ranked and rate-limited per embed.
 
 ## Still open
 
-- **Cards per day / slot allocation** — how many Pulse cards show per embed per day, and how are theme slots filled (one-of-each-theme, or volume-weighted)?
-- **LLM budget** — acceptable cost per card in Stage 5; model choice (Haiku for enrichment?).
+- **Hook build order** — which news-source detectors to wire first (articles, team news, injury, transfers, social reporters)?
+- **News ingestion v1 approach** — LLM + web search is the cheap path; budget and model TBD.
+- **Entity resolution coverage** — how deep on squad/player coverage before the matcher can reliably connect news to markets?
 - **Operator docs** — Ian to source; blocks Stage 8.
 
 ---
