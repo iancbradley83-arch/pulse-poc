@@ -213,14 +213,16 @@ That's Stages 1 → 5. Everything after is enhancement.
 6. **Content scope: international leagues.** EPL, La Liga, Bundesliga, Serie A, Ligue 1, UCL, Europa.
 7. **Demo mode permanent.** Scripted LAL/ARS/KC lives at `/demo` forever.
 8. **Monetization: fixed embed licence.** No click attribution tracking needed.
-9. **Validation surface in-app.** `/admin/candidates` table; default above-threshold, toggle for shadow candidates.
+9. **Validation surface in-app.** `/admin/candidates` table. V1 is read-only — columns + filters, no approve/reject buttons. Approve/reject land in a later pass once we've watched the engine for a while.
 10. **Volume target:** hundreds of candidates/day engine-side; published feed is a top-slice, ranked and rate-limited per embed.
+11. **News-ingestion v1:** LLM + web search per upcoming fixture ("what's news on these teams/players in the last 24h?"). No long-running RSS pipeline for v1. Cost budget + model choice TBD.
+12. **Candidate store:** SQLite file in the backend (zero new infra). Migrate to Postgres later if needed.
 
 ## Still open
 
-- **Hook build order** — which news-source detectors to wire first (articles, team news, injury, transfers, social reporters)?
-- **News ingestion v1 approach** — LLM + web search is the cheap path; budget and model TBD.
 - **Entity resolution coverage** — how deep on squad/player coverage before the matcher can reliably connect news to markets?
+- **LLM model + budget** — Haiku for ingestion vs. larger model for narrative generation; target cost per fixture per day.
+- **Engine cadence** — how often does the ingest-score-store loop run (every 15 min? every hour? on-demand only)?
 - **Operator docs** — Ian to source; blocks Stage 8.
 
 ---
