@@ -12,27 +12,41 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 
 
 class MarketCatalog:
-    def __init__(self):
+    def __init__(self, *, load_mock: bool = True):
         self.markets: dict[str, Market] = {}
         self._by_player: dict[str, list[str]] = defaultdict(list)
         self._by_team: dict[str, list[str]] = defaultdict(list)
         self._by_game: dict[str, list[str]] = defaultdict(list)
         self._by_player_stat: dict[str, list[str]] = defaultdict(list)
-        self._load()
+        if load_mock:
+            self._load_from_mock()
 
-    def _load(self):
+    def _load_from_mock(self):
         raw = json.loads((DATA_DIR / "mock_markets.json").read_text())
         for m in raw:
             market = Market(**m)
-            self.markets[market.id] = market
-            self._by_game[market.game_id].append(market.id)
-            if market.player_id:
-                self._by_player[market.player_id].append(market.id)
-                if market.stat_type:
-                    key = f"{market.player_id}:{market.stat_type}"
-                    self._by_player_stat[key].append(market.id)
-            if market.team_id:
-                self._by_team[market.team_id].append(market.id)
+            self._index(market)
+
+    def replace_all(self, markets: list[Market]) -> None:
+        """Swap the whole catalogue (used by the Rogue boot-time loader)."""
+        self.markets.clear()
+        self._by_player.clear()
+        self._by_team.clear()
+        self._by_game.clear()
+        self._by_player_stat.clear()
+        for market in markets:
+            self._index(market)
+
+    def _index(self, market: Market) -> None:
+        self.markets[market.id] = market
+        self._by_game[market.game_id].append(market.id)
+        if market.player_id:
+            self._by_player[market.player_id].append(market.id)
+            if market.stat_type:
+                key = f"{market.player_id}:{market.stat_type}"
+                self._by_player_stat[key].append(market.id)
+        if market.team_id:
+            self._by_team[market.team_id].append(market.id)
 
     def get(self, market_id: str) -> Market | None:
         return self.markets.get(market_id)

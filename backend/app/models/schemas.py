@@ -11,6 +11,7 @@ class Sport(str, Enum):
     NFL = "nfl"
     EPL = "epl"
     MLB = "mlb"
+    SOCCER = "soccer"  # generic soccer fixtures sourced from Rogue across international leagues
 
 
 class GameStatus(str, Enum):

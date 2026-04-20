@@ -1,18 +1,31 @@
 """PULSE POC — FastAPI application."""
 
 import json
+import logging
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
+from app.config import (
+    PULSE_DATA_SOURCE,
+    ROGUE_BASE_URL,
+    ROGUE_CATALOGUE_DAYS_AHEAD,
+    ROGUE_CATALOGUE_MAX_EVENTS,
+    ROGUE_CONFIG_JWT,
+    ROGUE_RATE_LIMIT_PER_SECOND,
+    ROGUE_SOCCER_SPORT_ID,
+)
 from app.models.schemas import (
     Game, Tweet, StatDisplay, ProgressDisplay, BadgeType, Card, CardType,
 )
 from app.services.market_catalog import MarketCatalog
 from app.services.feed_manager import FeedManager
 from app.services.game_simulator import GameSimulator
+from app.services.rogue_client import RogueClient
+from app.services.catalogue_loader import fetch_soccer_snapshot
+from app.services.rogue_prematch import build_prematch_cards
 from app.engine.event_detector import EventDetector
 from app.engine.entity_resolver import EntityResolver
 from app.engine.market_matcher import MarketMatcher
@@ -21,6 +34,7 @@ from app.engine.narrative_generator import NarrativeGenerator
 from app.engine.card_assembler import CardAssembler
 from app.api.routes import create_routes
 
+logger = logging.getLogger("pulse")
 DATA_DIR = Path(__file__).parent / "data"
 
 # ── Initialize services ──
@@ -79,7 +93,62 @@ async def websocket_endpoint(websocket: WebSocket):
 # ── Generate pre-match cards on startup ──
 @app.on_event("startup")
 async def generate_prematch_cards():
-    """Generate pre-match context cards for tonight's games."""
+    """Generate pre-match cards.
+
+    Data-source controlled by PULSE_DATA_SOURCE env var:
+      - "mock" (default): hand-crafted LAL/ARS/KC demo cards from local JSON.
+      - "rogue": real pre-match soccer fixtures pulled from the Rogue API.
+    """
+    if PULSE_DATA_SOURCE == "rogue":
+        await _load_rogue_prematch()
+        return
+    await _load_mock_prematch()
+
+
+async def _load_rogue_prematch():
+    if not ROGUE_CONFIG_JWT:
+        logger.warning(
+            "[PULSE] PULSE_DATA_SOURCE=rogue but ROGUE_CONFIG_JWT is empty — falling back to mock."
+        )
+        await _load_mock_prematch()
+        return
+
+    logger.info("[PULSE] Loading Rogue soccer catalogue (days=%s, max=%s)",
+                ROGUE_CATALOGUE_DAYS_AHEAD, ROGUE_CATALOGUE_MAX_EVENTS)
+
+    client = RogueClient(
+        base_url=ROGUE_BASE_URL,
+        config_jwt=ROGUE_CONFIG_JWT,
+        per_second=ROGUE_RATE_LIMIT_PER_SECOND,
+    )
+    try:
+        games, markets, _ = await fetch_soccer_snapshot(
+            client,
+            sport_id=ROGUE_SOCCER_SPORT_ID,
+            days_ahead=ROGUE_CATALOGUE_DAYS_AHEAD,
+            max_events=ROGUE_CATALOGUE_MAX_EVENTS,
+        )
+    finally:
+        await client.close()
+
+    if not games:
+        logger.warning("[PULSE] Rogue returned no usable fixtures — falling back to mock.")
+        await _load_mock_prematch()
+        return
+
+    catalog.replace_all(markets)
+    # Expose the real fixtures to the rest of the app by registering them
+    # on the simulator's game registry — the API routes read from there.
+    simulator._games = {g.id: g for g in games}
+
+    cards = build_prematch_cards(games, catalog, assembler)
+    for card in cards:
+        feed.add_prematch_card(card)
+    logger.info("[PULSE] Rogue mode — %d games, %d markets, %d cards",
+                len(games), len(markets), len(cards))
+
+
+async def _load_mock_prematch():
     games_raw = json.loads((DATA_DIR / "mock_games.json").read_text())
     tweets_raw = json.loads((DATA_DIR / "mock_tweets.json").read_text())
     players_raw = json.loads((DATA_DIR / "mock_players.json").read_text())

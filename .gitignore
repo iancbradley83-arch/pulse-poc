@@ -4,3 +4,6 @@ __pycache__/
 .env
 .DS_Store
 node_modules/
+.env
+twitter-bot/.env
+.claude/
