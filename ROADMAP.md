@@ -229,6 +229,17 @@ That's Stages 1 → 5. Everything after is enhancement.
 
 ## Current status
 
+- **Stage 2 — DONE locally (2026-04-20).** News-driven recommendation engine + validation surface running end-to-end.
+  - Schemas + SQLite store: `app/models/news.py`, `app/services/candidate_store.py`.
+  - News ingester: `app/services/news_ingester.py` (Claude Haiku 4.5 + native web search + terminal `submit_news_items` tool, prompt-cached system prompt). Mock fallback `app/services/mock_news_ingester.py` (20 curated stories) when `ANTHROPIC_API_KEY` is not set.
+  - Entity resolver: `app/engine/news_entity_resolver.py` — builds alias map from live Rogue catalogue at boot; mentions -> `fixture_ids` + `team_ids`.
+  - Candidate builder: `app/engine/candidate_builder.py` — hook_type drives market priority (1X2 primary, O/U or BTTS for tactical / injury hooks).
+  - Scorer + policy: `app/engine/news_scorer.py` — weighted (news_quality 0.30, coverage 0.20, proximity 0.20, hook 0.20, stats 0.10). Policy does per-(fixture,hook) dedupe, per-fixture cap (default 3), publish threshold `PULSE_PUBLISH_THRESHOLD=0.55`.
+  - Orchestrator: `app/services/candidate_engine.py`. Run-once pipeline invoked at boot in Rogue mode.
+  - Admin surface: `GET /admin/candidates` (HTML table with filters + toggle for above-threshold-only) and `GET /admin/candidates.json`. Counts-by-hook × status summary at the bottom.
+  - Published candidates overlay the public pre-match feed on top of Stage 1's baseline 1X2 card per fixture.
+  - **Verified via live smoke:** 10 real Rogue fixtures → 67 LLM-scouted candidates (18 injury, 21 team_news, 8 manager_quote, 10 preview, 7 tactical, 3 article) → 59 published, 8 rejected by policy cap → 69 cards in public feed.
+  - **Known rough edges surfaced by the admin table** (exactly what it's for): loose entity match occasionally cross-posts news from a mentioned team to a different fixture featuring the same team; narrative is the raw headline (Stage 4 will rewrite via LLM); scores cluster 0.7–0.8 with little spread (scorer weights need tuning once we have more data).
 - **Stage 1 — DONE locally (2026-04-20).** Real Rogue soccer fixtures render end-to-end through the existing mobile UI.
   - `RogueClient` (Python port of the TS MCP): `backend/app/services/rogue_client.py`.
   - Catalogue loader: `backend/app/services/catalogue_loader.py`. Pulls top-league soccer fixtures from Rogue, filters to international leagues (EPL / La Liga / Bundesliga / Serie A / Ligue 1 / UCL / Europa), deep-scans `includeMarkets=default`, maps to internal `Game`/`Market` types.

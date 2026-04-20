@@ -7,3 +7,5 @@ node_modules/
 .env
 twitter-bot/.env
 .claude/
+backend/app/data/pulse.db
+backend/app/data/pulse.db-*

@@ -1,0 +1,182 @@
+[
+  {
+    "teams": ["Arsenal"],
+    "hook_type": "injury",
+    "headline": "Saka returns to full training ahead of weekend fixture",
+    "summary": "Bukayo Saka completed his first full training session since the hamstring issue, per Arteta's Friday press conference. Expected to start.",
+    "source_name": "Sky Sports",
+    "source_url": "https://www.skysports.com/football/news",
+    "mentions": ["Bukayo Saka", "Arsenal", "Mikel Arteta"]
+  },
+  {
+    "teams": ["Arsenal"],
+    "hook_type": "team_news",
+    "headline": "Arteta hints at shape change — Odegaard pushed higher",
+    "summary": "Press conference Thursday: Arteta suggested Odegaard will play a more advanced role with Jorginho anchoring. Points to higher xG ceiling.",
+    "source_name": "The Athletic",
+    "source_url": "https://theathletic.com/football",
+    "mentions": ["Martin Odegaard", "Jorginho", "Arsenal", "Mikel Arteta"]
+  },
+  {
+    "teams": ["Chelsea"],
+    "hook_type": "injury",
+    "headline": "Palmer doubtful for London derby",
+    "summary": "Cole Palmer absent from final training session with a knock. Maresca says decision will be made Saturday morning. Chelsea's main creative outlet.",
+    "source_name": "BBC Sport",
+    "source_url": "https://www.bbc.com/sport/football",
+    "mentions": ["Cole Palmer", "Chelsea", "Enzo Maresca"]
+  },
+  {
+    "teams": ["Chelsea"],
+    "hook_type": "tactical",
+    "headline": "Maresca signals pragmatic away setup",
+    "summary": "Hints at a low-block, counter approach. Five at the back likely. Points to a low-scoring game if Arsenal can't break them down.",
+    "source_name": "Sky Sports",
+    "source_url": "https://www.skysports.com/football/news",
+    "mentions": ["Chelsea", "Enzo Maresca"]
+  },
+  {
+    "teams": ["Crystal Palace"],
+    "hook_type": "team_news",
+    "headline": "Eze to start after returning from international duty",
+    "summary": "Glasner confirms Eberechi Eze will start despite late return. Palace desperate for creativity after goalless run.",
+    "source_name": "BBC Sport",
+    "source_url": "https://www.bbc.com/sport/football",
+    "mentions": ["Eberechi Eze", "Crystal Palace", "Oliver Glasner"]
+  },
+  {
+    "teams": ["West Ham"],
+    "hook_type": "injury",
+    "headline": "Bowen ruled out with calf strain",
+    "summary": "Jarrod Bowen confirmed out for 2-3 weeks. Major blow to West Ham's attacking threat — top scorer this season.",
+    "source_name": "The Athletic",
+    "source_url": "https://theathletic.com/football",
+    "mentions": ["Jarrod Bowen", "West Ham"]
+  },
+  {
+    "teams": ["Real Madrid"],
+    "hook_type": "manager_quote",
+    "headline": "Ancelotti: Vinicius 'needs a rest' — may drop to bench",
+    "summary": "Carlo Ancelotti told reporters Vinicius Junior looked fatigued in midweek and could start on the bench. Rodrygo would move central.",
+    "source_name": "Marca",
+    "source_url": "https://www.marca.com/en/football",
+    "mentions": ["Vinicius Junior", "Rodrygo", "Real Madrid", "Carlo Ancelotti"]
+  },
+  {
+    "teams": ["Real Madrid"],
+    "hook_type": "preview",
+    "headline": "Real Madrid's dominant home record continues",
+    "summary": "Unbeaten in 24 straight La Liga home matches. Opposition have only scored 0.6 goals per away game this season.",
+    "source_name": "Marca",
+    "source_url": "https://www.marca.com/en/football",
+    "mentions": ["Real Madrid"]
+  },
+  {
+    "teams": ["Barcelona"],
+    "hook_type": "injury",
+    "headline": "Lewandowski returns from back issue",
+    "summary": "Robert Lewandowski cleared by medical staff after missing the previous match. Flick confirms he'll start. 3 goals in his last 4 home games.",
+    "source_name": "Mundo Deportivo",
+    "source_url": "https://www.mundodeportivo.com/en",
+    "mentions": ["Robert Lewandowski", "Barcelona", "Hansi Flick"]
+  },
+  {
+    "teams": ["Atletico Madrid"],
+    "hook_type": "tactical",
+    "headline": "Simeone switches to 4-4-2 diamond",
+    "summary": "Atletico expected to play a diamond with Griezmann at the tip. Higher press, more shots on goal. Over 2.5 backers paying attention.",
+    "source_name": "AS",
+    "source_url": "https://en.as.com/en",
+    "mentions": ["Antoine Griezmann", "Atletico Madrid", "Diego Simeone"]
+  },
+  {
+    "teams": ["Athletic Bilbao"],
+    "hook_type": "team_news",
+    "headline": "Nico Williams available after suspension",
+    "summary": "Nico Williams returns from one-match ban. Top creator for the club and has 4 assists in his last 5 starts.",
+    "source_name": "AS",
+    "source_url": "https://en.as.com/en",
+    "mentions": ["Nico Williams", "Athletic Bilbao"]
+  },
+  {
+    "teams": ["Osasuna"],
+    "hook_type": "injury",
+    "headline": "Budimir a doubt with hamstring tightness",
+    "summary": "Ante Budimir, Osasuna's main striker, missed the final training session. Without him, goal threat is minimal.",
+    "source_name": "Marca",
+    "source_url": "https://www.marca.com/en/football",
+    "mentions": ["Ante Budimir", "Osasuna"]
+  },
+  {
+    "teams": ["Brighton"],
+    "hook_type": "team_news",
+    "headline": "Mitoma starts after being rested midweek",
+    "summary": "Kaoru Mitoma fully fit and expected to start. He's been rotated recently but is one of Brighton's most direct attackers.",
+    "source_name": "The Athletic",
+    "source_url": "https://theathletic.com/football",
+    "mentions": ["Kaoru Mitoma", "Brighton"]
+  },
+  {
+    "teams": ["Lecce"],
+    "hook_type": "tactical",
+    "headline": "Lecce set up to absorb pressure",
+    "summary": "Manager confirms a compact 5-4-1 at home. Lecce have averaged 1.4 goals conceded per home game this season.",
+    "source_name": "Gazzetta dello Sport",
+    "source_url": "https://www.gazzetta.it/english",
+    "mentions": ["Lecce"]
+  },
+  {
+    "teams": ["Fiorentina"],
+    "hook_type": "team_news",
+    "headline": "Kean confirmed to start as lone striker",
+    "summary": "Moise Kean leads the line. Seven goals in his last nine matches. Fiorentina have been prolific away from home.",
+    "source_name": "Gazzetta dello Sport",
+    "source_url": "https://www.gazzetta.it/english",
+    "mentions": ["Moise Kean", "Fiorentina"]
+  },
+  {
+    "teams": ["Mallorca"],
+    "hook_type": "preview",
+    "headline": "Mallorca struggle against top-six opposition",
+    "summary": "Only 1 win in their last 12 matches against La Liga top-half sides. Low-scoring pattern at home in these matchups.",
+    "source_name": "Marca",
+    "source_url": "https://www.marca.com/en/football",
+    "mentions": ["Mallorca"]
+  },
+  {
+    "teams": ["Valencia"],
+    "hook_type": "injury",
+    "headline": "Hugo Duro out — Valencia short up front",
+    "summary": "Hugo Duro ruled out with a thigh injury. Valencia have no natural backup in form — attack may struggle.",
+    "source_name": "AS",
+    "source_url": "https://en.as.com/en",
+    "mentions": ["Hugo Duro", "Valencia"]
+  },
+  {
+    "teams": ["Girona"],
+    "hook_type": "manager_quote",
+    "headline": "Michel targets 'aggressive pressing' at home",
+    "summary": "Michel says Girona will press high from the first whistle. Points to chaotic first-half goals pattern we've seen this season.",
+    "source_name": "Marca",
+    "source_url": "https://www.marca.com/en/football",
+    "mentions": ["Girona", "Michel"]
+  },
+  {
+    "teams": ["Real Betis"],
+    "hook_type": "team_news",
+    "headline": "Isco in the starting XI after rest",
+    "summary": "Isco returns after being benched midweek. Betis look a different team with him orchestrating — main source of chance creation.",
+    "source_name": "AS",
+    "source_url": "https://en.as.com/en",
+    "mentions": ["Isco", "Real Betis"]
+  },
+  {
+    "teams": ["Elche"],
+    "hook_type": "preview",
+    "headline": "Elche's home struggles against top teams",
+    "summary": "Elche have been leaky at home this season — conceded 2+ goals in 6 of their last 8 home matches against top-half opponents.",
+    "source_name": "AS",
+    "source_url": "https://en.as.com/en",
+    "mentions": ["Elche"]
+  }
+]

@@ -9,7 +9,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from app.config import (
+    ANTHROPIC_API_KEY,
     PULSE_DATA_SOURCE,
+    PULSE_DB_PATH,
+    PULSE_NEWS_CACHE_TTL_HOURS,
+    PULSE_NEWS_MAX_FIXTURES,
+    PULSE_NEWS_MAX_SEARCHES,
+    PULSE_NEWS_MODEL,
+    PULSE_PUBLISH_THRESHOLD,
     ROGUE_BASE_URL,
     ROGUE_CATALOGUE_DAYS_AHEAD,
     ROGUE_CATALOGUE_MAX_EVENTS,
@@ -26,13 +33,20 @@ from app.services.game_simulator import GameSimulator
 from app.services.rogue_client import RogueClient
 from app.services.catalogue_loader import fetch_soccer_snapshot
 from app.services.rogue_prematch import build_prematch_cards
+from app.services.candidate_store import CandidateStore
+from app.services.mock_news_ingester import MockNewsIngester
+from app.services.candidate_engine import CandidateEngine
 from app.engine.event_detector import EventDetector
 from app.engine.entity_resolver import EntityResolver
 from app.engine.market_matcher import MarketMatcher
 from app.engine.relevance_scorer import RelevanceScorer
 from app.engine.narrative_generator import NarrativeGenerator
 from app.engine.card_assembler import CardAssembler
+from app.engine.news_entity_resolver import NewsEntityResolver
+from app.engine.candidate_builder import CandidateBuilder
+from app.engine.news_scorer import NewsScorer, PolicyLayer
 from app.api.routes import create_routes
+from app.api.admin import create_admin_routes
 
 logger = logging.getLogger("pulse")
 DATA_DIR = Path(__file__).parent / "data"
@@ -64,9 +78,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Candidate engine plumbing ──
+from typing import Optional as _Optional
+candidate_store = CandidateStore(PULSE_DB_PATH)
+candidate_engine: _Optional[CandidateEngine] = None  # initialised in startup
+
 # ── Mount routes ──
 router = create_routes(catalog, feed, simulator)
 app.include_router(router)
+admin_router = create_admin_routes(candidate_store, catalog, simulator)
+app.include_router(admin_router)
 
 # ── Static files ──
 STATIC_DIR = Path(__file__).parent / "static"
@@ -141,11 +162,88 @@ async def _load_rogue_prematch():
     # on the simulator's game registry — the API routes read from there.
     simulator._games = {g.id: g for g in games}
 
+    # Baseline pre-match cards (1X2 per fixture). The candidate engine below
+    # overlays news-driven cards on top.
     cards = build_prematch_cards(games, catalog, assembler)
     for card in cards:
         feed.add_prematch_card(card)
+
+    await _run_candidate_engine(simulator._games)
+
     logger.info("[PULSE] Rogue mode — %d games, %d markets, %d cards",
-                len(games), len(markets), len(cards))
+                len(games), len(markets), len(feed.prematch_cards))
+
+
+async def _run_candidate_engine(games_by_id: dict[str, Game]):
+    """Run the news-driven engine across the live catalogue.
+
+    Uses MockNewsIngester by default (no API key). When ANTHROPIC_API_KEY is
+    set, we can swap in the real NewsIngester — imported lazily so missing
+    SDK deps don't break the mock path.
+    """
+    global candidate_engine
+    await candidate_store.init()
+
+    if ANTHROPIC_API_KEY:
+        try:
+            from anthropic import AsyncAnthropic
+            from app.services.news_ingester import NewsIngester
+
+            anth = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            ingester = NewsIngester(
+                client=anth,
+                store=candidate_store,
+                model=PULSE_NEWS_MODEL,
+                max_searches=PULSE_NEWS_MAX_SEARCHES,
+                cache_ttl_seconds=PULSE_NEWS_CACHE_TTL_HOURS * 3600,
+            )
+            logger.info("[PULSE] Candidate engine using real LLM ingester (%s)", PULSE_NEWS_MODEL)
+        except Exception as exc:
+            logger.warning("[PULSE] LLM ingester unavailable (%s) — using mock", exc)
+            ingester = MockNewsIngester(candidate_store)
+    else:
+        ingester = MockNewsIngester(candidate_store)
+        logger.info("[PULSE] Candidate engine using mock news (no ANTHROPIC_API_KEY)")
+
+    resolver = NewsEntityResolver(games_by_id)
+    builder = CandidateBuilder(catalog)
+    scorer = NewsScorer()
+    policy = PolicyLayer(publish_threshold=PULSE_PUBLISH_THRESHOLD)
+
+    candidate_engine = CandidateEngine(
+        ingester=ingester, resolver=resolver, builder=builder,
+        scorer=scorer, policy=policy, store=candidate_store,
+    )
+
+    counts = await candidate_engine.run_once(
+        games_by_id, max_fixtures=PULSE_NEWS_MAX_FIXTURES,
+    )
+    logger.info("[PULSE] Candidate engine counts: %s", counts)
+
+    # Promote published candidates into the public feed
+    published = await candidate_store.list_candidates(
+        above_threshold_only=True, status="published", limit=100,
+    )
+    for cand in published:
+        game = games_by_id.get(cand.game_id)
+        if game is None:
+            continue
+        market_id = cand.market_ids[0] if cand.market_ids else None
+        market = catalog.get(market_id) if market_id else None
+        if market is None:
+            continue
+        news = await candidate_store.get_news_item(cand.news_item_id) if cand.news_item_id else None
+        narrative = (news.summary if news else cand.narrative) or (news.headline if news else "")
+        badge = {
+            "injury": BadgeType.NEWS, "team_news": BadgeType.NEWS,
+            "transfer": BadgeType.NEWS, "manager_quote": BadgeType.NEWS,
+            "tactical": BadgeType.TRENDING, "preview": BadgeType.TRENDING,
+            "article": BadgeType.NEWS,
+        }.get(cand.hook_type.value, BadgeType.TRENDING)
+        feed.add_prematch_card(assembler.assemble_prematch(
+            game=game, market=market, narrative=narrative or "",
+            badge=badge, relevance=cand.score, stats=[], tweets=[],
+        ))
 
 
 async def _load_mock_prematch():
