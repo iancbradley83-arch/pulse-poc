@@ -299,10 +299,12 @@ class ComboBuilder:
             try:
                 quote = await self._rogue.calculate_bets([virtual_selection])
             except Exception as exc:
-                logger.warning("ComboBuilder: Rogue calculate_bets errored: %s", exc)
+                logger.warning("ComboBuilder: calculate_bets errored for %s — %s",
+                               virtual_selection[:48], exc)
                 quote = None
             if isinstance(quote, dict):
                 bets = quote.get("Bets") or []
+                bet_types = [(b or {}).get("Type") for b in bets]
                 bb_bet = next(
                     (b for b in bets if (b or {}).get("Type") in ("BetBuilder", "Single")),
                     None,
@@ -310,10 +312,27 @@ class ComboBuilder:
                 if bb_bet and isinstance(bb_bet.get("TrueOdds"), (int, float)):
                     total_odds = round(float(bb_bet["TrueOdds"]), 2)
                     price_source = "rogue_calculate_bets"
-                    logger.debug(
-                        "ComboBuilder: BB %s priced at %.2f via calculate_bets",
-                        virtual_selection[:32], total_odds,
+                    logger.info(
+                        "ComboBuilder: BB priced at %.2f via calculate_bets (vs=%s, bet_types=%s)",
+                        total_odds, virtual_selection[:48], bet_types,
                     )
+                else:
+                    # API returned but didn't give us a BB total — log the
+                    # whole shape so we can see what we're missing.
+                    errors = quote.get("Errors") or []
+                    nonactive = quote.get("NonActiveSelections") or {}
+                    logger.warning(
+                        "ComboBuilder: calculate_bets returned no usable BB price "
+                        "(vs=%s, bet_types=%s, errors=%s, nonactive=%s)",
+                        virtual_selection[:48], bet_types,
+                        [e.get("Error") for e in errors[:3]],
+                        {k: v for k, v in nonactive.items() if v},
+                    )
+            elif quote is None:
+                logger.warning(
+                    "ComboBuilder: calculate_bets returned None for %s",
+                    virtual_selection[:48],
+                )
 
         # Fallback total: multiply decimal odds naively if neither Rogue nor
         # Kmianko gave us a real number. Naive product over-states correlated
