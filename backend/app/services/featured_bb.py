@@ -134,7 +134,7 @@ async def fetch_and_build_featured_bb_cards(
             ))
 
         card = Card(
-            card_type=CardType.PREMATCH_ENHANCED,
+            card_type=CardType.PRE_MATCH,
             game=game,
             badge=BadgeType.TRENDING,
             narrative_hook=f"Operator's pick for {event_name}",
