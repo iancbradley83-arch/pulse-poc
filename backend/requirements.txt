@@ -6,8 +6,3 @@ python-dotenv==1.0.1
 anthropic==0.42.0
 httpx==0.28.1
 aiosqlite==0.20.0
-# Playwright mints Apuesta Total bet-slip session tokens (kmianko.com) so the
-# KmiankoBetslipClient can quote real correlated BB prices. The Cloudflare
-# managed challenge blocks plain HTTP clients — Chromium is needed to pass it.
-# Image-size cost ~80MB; chromium browser binary fetched in the Dockerfile.
-playwright==1.50.0
