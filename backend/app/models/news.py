@@ -38,6 +38,7 @@ class HookType(str, Enum):
     ARTICLE = "article"            # generic editorial / news
     PRICE_MOVE = "price_move"      # market-internal — Stage 6+
     LIVE_MOMENT = "live_moment"    # Stage 7+
+    FEATURED = "featured"          # operator-curated (Rogue /v1/featured/betbuilder)
     OTHER = "other"
 
 

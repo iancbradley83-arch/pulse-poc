@@ -45,6 +45,7 @@ from app.services.game_simulator import GameSimulator
 from app.services.rogue_client import RogueClient
 from app.services.catalogue_loader import fetch_soccer_snapshot
 from app.services.rogue_prematch import build_prematch_cards
+from app.services.featured_bb import fetch_and_build_featured_bb_cards
 from app.services.candidate_store import CandidateStore
 from app.services.mock_news_ingester import MockNewsIngester
 from app.services.candidate_engine import CandidateEngine
@@ -271,6 +272,26 @@ async def _load_rogue_prematch():
             simulator._games,
             rogue_client=client,
         )
+
+        # Surface operator-curated featured BBs (Apuesta Total's
+        # /v1/featured/betbuilder picks). Each is priced via calculate_bets
+        # and rendered as a self-contained Card — bypasses candidate_store
+        # and MarketCatalog because the operator picks markets we don't
+        # whitelist (Goalscorer, Corners O/U etc.).
+        if os.getenv("PULSE_FEATURED_BB_ENABLED", "true").lower() == "true":
+            try:
+                featured_max = int(os.getenv("PULSE_FEATURED_BB_MAX", "6"))
+            except ValueError:
+                featured_max = 6
+            featured_cards = await fetch_and_build_featured_bb_cards(
+                client, simulator._games, max_count=featured_max,
+            )
+            for c in featured_cards:
+                feed.add_prematch_card(c)
+            logger.info(
+                "[PULSE] Featured BBs added to feed: %d (out of %d max)",
+                len(featured_cards), featured_max,
+            )
     finally:
         await client.close()
 
