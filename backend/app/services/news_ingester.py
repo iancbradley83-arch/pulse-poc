@@ -90,6 +90,16 @@ Used by downstream entity resolution. Include both short and full forms
 new information, promotional "best bets" listicles, anything older than 48
 hours that isn't still breaking today.
 
+**RELEVANCE — HARD RULE** — every item you return must be directly about
+THIS fixture, its two teams, its managers, or its key players. If a search
+surfaces an unrelated story that happens to mention one of the teams in
+passing (e.g. a Burnley injury story that namedrops Brighton as the next
+opponent two weeks away), DROP IT. Do not surface it. The `mentions` array
+must include at least one of the two teams in the fixture by name, and the
+headline must be about that team or a player at that team — not a third
+team. A bettor reading the card must feel the story is unambiguously
+about THIS match.
+
 **CRITICAL OUTPUT RULE** — the `headline` and `summary` fields must be plain
 prose text. NEVER include XML, HTML, or citation markup of any kind. The
 web_search tool's output includes `<cite index="...">...</cite>` tags around
@@ -188,6 +198,34 @@ class NewsIngester:
             return [NewsItem(**row) for row in cached]
 
         raw_items = await self._call_llm(home=home, away=away, league=league, kickoff_iso=kickoff_iso)
+
+        # Relevance filter — drop items that aren't about this fixture's two
+        # teams. Prompt-level rule already covers this, but belt-and-braces
+        # against the scout occasionally surfacing a third-team story.
+        home_low = (home or "").lower()
+        away_low = (away or "").lower()
+
+        def _mentions_fixture_team(row: dict[str, Any]) -> bool:
+            # Require the HEADLINE or SUMMARY to name one of the fixture's two
+            # teams. The `mentions` array alone is too permissive — the scout
+            # routinely name-drops adjacent teams in passing and the entity
+            # resolver would then incorrectly attach the story.
+            head = str(row.get("headline") or "").lower()
+            body = str(row.get("summary") or "").lower()
+            for team in (home_low, away_low):
+                if not team:
+                    continue
+                if team in head or team in body:
+                    return True
+            return False
+
+        before = len(raw_items)
+        raw_items = [r for r in raw_items if _mentions_fixture_team(r)]
+        if len(raw_items) != before:
+            logger.info(
+                "News ingest: dropped %d/%d items unrelated to %s vs %s",
+                before - len(raw_items), before, home, away,
+            )
 
         news_items = [_raw_to_news(row) for row in raw_items if row.get("headline")]
 

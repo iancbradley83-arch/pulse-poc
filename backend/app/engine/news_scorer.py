@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, Optional
 
 from app.models.news import (
     BetType,
@@ -136,11 +136,18 @@ class PolicyLayer:
         self._threshold = publish_threshold
         self._per_fixture_cap = per_fixture_cap
 
-    def apply(self, candidates: list[CandidateCard]) -> list[CandidateCard]:
+    def apply(self, candidates: list[CandidateCard], *, headlines_by_id: Optional[dict[str, str]] = None) -> list[CandidateCard]:
         # 0. One candidate per news_item_id globally. Prefer validated Bet
         #    Builders over singles from the same news item (BB is the richer
         #    product — same story, more interesting bet). Among BBs or among
         #    singles, pick highest score.
+        def better(a: CandidateCard, b: CandidateCard) -> CandidateCard:
+            a_bb = a.bet_type == BetType.BET_BUILDER
+            b_bb = b.bet_type == BetType.BET_BUILDER
+            if a_bb != b_bb:
+                return a if a_bb else b
+            return a if a.score >= b.score else b
+
         by_news: dict[str, CandidateCard] = {}
         no_news: list[CandidateCard] = []
         for c in candidates:
@@ -148,17 +155,28 @@ class PolicyLayer:
                 no_news.append(c)
                 continue
             prev = by_news.get(c.news_item_id)
-            if prev is None:
-                by_news[c.news_item_id] = c
-                continue
-            # BB beats single; otherwise higher score wins.
-            prev_is_bb = prev.bet_type == BetType.BET_BUILDER
-            cur_is_bb = c.bet_type == BetType.BET_BUILDER
-            if cur_is_bb and not prev_is_bb:
-                by_news[c.news_item_id] = c
-            elif cur_is_bb == prev_is_bb and c.score > prev.score:
-                by_news[c.news_item_id] = c
+            by_news[c.news_item_id] = c if prev is None else better(prev, c)
         candidates = list(by_news.values()) + no_news
+
+        # 0b. Content dedupe by normalized headline. The scout runs once per
+        #     fixture and can independently surface the same real-world story
+        #     for several fixtures (different news_item_ids, same headline).
+        #     Collapse to one candidate per headline — BB wins, then score.
+        if headlines_by_id:
+            def _norm_head(s: str) -> str:
+                return " ".join((s or "").lower().split())
+
+            by_head: dict[str, CandidateCard] = {}
+            untitled: list[CandidateCard] = []
+            for c in candidates:
+                head = headlines_by_id.get(c.news_item_id or "") if c.news_item_id else None
+                key = _norm_head(head) if head else None
+                if not key:
+                    untitled.append(c)
+                    continue
+                prev = by_head.get(key)
+                by_head[key] = c if prev is None else better(prev, c)
+            candidates = list(by_head.values()) + untitled
 
         # 1. Best-per-(fixture, hook_type) dedupe
         best: dict[tuple[str, HookType], CandidateCard] = {}

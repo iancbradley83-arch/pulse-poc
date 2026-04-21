@@ -68,10 +68,18 @@ class CandidateEngine:
         *,
         max_fixtures: int,
     ) -> dict[str, int]:
-        """Run the full pipeline across the current catalogue. Returns counts."""
+        """Run the full pipeline across the current catalogue. Returns counts.
+
+        The policy layer runs ONCE at the end across all fixtures so it can
+        see (and dedupe) scout-duplicated stories that landed on different
+        fixtures with different news_item_ids.
+        """
         counts = {"news": 0, "candidates": 0, "published": 0, "fixtures": 0}
         fixtures = list(games.values())[:max_fixtures]
         counts["fixtures"] = len(fixtures)
+
+        all_scored: list[CandidateCard] = []
+        all_items: list[NewsItem] = []
 
         for game in fixtures:
             items = await self._ingester.ingest_for_fixture(
@@ -82,6 +90,7 @@ class CandidateEngine:
                 kickoff_iso=game.start_time or "",
             )
             counts["news"] += len(items)
+            all_items.extend(items)
 
             drafts: list[CandidateCard] = []
             for item in items:
@@ -96,8 +105,7 @@ class CandidateEngine:
                 # fails or is rejected by the book.
                 drafts.extend(self._builder.build(item))
 
-                # Try a Bet Builder per news item's *primary* fixture (resolver
-                # now returns one fixture; defensive iteration if that changes).
+                # Try a Bet Builder per news item's *primary* fixture.
                 if self._combo_builder is not None:
                     for fixture_id in item.fixture_ids:
                         fixture = games.get(fixture_id)
@@ -107,24 +115,28 @@ class CandidateEngine:
                         if bb is not None:
                             drafts.append(bb)
 
-            # Score
-            scored: list[CandidateCard] = []
+            # Score this fixture's drafts now (needs in-memory news items).
             for c in drafts:
-                news = await self._store.get_news_item(c.news_item_id) if c.news_item_id else None
+                news = next((it for it in items if it.id == c.news_item_id), None)
+                if news is None:
+                    news = await self._store.get_news_item(c.news_item_id) if c.news_item_id else None
                 if news is None:
                     continue
                 game_for_score = games.get(c.game_id)
                 c.score, c.reason = self._scorer.score(
                     candidate=c, news=news, game=game_for_score,
                 )
-                scored.append(c)
+                all_scored.append(c)
 
-            # Policy layer (dedupe + cap + threshold)
-            final = self._policy.apply(scored)
-            counts["candidates"] += len(final)
-            counts["published"] += sum(1 for c in final if c.threshold_passed)
+        # Global policy pass — sees every candidate from every fixture. Lets
+        # the headline-dedupe collapse a story that the scout returned for
+        # multiple fixtures (e.g. a weekend injury round-up).
+        headlines_by_id = {it.id: it.headline for it in all_items if it.id and it.headline}
+        final = self._policy.apply(all_scored, headlines_by_id=headlines_by_id)
+        counts["candidates"] = len(final)
+        counts["published"] = sum(1 for c in final if c.threshold_passed)
 
-            await self._store.save_candidates(final)
+        await self._store.save_candidates(final)
 
         logger.info(
             "CandidateEngine run: fixtures=%d news=%d candidates=%d published=%d",
