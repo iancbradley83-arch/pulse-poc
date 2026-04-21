@@ -2,11 +2,13 @@
 
 import json
 import logging
+import time
+import uuid
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 from app.config import (
     ANTHROPIC_API_KEY,
@@ -94,9 +96,19 @@ STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-@app.get("/")
+# Boot-time static version stamp. Every Railway restart bumps it, which
+# invalidates browser caches of /static/app.js and /static/styles.css without
+# needing manual cache-control headers on the static mount.
+STATIC_VERSION = f"{int(time.time())}-{uuid.uuid4().hex[:6]}"
+_INDEX_HTML = (STATIC_DIR / "index.html").read_text().replace("{{ VERSION }}", STATIC_VERSION)
+
+
+@app.get("/", response_class=HTMLResponse)
 async def serve_index():
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    return HTMLResponse(
+        _INDEX_HTML,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 # ── WebSocket ──

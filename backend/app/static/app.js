@@ -390,4 +390,8 @@ const PULSE = (() => {
   };
 })();
 
+// Expose on window so the inline `onclick="PULSE.refresh()"` in the header
+// refresh button resolves (inline handlers run in global scope and can't see
+// module-scoped `const PULSE` bindings).
+window.PULSE = PULSE;
 document.addEventListener('DOMContentLoaded', PULSE.init);
