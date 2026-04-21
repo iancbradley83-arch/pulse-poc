@@ -214,6 +214,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ── Generate pre-match cards on startup ──
+_rerun_task: _Optional["asyncio.Task"] = None  # noqa: F821
+
+
 @app.on_event("startup")
 async def generate_prematch_cards():
     """Generate pre-match cards.
@@ -222,13 +225,70 @@ async def generate_prematch_cards():
       - "mock" (default): hand-crafted LAL/ARS/KC demo cards from local JSON.
       - "rogue": real pre-match soccer fixtures pulled from the Rogue API.
     """
+    global _rerun_task
     if PULSE_DATA_SOURCE == "rogue":
         await _load_rogue_prematch()
+        # Kick off the periodic rerun loop AFTER initial load completes.
+        # The loop sleeps first, so it doesn't compete with the boot pass.
+        import asyncio as _asyncio
+        _rerun_task = _asyncio.create_task(_scheduled_rerun_loop())
         return
     await _load_mock_prematch()
 
 
-async def _load_rogue_prematch():
+# In-flight on-demand rerun task — guarded so /admin/rerun can't kick off
+# parallel runs. While one is running, the endpoint returns 409.
+_ondemand_rerun_inflight: bool = False
+
+
+@app.post("/admin/rerun")
+async def admin_rerun():
+    """On-demand candidate-engine rerun for demos. Builds into a staging
+    FeedManager and atomic-swaps when complete (visible feed never goes
+    empty during the ~3-min run). Guarded against parallel invocations —
+    second call while one is in flight returns 409.
+
+    No auth on the endpoint today (POC). Cost: same ~$0.30-0.50 per run as
+    the scheduled loop.
+    """
+    global _ondemand_rerun_inflight
+    if PULSE_DATA_SOURCE != "rogue":
+        raise HTTPException(400, "rerun only valid when PULSE_DATA_SOURCE=rogue")
+    if _ondemand_rerun_inflight:
+        raise HTTPException(409, "a rerun is already in flight")
+    _ondemand_rerun_inflight = True
+    t0 = time.time()
+    try:
+        staging = FeedManager()
+        await _load_rogue_prematch(target_feed=staging)
+        new_cards = list(staging.prematch_cards)
+        if not new_cards:
+            raise HTTPException(500, "rerun produced 0 cards — keeping prior feed")
+        feed.replace_prematch_cards(new_cards)
+        try:
+            await feed.broadcast_feed_refresh()
+        except Exception:
+            pass
+        elapsed = time.time() - t0
+        logger.info(
+            "[PULSE] On-demand rerun complete: %d cards swapped in (%.1fs)",
+            len(new_cards), elapsed,
+        )
+        return {"ok": True, "cards": len(new_cards), "elapsed_s": round(elapsed, 1)}
+    finally:
+        _ondemand_rerun_inflight = False
+
+
+async def _load_rogue_prematch(target_feed: _Optional[FeedManager] = None) -> None:
+    """Build the Rogue-sourced pre-match feed.
+
+    target_feed: which FeedManager to populate. Defaults to the live `feed`
+    singleton (startup case). The scheduled rerun loop passes a fresh
+    staging FeedManager and atomically swaps it into the live one once
+    fully built — so rerunning never leaves the visible feed empty.
+    """
+    if target_feed is None:
+        target_feed = feed
     if not ROGUE_CONFIG_JWT:
         logger.warning(
             "[PULSE] PULSE_DATA_SOURCE=rogue but ROGUE_CONFIG_JWT is empty — falling back to mock."
@@ -264,13 +324,14 @@ async def _load_rogue_prematch():
         # below overlays news-driven cards on top.
         cards = build_prematch_cards(games, catalog, assembler)
         for card in cards:
-            feed.add_prematch_card(card)
+            target_feed.add_prematch_card(card)
 
         # Real correlated BB + combo prices come from the same RogueClient
         # via POST /v1/betting/calculateBets — no separate service or auth.
         await _run_candidate_engine(
             simulator._games,
             rogue_client=client,
+            target_feed=target_feed,
         )
 
         # Surface operator-curated featured BBs (Apuesta Total's
@@ -290,7 +351,7 @@ async def _load_rogue_prematch():
                     client, simulator._games, max_count=featured_max,
                 )
                 for c in featured_cards:
-                    feed.add_prematch_card(c)
+                    target_feed.add_prematch_card(c)
                 logger.info(
                     "[PULSE] Featured BBs added to feed: %d (out of %d max)",
                     len(featured_cards), featured_max,
@@ -301,13 +362,80 @@ async def _load_rogue_prematch():
         await client.close()
 
     logger.info("[PULSE] Rogue mode — %d games, %d markets, %d cards",
-                len(games), len(markets), len(feed.prematch_cards))
+                len(games), len(markets), len(target_feed.prematch_cards))
+
+
+# ── Scheduled rerun loop ────────────────────────────────────────────────
+#
+# Rebuilds the entire Rogue-sourced pre-match feed every
+# PULSE_RERUN_INTERVAL_SECONDS (default 4h, matching the news cache TTL of
+# 6h so most fixtures should hit the cache on rerun). Builds into a
+# staging FeedManager and atomic-swaps once complete — visible feed never
+# goes empty during a rerun.
+#
+# Cost:
+#   ~$0.30-0.50 per run (Haiku scout × ~8 fixtures + Sonnet rewrite × ~25
+#   candidates). At 4h cadence: 6 runs/day = ~$2-3/day. Cache hits cut
+#   this further, but Railway's ephemeral fs wipes the cache on every
+#   redeploy — moving cache to a persistent volume is a follow-up.
+#
+# Levers:
+#   PULSE_RERUN_ENABLED (default true)            — kill switch
+#   PULSE_RERUN_INTERVAL_SECONDS (default 14400)  — 4h
+#   PULSE_NEWS_MAX_FIXTURES (default 12)          — fewer fixtures = cheaper
+#   PULSE_NEWS_CACHE_TTL_HOURS (default 6)        — longer cache = cheaper
+async def _scheduled_rerun_loop():
+    if PULSE_DATA_SOURCE != "rogue":
+        return
+    if os.getenv("PULSE_RERUN_ENABLED", "true").lower() != "true":
+        logger.info("[PULSE] Scheduled rerun disabled (PULSE_RERUN_ENABLED=false)")
+        return
+    try:
+        interval_s = int(os.getenv("PULSE_RERUN_INTERVAL_SECONDS", "14400"))
+    except ValueError:
+        interval_s = 14400
+    interval_s = max(60, interval_s)  # safety floor 1 min
+    logger.info(
+        "[PULSE] Scheduled rerun loop active — every %ds (~%.1fh)",
+        interval_s, interval_s / 3600,
+    )
+    import asyncio as _asyncio
+    while True:
+        try:
+            await _asyncio.sleep(interval_s)
+        except _asyncio.CancelledError:
+            return
+        t0 = time.time()
+        logger.info("[PULSE] Scheduled rerun starting…")
+        # Build into a fresh staging FeedManager — atomic swap at end means
+        # the visible feed never goes empty.
+        staging = FeedManager()
+        try:
+            await _load_rogue_prematch(target_feed=staging)
+        except Exception as exc:
+            logger.exception("[PULSE] Scheduled rerun failed (keeping prior feed): %s", exc)
+            continue
+        new_cards = list(staging.prematch_cards)
+        if not new_cards:
+            logger.warning("[PULSE] Scheduled rerun produced 0 cards — keeping prior feed")
+            continue
+        feed.replace_prematch_cards(new_cards)
+        try:
+            await feed.broadcast_feed_refresh()
+        except Exception as exc:
+            logger.warning("[PULSE] feed_refresh broadcast errored: %s", exc)
+        elapsed = time.time() - t0
+        logger.info(
+            "[PULSE] Scheduled rerun complete: %d cards swapped in (%.1fs)",
+            len(new_cards), elapsed,
+        )
 
 
 async def _run_candidate_engine(
     games_by_id: dict[str, Game],
     *,
     rogue_client: _Optional[RogueClient] = None,
+    target_feed: _Optional[FeedManager] = None,
 ):
     """Run the news-driven engine across the live catalogue.
 
@@ -316,7 +444,12 @@ async def _run_candidate_engine(
     SDK deps don't break the mock path. When a Rogue client is passed in,
     the ComboBuilder uses it for Bet Builder validation AND for real
     correlated pricing via POST /v1/betting/calculateBets.
+
+    target_feed: which FeedManager to publish into. Defaults to live `feed`;
+    scheduled rerun loop passes a staging FeedManager.
     """
+    if target_feed is None:
+        target_feed = feed
     global candidate_engine
     await candidate_store.init()
 
@@ -539,7 +672,7 @@ async def _run_candidate_engine(
             else:
                 card.total_odds = None
             card.bet_type = "bet_builder"
-        feed.add_prematch_card(card)
+        target_feed.add_prematch_card(card)
 
     if rewriter is not None:
         logger.info("[PULSE] NarrativeRewriter: %d hits, %d misses (fell back to scout copy)",
