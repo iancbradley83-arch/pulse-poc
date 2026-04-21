@@ -97,3 +97,14 @@ class CandidateCard(BaseModel):
 
     narrative: str = ""                  # card copy — "Saka returns to full training..."
     supporting_stats_json: str = ""      # Stage 4 fills this (JSON-encoded list[StatDisplay])
+
+    # Multi-leg pricing — populated by ComboBuilder when we successfully fetch a
+    # real correlated BB price (or operator-boosted combo price) from the
+    # Kmianko bet-slip endpoint. None means "compute naively downstream".
+    total_odds: Optional[float] = None
+    # Where `total_odds` came from. One of:
+    #   "kmianko_bb"   — real correlated BB price (POST betslip with isBetBuilderBet)
+    #   "kmianko_combo"— naive product × operator combo bonus
+    #   "naive"        — pure product, no bonus / no real quote
+    #   None           — total_odds not set
+    price_source: Optional[str] = None

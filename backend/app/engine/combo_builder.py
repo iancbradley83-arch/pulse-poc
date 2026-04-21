@@ -26,6 +26,7 @@ from app.models.news import BetType, CandidateCard, CandidateStatus, HookType, N
 from app.models.schemas import Game, Market, MarketSelection
 from app.services.market_catalog import MarketCatalog
 from app.services.rogue_client import RogueApiError, RogueClient
+from app.services.kmianko_betslip import KmiankoBetslipClient
 
 logger = logging.getLogger(__name__)
 
@@ -160,8 +161,8 @@ def _find_selection(
     return None
 
 
-def _parse_bb_validation(resp: Any) -> tuple[bool, Optional[float], str]:
-    """Normalise Rogue BB response into (valid, total_odds, reason).
+def _parse_bb_validation(resp: Any) -> tuple[bool, Optional[float], str, Optional[str]]:
+    """Normalise Rogue BB response into (valid, total_odds, reason, virtual_selection_id).
 
     Rogue's `/v1/sportsdata/betbuilder/match` response shape (verified against
     prod 2026-04-21):
@@ -170,14 +171,14 @@ def _parse_bb_validation(resp: Any) -> tuple[bool, Optional[float], str]:
           "AvailableSelectionIds": [...more selections you could add...],
           "VirtualSelection": "0VS<piped-ids>" }
 
-    No combined odds in the response — callers must compute their own by
-    multiplying decimal odds. We treat `IsSuccess=true` as "combo is legal"
-    and let the caller handle total-odds computation.
+    No combined odds in the response — callers must compute their own (or quote
+    via Kmianko bet-slip using the returned `VirtualSelection` id, which is
+    what `ComboBuilder.build` does when a `KmiankoBetslipClient` is provided).
     """
     if resp is None:
-        return False, None, "no response"
+        return False, None, "no response", None
     if not isinstance(resp, dict):
-        return False, None, f"unexpected response shape: {type(resp).__name__}"
+        return False, None, f"unexpected response shape: {type(resp).__name__}", None
 
     # Canonical Rogue response key
     if "IsSuccess" in resp:
@@ -221,13 +222,25 @@ def _parse_bb_validation(resp: Any) -> tuple[bool, Optional[float], str]:
             reason = v
             break
 
-    return bool(valid), odds, reason
+    virtual_selection = resp.get("VirtualSelection")
+    if not isinstance(virtual_selection, str) or not virtual_selection:
+        virtual_selection = None
+
+    return bool(valid), odds, reason, virtual_selection
 
 
 class ComboBuilder:
-    def __init__(self, catalog: MarketCatalog, rogue_client: Optional[RogueClient]):
+    def __init__(
+        self,
+        catalog: MarketCatalog,
+        rogue_client: Optional[RogueClient],
+        kmianko_client: Optional[KmiankoBetslipClient] = None,
+    ):
         self._catalog = catalog
         self._rogue = rogue_client
+        # Optional — when present, BB candidates get a real correlated price
+        # from Apuesta Total's bet-slip endpoint instead of the naive product.
+        self._kmianko = kmianko_client
 
     async def build(self, news: NewsItem, game: Game) -> Optional[CandidateCard]:
         """Build a Bet Builder candidate from a news item + its resolved fixture."""
@@ -259,6 +272,8 @@ class ComboBuilder:
         # Validate via Rogue BB endpoint. Mock mode (no Rogue client) skips
         # validation and just trusts the combo — fine for local dev.
         total_odds: Optional[float] = None
+        price_source: Optional[str] = None
+        virtual_selection: Optional[str] = None
         if self._rogue is not None:
             try:
                 resp = await self._rogue.betbuilder_match(selection_ids)
@@ -268,21 +283,45 @@ class ComboBuilder:
             except Exception as exc:
                 logger.warning("ComboBuilder: Rogue BB call errored: %s", exc)
                 return None
-            valid, odds, reason = _parse_bb_validation(resp)
+            valid, odds, reason, virtual_selection = _parse_bb_validation(resp)
             if not valid:
                 logger.info("ComboBuilder: combo invalid — %s (selection_ids=%s)", reason or "no reason", selection_ids)
                 return None
-            total_odds = odds
+            # Rogue itself returns no correlated odds. If we have a Kmianko
+            # client and a VirtualSelection id, use those to get the *real*
+            # operator price.
+            if odds:
+                total_odds = odds
+                price_source = "rogue_bb"
 
-        # Fallback total: multiply decimal odds naively if Rogue didn't return one.
+        if total_odds is None and self._kmianko is not None and virtual_selection:
+            try:
+                quote = await self._kmianko.quote_bet_builder(virtual_selection)
+            except Exception as exc:
+                logger.warning("ComboBuilder: Kmianko BB quote errored: %s", exc)
+                quote = None
+            if quote and quote.get("decimal"):
+                total_odds = round(float(quote["decimal"]), 2)
+                price_source = "kmianko_bb"
+                logger.debug(
+                    "ComboBuilder: BB %s priced at %.2f via Kmianko (legs=%s)",
+                    virtual_selection[:32], total_odds, quote.get("leg_decimals"),
+                )
+
+        # Fallback total: multiply decimal odds naively if neither Rogue nor
+        # Kmianko gave us a real number. Naive product over-states correlated
+        # BBs by ~1-2x, so this is *only* useful for the quality gate — the
+        # frontend hides total_odds when price_source == 'naive'.
         if total_odds is None:
             try:
                 product = 1.0
                 for _, sel in legs:
                     product *= float(sel.odds)
                 total_odds = round(product, 2)
+                price_source = "naive"
             except Exception:
                 total_odds = None
+                price_source = None
 
         market_ids = [m.id for m, _ in legs]
         narrative = news.headline or news.summary or ""
@@ -296,5 +335,7 @@ class ComboBuilder:
             selection_ids=selection_ids,
             narrative=narrative,
             status=CandidateStatus.DRAFT,
+            total_odds=total_odds,
+            price_source=price_source,
         )
         return cand

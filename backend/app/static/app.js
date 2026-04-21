@@ -153,12 +153,27 @@ const PULSE = (() => {
     // Multi-leg (Bet Builder / combo) cards stack their legs in the Pulse
     // Pick block with a big total-odds badge on the right. Singles render
     // the one selected leg exactly like before.
+    //
+    // Pricing rules:
+    //   - Backend sends total_odds for BBs ONLY when it has a real correlated
+    //     price from the operator's bet slip (Kmianko `kmianko_bb` source).
+    //     When total_odds is null on a BB, the legs are correlated and the
+    //     naive product would over-state the price — render "Price in bet
+    //     slip" instead.
+    //   - Cross-event accumulators (bet_type === 'combo'): backend stamps
+    //     total_odds with the operator-boosted price (`kmianko_combo`). When
+    //     missing, fall back to naive product — combo legs are independent
+    //     so the product is at least directionally correct.
     const betType = card.bet_type || 'single';
     const multiLegs = Array.isArray(card.legs) ? card.legs : [];
     const isMultiLeg = multiLegs.length > 1;
+    const isBB = isMultiLeg && betType === 'bet_builder';
     const totalOdds = isMultiLeg
-      ? (typeof card.total_odds === 'number' ? card.total_odds : multiLegs.reduce((p, l) => p * (l.odds || 1), 1))
+      ? (typeof card.total_odds === 'number'
+          ? card.total_odds
+          : (isBB ? null : multiLegs.reduce((p, l) => p * (l.odds || 1), 1)))
       : (pick?.odds || 0);
+    const hasTotal = typeof totalOdds === 'number' && totalOdds > 0;
 
     // Hook-color CSS vars for per-card tint
     const style = [
@@ -212,7 +227,12 @@ const PULSE = (() => {
                   `).join('')}
                 </div>
               </div>
-              <div class="pick-odds pick-odds--total">${(Number(totalOdds) || 0).toFixed(2)}</div>
+              ${hasTotal
+                ? `<div class="pick-odds pick-odds--total">${(Number(totalOdds) || 0).toFixed(2)}</div>`
+                : `<div class="pick-odds pick-odds--bb">
+                     <span class="bb-odds-note">Price shown</span>
+                     <span class="bb-odds-note">in bet slip</span>
+                   </div>`}
             </div>
           ` : pick ? `
             <div class="pulse-pick">
@@ -231,7 +251,9 @@ const PULSE = (() => {
               ${isMultiLeg ? (betType === 'bet_builder' ? 'Add Bet Builder' : 'Add Combo') : 'Tap to bet'}
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
             </span>
-            ${totalOdds ? `<span class="cta-odds">${(Number(totalOdds) || 0).toFixed(2)}</span>` : ''}
+            ${hasTotal
+              ? `<span class="cta-odds">${(Number(totalOdds) || 0).toFixed(2)}</span>`
+              : (isBB ? `<span class="cta-odds cta-odds--note">Price in slip</span>` : '')}
           </button>
 
           <div class="card-foot">

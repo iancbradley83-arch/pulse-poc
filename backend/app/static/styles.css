@@ -490,6 +490,25 @@ button { font: inherit; cursor: pointer; }
   align-self: center;
   font-size: 30px;
 }
+/* BB price placeholder — correlated price comes from the operator's bet slip,
+   so we show a two-line "Price in bet slip" note in place of a number. */
+.pulse-pick--stack .pick-odds--bb {
+  align-self: center;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  text-align: right;
+}
+.pulse-pick--stack .pick-odds--bb .bb-odds-note:first-child {
+  color: var(--text-secondary);
+}
 
 /* angle */
 .card-angle {
@@ -540,6 +559,14 @@ button { font: inherit; cursor: pointer; }
   font-size: 15px;
   font-weight: 700;
   letter-spacing: 0.02em;
+}
+/* Fallback label when we can't quote a correlated BB price — plain weight,
+   smaller, so it doesn't masquerade as odds. */
+.cta-button .cta-odds--note {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.9;
 }
 
 /* pick-rate + engagement row */
