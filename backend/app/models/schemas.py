@@ -207,3 +207,9 @@ class Card(BaseModel):
     legs: list[CardLeg] = []
     total_odds: Optional[float] = None
     bet_type: str = "single"                 # "single" | "combo" | "bet_builder"
+    # SSE live-pricing — Rogue VirtualSelection id for BBs (re-fed into
+    # /v1/betting/calculateBets when a leg ticks). None for singles/combos.
+    virtual_selection: Optional[str] = None
+    # Suspension state — set true when the SSE feed reports the event or any
+    # leg market suspends. Frontend grays the CTA.
+    suspended: bool = False

@@ -184,7 +184,7 @@ const PULSE = (() => {
     ].join(';');
 
     return `
-      <article class="card-hero" style="${style}">
+      <article class="card-hero${card.suspended ? ' card-suspended' : ''}" data-card-id="${escape(card.id || '')}" style="${style}">
         <div class="card-glyph">${hookGlyph(hook.icon, 40, hook.color)}</div>
         <div class="card-body">
           <div class="card-head">
@@ -422,6 +422,80 @@ const PULSE = (() => {
     }
   }
 
+  // ── WebSocket: live price updates + feed refresh ────────────────────
+  //
+  // Backend pushes three message types over /ws/feed:
+  //   - card_update   { card_id, total_odds, leg_odds:{sel_id:odds},
+  //                     suspended }
+  //                   → patch one card's price + leg odds in place,
+  //                     animate the change.
+  //   - feed_refresh  → re-pull /api/feed (used after a candidate-engine
+  //                     rerun atomic-swaps the card list).
+  //   - new_card      → reserved for live cards (Stage 7+); unused today.
+  //
+  // The connection auto-reconnects with exponential backoff up to 30s.
+
+  let _ws = null;
+  let _wsBackoffMs = 1000;
+  function connectWS() {
+    try {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      _ws = new WebSocket(`${proto}//${location.host}/ws/feed`);
+    } catch (err) {
+      console.warn('[ws] connect failed', err);
+      scheduleWSReconnect();
+      return;
+    }
+    _ws.addEventListener('open', () => {
+      _wsBackoffMs = 1000;
+      console.log('[ws] connected');
+    });
+    _ws.addEventListener('close', () => { _ws = null; scheduleWSReconnect(); });
+    _ws.addEventListener('error', () => { try { _ws.close(); } catch (e) {} });
+    _ws.addEventListener('message', (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (!msg || !msg.type) return;
+      if (msg.type === 'card_update') return applyCardUpdate(msg);
+      if (msg.type === 'feed_refresh') return loadFeed();
+      // new_card / game_update etc — ignored in v1
+    });
+  }
+  function scheduleWSReconnect() {
+    setTimeout(connectWS, _wsBackoffMs);
+    _wsBackoffMs = Math.min(_wsBackoffMs * 2, 30000);
+  }
+
+  function applyCardUpdate(msg) {
+    // Find card in our local model
+    const card = allCards.find(c => c.id === msg.card_id);
+    if (!card) return;
+    if (typeof msg.total_odds === 'number') card.total_odds = msg.total_odds;
+    if (typeof msg.suspended === 'boolean') card.suspended = msg.suspended;
+    if (msg.leg_odds && Array.isArray(card.legs)) {
+      for (const leg of card.legs) {
+        if (leg.selection_id && leg.selection_id in msg.leg_odds) {
+          leg.odds = msg.leg_odds[leg.selection_id];
+        }
+      }
+    }
+    // Patch the DOM in place — re-render this one card to pick up the new
+    // odds + suspended state. Simplest path; preserves scroll position
+    // because we replace innerHTML of just the article element.
+    const article = document.querySelector(`article[data-card-id="${CSS.escape(msg.card_id)}"]`);
+    if (article) {
+      const fresh = document.createElement('div');
+      fresh.innerHTML = renderHeroCard(card);
+      const newArticle = fresh.firstElementChild;
+      if (newArticle) {
+        article.replaceWith(newArticle);
+        // Brief flash so the user notices the price changed.
+        newArticle.classList.add('price-updated');
+        setTimeout(() => newArticle.classList.remove('price-updated'), 1500);
+      }
+    }
+  }
+
   // ── Init ────────────────────────────────────────────────────────────
 
   function init() {
@@ -432,6 +506,7 @@ const PULSE = (() => {
     }
     renderFilterStrip();
     loadFeed();
+    connectWS();
   }
 
   return {

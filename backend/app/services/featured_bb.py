@@ -146,6 +146,7 @@ async def fetch_and_build_featured_bb_cards(
             legs=legs,
             total_odds=total_odds,
             bet_type="bet_builder",
+            virtual_selection=vid,
         )
         cards.append(card)
         logger.info(

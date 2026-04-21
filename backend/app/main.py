@@ -46,6 +46,7 @@ from app.services.rogue_client import RogueClient
 from app.services.catalogue_loader import fetch_soccer_snapshot
 from app.services.rogue_prematch import build_prematch_cards
 from app.services.featured_bb import fetch_and_build_featured_bb_cards
+from app.services.sse_pricing import SSEPricingManager
 from app.services.candidate_store import CandidateStore
 from app.services.mock_news_ingester import MockNewsIngester
 from app.services.candidate_engine import CandidateEngine
@@ -215,6 +216,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ── Generate pre-match cards on startup ──
 _rerun_task: _Optional["asyncio.Task"] = None  # noqa: F821
+# Long-lived RogueClient + SSE manager for live price updates. Distinct
+# from the short-lived client used inside _load_rogue_prematch (that one
+# closes at end of each run). This one stays open for the SSE stream's
+# lifetime.
+_sse_rogue_client: _Optional[RogueClient] = None
+_sse_manager: _Optional[SSEPricingManager] = None
 
 
 @app.on_event("startup")
@@ -225,15 +232,37 @@ async def generate_prematch_cards():
       - "mock" (default): hand-crafted LAL/ARS/KC demo cards from local JSON.
       - "rogue": real pre-match soccer fixtures pulled from the Rogue API.
     """
-    global _rerun_task
+    global _rerun_task, _sse_rogue_client, _sse_manager
     if PULSE_DATA_SOURCE == "rogue":
         await _load_rogue_prematch()
         # Kick off the periodic rerun loop AFTER initial load completes.
         # The loop sleeps first, so it doesn't compete with the boot pass.
         import asyncio as _asyncio
         _rerun_task = _asyncio.create_task(_scheduled_rerun_loop())
+
+        # Start the SSE live-pricing manager. Separate long-lived RogueClient
+        # so the SSE stream isn't killed when the rerun's transient client
+        # closes. Disable via PULSE_SSE_PRICING_ENABLED=false.
+        if os.getenv("PULSE_SSE_PRICING_ENABLED", "true").lower() == "true" and ROGUE_CONFIG_JWT:
+            _sse_rogue_client = RogueClient(
+                base_url=ROGUE_BASE_URL,
+                config_jwt=ROGUE_CONFIG_JWT,
+                per_second=ROGUE_RATE_LIMIT_PER_SECOND,
+            )
+            _sse_manager = SSEPricingManager(feed, _sse_rogue_client)
+            await _sse_manager.start()
+            _sse_manager.set_cards(feed.prematch_cards)
+            logger.info("[PULSE] SSE live-pricing manager running")
         return
     await _load_mock_prematch()
+
+
+@app.on_event("shutdown")
+async def _shutdown_tasks():
+    if _sse_manager is not None:
+        await _sse_manager.stop()
+    if _sse_rogue_client is not None:
+        await _sse_rogue_client.close()
 
 
 # In-flight on-demand rerun state. Guarded so /admin/rerun can't kick off
@@ -263,6 +292,8 @@ async def _do_ondemand_rerun():
             logger.warning("[PULSE] On-demand rerun produced 0 cards")
             return
         feed.replace_prematch_cards(new_cards)
+        if _sse_manager is not None:
+            _sse_manager.set_cards(new_cards)
         try:
             await feed.broadcast_feed_refresh()
         except Exception as exc:
@@ -495,6 +526,8 @@ async def _scheduled_rerun_loop():
             logger.warning("[PULSE] Scheduled rerun produced 0 cards — keeping prior feed")
             continue
         feed.replace_prematch_cards(new_cards)
+        if _sse_manager is not None:
+            _sse_manager.set_cards(new_cards)
         try:
             await feed.broadcast_feed_refresh()
         except Exception as exc:
@@ -747,6 +780,7 @@ async def _run_candidate_engine(
             else:
                 card.total_odds = None
             card.bet_type = "bet_builder"
+            card.virtual_selection = cand.virtual_selection
         target_feed.add_prematch_card(card)
 
     if rewriter is not None:

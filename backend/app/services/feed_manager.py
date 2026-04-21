@@ -62,6 +62,66 @@ class FeedManager:
         for ws in dead:
             self.unregister_ws(ws)
 
+    def get_card(self, card_id: str) -> Card | None:
+        for c in self.prematch_cards:
+            if c.id == card_id:
+                return c
+        for c in self.live_cards:
+            if c.id == card_id:
+                return c
+        return None
+
+    def update_card_total(
+        self,
+        card_id: str,
+        *,
+        total_odds: float | None = None,
+        leg_odds: dict[str, float] | None = None,
+        suspended: bool | None = None,
+    ) -> Card | None:
+        """Mutate a card's price/leg odds/suspension state in place. Returns
+        the updated card (or None if not found). Caller is responsible for
+        broadcasting the change via `broadcast_card_update`."""
+        card = self.get_card(card_id)
+        if card is None:
+            return None
+        if total_odds is not None:
+            card.total_odds = round(float(total_odds), 2)
+        if leg_odds:
+            for leg in card.legs:
+                if leg.selection_id and leg.selection_id in leg_odds:
+                    try:
+                        leg.odds = round(float(leg_odds[leg.selection_id]), 2)
+                    except (TypeError, ValueError):
+                        pass
+        if suspended is not None:
+            card.suspended = bool(suspended)
+        return card
+
+    async def broadcast_card_update(self, card: Card) -> None:
+        """Push a price/state delta for one card to all WebSocket clients.
+        Frontend handler updates the DOM in place + animates the change."""
+        data = json.dumps({
+            "type": "card_update",
+            "card_id": card.id,
+            "total_odds": card.total_odds,
+            "suspended": card.suspended,
+            "leg_odds": {
+                leg.selection_id: leg.odds
+                for leg in card.legs
+                if leg.selection_id
+            },
+            "ts": time.time(),
+        }, default=str)
+        dead = []
+        for ws in self._websocket_clients:
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.unregister_ws(ws)
+
     async def broadcast_feed_refresh(self):
         """Tell connected clients to re-pull /api/feed (used after a
         scheduled candidate-engine rerun replaces the card list)."""

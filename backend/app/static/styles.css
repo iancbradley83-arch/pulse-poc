@@ -80,6 +80,18 @@ button { font: inherit; cursor: pointer; }
   from { opacity: 0; transform: translateY(8px); }
   to   { opacity: 1; transform: translateY(0); }
 }
+/* SSE price update flash — pulses the card border briefly when total_odds
+   or leg odds change, so users notice. */
+@keyframes priceFlash {
+  0%   { box-shadow: 0 0 0 0 var(--hook-color, var(--accent)); }
+  30%  { box-shadow: 0 0 0 4px var(--hook-color-20, rgba(88,166,255,0.25)); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.card-hero.price-updated { animation: priceFlash 1.5s ease-out; }
+/* Suspended state — gray and disable the CTA when the operator suspends a
+   leg or event mid-feed. */
+.card-hero.card-suspended { opacity: 0.55; }
+.card-hero.card-suspended .cta-button { pointer-events: none; opacity: 0.6; }
 
 /* ── app shell ── */
 
