@@ -130,10 +130,25 @@ class KmiankoSession:
                 "playwright not installed — `pip install playwright && playwright install chromium`"
             ) from exc
 
+        # Telemetry so Railway logs clearly tell us which step failed. The
+        # three likely failure modes are: (1) Chromium binary missing (we fail
+        # at launch), (2) page loads but Cloudflare shows a challenge page
+        # (we see a title like "Just a moment..." and the kmianko API never
+        # fires), (3) everything works. Without these logs we can't tell (1)
+        # from (2).
         captured: dict[str, str] = {}
+        t_start = time.monotonic()
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self._headless)
+            try:
+                browser = await p.chromium.launch(headless=self._headless)
+            except Exception as exc:
+                raise KmiankoSessionError(
+                    f"chromium launch failed ({exc!s}) — is the browser binary installed "
+                    f"on this host? Run `python -m playwright install chromium`."
+                ) from exc
+            logger.info("[KmiankoSession] chromium launched (t=%.2fs)", time.monotonic() - t_start)
+
             try:
                 ctx = await browser.new_context(
                     user_agent=USER_AGENT,
@@ -151,6 +166,17 @@ class KmiankoSession:
 
                 page.on("request", on_request)
 
+                # Capture the top-level navigation response so we can tell
+                # apart "CF challenge" (status 403 / cf-mitigated header) from
+                # "page loaded fine but no API fired".
+                nav_status = {"code": None, "cf_mitigated": None}
+                def on_response(resp):
+                    if resp.url == self._bootstrap_url or resp.request.resource_type == "document":
+                        if nav_status["code"] is None:
+                            nav_status["code"] = resp.status
+                            nav_status["cf_mitigated"] = resp.headers.get("cf-mitigated")
+                page.on("response", on_response)
+
                 try:
                     await page.goto(
                         self._bootstrap_url,
@@ -165,15 +191,55 @@ class KmiankoSession:
                     await asyncio.sleep(0.25)
 
                 # Lift cookies for the kmianko host so httpx can replay the
-                # CF clearance the browser earned.
+                # CF clearance the browser earned. Also grab the page title
+                # and HTML snippet as a CF-challenge tell — the challenge
+                # page reads "Just a moment..." in all locales.
                 cookie_objs = await ctx.cookies(self._bootstrap_url)
                 self._cookies = {c["name"]: c["value"] for c in cookie_objs}
+                has_cf_clearance = "cf_clearance" in self._cookies
+                has_cf_bm = "__cf_bm" in self._cookies
+                page_title = ""
+                try:
+                    page_title = (await page.title())[:80]
+                except Exception:
+                    pass
             finally:
                 await browser.close()
 
+        elapsed = time.monotonic() - t_start
         if "v" not in captured:
+            # Log all the diagnostic state before raising so we can see at a
+            # glance whether CF challenged us or the page just failed to fire
+            # its API calls.
+            looks_like_cf_challenge = (
+                (nav_status.get("cf_mitigated") == "challenge")
+                or (nav_status.get("code") == 403)
+                or ("just a moment" in page_title.lower())
+            )
+            logger.warning(
+                "[KmiankoSession] mint FAILED after %.1fs — nav_status=%s cf_mitigated=%s "
+                "cf_bm=%s cf_clearance=%s page_title=%r cookies=%d cf_challenge_suspected=%s",
+                elapsed, nav_status.get("code"), nav_status.get("cf_mitigated"),
+                has_cf_bm, has_cf_clearance, page_title, len(self._cookies),
+                looks_like_cf_challenge,
+            )
+            if looks_like_cf_challenge:
+                raise KmiankoSessionError(
+                    f"Cloudflare challenged the bootstrap page (status={nav_status.get('code')}, "
+                    f"cf-mitigated={nav_status.get('cf_mitigated')}). Headless Chromium on this "
+                    f"egress IP can't pass the challenge. Options: residential proxy, "
+                    f"or mint tokens off-box and inject via env."
+                )
             raise KmiankoSessionError(
-                f"session token never appeared on outgoing requests within "
-                f"{SESSION_CAPTURE_TIMEOUT_SECONDS:.0f}s — Cloudflare may be challenging us"
+                f"session token never appeared within {SESSION_CAPTURE_TIMEOUT_SECONDS:.0f}s "
+                f"(nav_status={nav_status.get('code')}, page_title={page_title!r}, "
+                f"cookies={len(self._cookies)}) — browser loaded the page but no kmianko API "
+                f"fired. Bootstrap URL may have changed."
             )
         self._token = captured["v"]
+        logger.info(
+            "[KmiankoSession] mint OK in %.1fs (token_len=%d, cookies=%d, cf_bm=%s, "
+            "cf_clearance=%s, nav_status=%s)",
+            elapsed, len(self._token), len(self._cookies), has_cf_bm, has_cf_clearance,
+            nav_status.get("code"),
+        )

@@ -4,7 +4,7 @@ websockets==14.1
 pydantic==2.10.3
 python-dotenv==1.0.1
 anthropic==0.42.0
-httpx[http2]==0.28.1
+httpx==0.28.1
 aiosqlite==0.20.0
 # Playwright mints Apuesta Total bet-slip session tokens (kmianko.com) so the
 # KmiankoBetslipClient can quote real correlated BB prices. The Cloudflare

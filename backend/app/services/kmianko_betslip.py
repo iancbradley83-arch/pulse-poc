@@ -77,11 +77,13 @@ class KmiankoBetslipClient:
         bonus_ttl_seconds: int = 3600,
     ):
         self._session = session
+        # HTTP/1.1 is fine here — volume is low (one POST per BB generated)
+        # and we don't want the httpx[http2] extra to be a build requirement
+        # (the h2 package pulled an install issue on Railway's Railpack path).
         self._http = httpx.AsyncClient(
             base_url=KMIANKO_HOST,
             headers=_DEFAULT_HEADERS,
             timeout=timeout_s,
-            http2=True,
         )
         self._bonus_ttl = bonus_ttl_seconds
         self._bonuses_cache: Optional[list[dict[str, Any]]] = None
