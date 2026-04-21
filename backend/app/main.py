@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -196,10 +197,12 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
     global candidate_engine
     await candidate_store.init()
 
+    rewriter = None
     if ANTHROPIC_API_KEY:
         try:
             from anthropic import AsyncAnthropic
             from app.services.news_ingester import NewsIngester
+            from app.engine.narrative_rewriter import NarrativeRewriter
 
             anth = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
             ingester = NewsIngester(
@@ -209,7 +212,11 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
                 max_searches=PULSE_NEWS_MAX_SEARCHES,
                 cache_ttl_seconds=PULSE_NEWS_CACHE_TTL_HOURS * 3600,
             )
-            logger.info("[PULSE] Candidate engine using real LLM ingester (%s)", PULSE_NEWS_MODEL)
+            # Copywriter pass — rewrites scout output into journalist voice
+            # before the card hits the feed. Sonnet by default; override via env.
+            rewriter = NarrativeRewriter(anth, model=os.getenv("PULSE_REWRITER_MODEL", "claude-sonnet-4-6"))
+            logger.info("[PULSE] Candidate engine: scout=%s, rewriter=%s",
+                        PULSE_NEWS_MODEL, os.getenv("PULSE_REWRITER_MODEL", "claude-sonnet-4-6"))
         except Exception as exc:
             logger.warning("[PULSE] LLM ingester unavailable (%s) — using mock", exc)
             ingester = MockNewsIngester(candidate_store)
@@ -237,6 +244,8 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
         above_threshold_only=True, status="published", limit=100,
     )
     import time as _time
+    rewrite_hit = 0
+    rewrite_miss = 0
     for cand in published:
         game = games_by_id.get(cand.game_id)
         if game is None:
@@ -246,7 +255,20 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
         if market is None:
             continue
         news = await candidate_store.get_news_item(cand.news_item_id) if cand.news_item_id else None
-        narrative = (news.summary if news else cand.narrative) or (news.headline if news else "")
+
+        # Journalist voice pass — replace the scout's raw headline + summary
+        # with card-ready copy. Falls back to scout output on failure.
+        final_headline = news.headline if news else (cand.narrative or "")
+        final_angle = news.summary if news else (cand.narrative or "")
+        if rewriter is not None and news is not None:
+            rewrite = await rewriter.rewrite(news=news, market=market, game=game, candidate=cand)
+            if rewrite:
+                final_headline = rewrite.get("headline") or final_headline
+                final_angle = rewrite.get("angle") or final_angle
+                rewrite_hit += 1
+            else:
+                rewrite_miss += 1
+
         badge = {
             "injury": BadgeType.NEWS, "team_news": BadgeType.NEWS,
             "transfer": BadgeType.NEWS, "manager_quote": BadgeType.NEWS,
@@ -254,18 +276,21 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
             "article": BadgeType.NEWS,
         }.get(cand.hook_type.value, BadgeType.TRENDING)
         card = assembler.assemble_prematch(
-            game=game, market=market, narrative=narrative or "",
+            game=game, market=market, narrative=final_angle or "",
             badge=badge, relevance=cand.score, stats=[], tweets=[],
         )
         # Design-handoff fields so the Hero variant has source / recency / hook
         card.hook_type = cand.hook_type.value
-        card.headline = news.headline if news else (cand.narrative or "")
+        card.headline = final_headline
         card.source_name = news.source_name if news else None
-        # Rough ago: ingestion time vs now (published_at often missing from LLM output)
         ingested = news.ingested_at if news else cand.created_at
         if ingested:
             card.ago_minutes = max(0, int((_time.time() - ingested) / 60))
         feed.add_prematch_card(card)
+
+    if rewriter is not None:
+        logger.info("[PULSE] NarrativeRewriter: %d hits, %d misses (fell back to scout copy)",
+                    rewrite_hit, rewrite_miss)
 
 
 async def _load_mock_prematch():

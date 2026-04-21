@@ -136,6 +136,21 @@ class PolicyLayer:
         self._per_fixture_cap = per_fixture_cap
 
     def apply(self, candidates: list[CandidateCard]) -> list[CandidateCard]:
+        # 0. One candidate per news_item_id globally — even if the entity
+        #    resolver has (incorrectly) attached the same story to multiple
+        #    fixtures, only keep the highest-scoring attach. Prevents "same
+        #    headline on two different match cards" that users were seeing.
+        by_news: dict[str, CandidateCard] = {}
+        no_news: list[CandidateCard] = []
+        for c in candidates:
+            if not c.news_item_id:
+                no_news.append(c)
+                continue
+            prev = by_news.get(c.news_item_id)
+            if prev is None or c.score > prev.score:
+                by_news[c.news_item_id] = c
+        candidates = list(by_news.values()) + no_news
+
         # 1. Best-per-(fixture, hook_type) dedupe
         best: dict[tuple[str, HookType], CandidateCard] = {}
         for c in candidates:

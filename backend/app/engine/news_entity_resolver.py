@@ -49,6 +49,17 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
+def _alias_in(alias: str, haystack: str) -> bool:
+    """True iff `alias` appears as a whole token within `haystack`.
+
+    Stops "man" from matching "manchester", "uni" from matching "united", etc.
+    Both inputs are already lowercase-normalised via _norm.
+    """
+    if not alias or not haystack:
+        return False
+    return re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", haystack) is not None
+
+
 class NewsEntityResolver:
     """Alias map built from the live Rogue catalogue.
 
@@ -80,33 +91,75 @@ class NewsEntityResolver:
                         self._team_alias_to_games.setdefault(key, []).append(game.id)
 
     def resolve(self, item: NewsItem) -> NewsItem:
-        """Populate team_ids and fixture_ids in-place-ish (returns the item)."""
-        matched_games: set[str] = set()
+        """Pick the *single* fixture this news item is about (if any).
+
+        Previous behaviour attached a story to every fixture that featured any
+        mentioned team, which produced duplicate cards across unrelated matches
+        (e.g. an Atletico Madrid injury story that name-dropped "Arsenal" as
+        the UCL semi-final opponent ended up on the weekend Arsenal vs Chelsea
+        card). The fix: score each fixture and keep only the top match.
+
+        Scoring:
+          2.0  both teams of a fixture appear in mentions (strongest signal — the
+               story is clearly ABOUT that match)
+          1.5  only one team appears in mentions AND that team plays in exactly
+               one fixture in our current catalogue (unambiguous attach)
+          1.0  only one team appears and it plays multiple fixtures (weak — use
+               earliest-kickoff tiebreak and treat as a last-resort match)
+
+        If nothing scores above 0, the news is dropped rather than spread. The
+        candidate engine skips items with no fixture_ids downstream.
+        """
         matched_teams: set[str] = set()
 
         for mention in item.mentions:
             m = _norm(mention)
             if not m:
                 continue
-            # Exact alias match first
-            if m in self._team_alias_to_games:
-                for gid in self._team_alias_to_games[m]:
-                    matched_games.add(gid)
-                if m in self._team_name_to_id:
-                    matched_teams.add(self._team_name_to_id[m])
+            if m in self._team_name_to_id:
+                matched_teams.add(self._team_name_to_id[m])
                 continue
-            # Substring fallback — "Bukayo Saka" mention matches Arsenal via
-            # the player's (implicit) team; we don't have squad rosters yet,
-            # so a substring like "Arsenal" inside a mention still hits.
-            for alias, gids in self._team_alias_to_games.items():
-                if alias and alias in m:
-                    for gid in gids:
-                        matched_games.add(gid)
-                    if alias in self._team_name_to_id:
-                        matched_teams.add(self._team_name_to_id[alias])
+            # Substring fallback — e.g. "Bukayo Saka, Arsenal" mention matches
+            # "arsenal" as a contained alias. Conservative: only whole-alias
+            # hits, not partial character runs, by requiring word boundaries.
+            for alias, tid in self._team_name_to_id.items():
+                if alias and _alias_in(alias, m):
+                    matched_teams.add(tid)
 
-        item.fixture_ids = sorted(matched_games)
         item.team_ids = sorted(matched_teams)
+        if not matched_teams:
+            item.fixture_ids = []
+            return item
+
+        # How many games each team participates in (to detect unambiguous attachments).
+        team_to_games: dict[str, list[str]] = {}
+        for gid, game in self._games.items():
+            for tid in (game.home_team.id, game.away_team.id):
+                team_to_games.setdefault(tid, []).append(gid)
+
+        scores: dict[str, float] = {}
+        for gid, game in self._games.items():
+            home_in = game.home_team.id in matched_teams
+            away_in = game.away_team.id in matched_teams
+            if home_in and away_in:
+                scores[gid] = 2.0
+            elif home_in or away_in:
+                participating_team = game.home_team.id if home_in else game.away_team.id
+                fixtures_for_team = team_to_games.get(participating_team, [])
+                scores[gid] = 1.5 if len(fixtures_for_team) == 1 else 1.0
+
+        if not scores:
+            item.fixture_ids = []
+            return item
+
+        top_score = max(scores.values())
+        # Ties broken by earliest kickoff (lexicographic on our "22 Apr 19:00 UTC"
+        # strings is good enough inside a single rolling window).
+        best = sorted(
+            [gid for gid, s in scores.items() if s == top_score],
+            key=lambda g: (self._games[g].start_time or ""),
+        )[:1]
+        item.fixture_ids = best
         return item
 
     def team_id_for(self, mention: str) -> Optional[str]:

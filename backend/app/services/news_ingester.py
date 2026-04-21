@@ -18,12 +18,26 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from anthropic import AsyncAnthropic
 
 from app.models.news import HookType, NewsItem
 from app.services.candidate_store import CandidateStore
+
+# Defensive cleanup — web_search sometimes injects <cite index="...">...</cite>
+# markup which the scout can echo into the summary. Strip any HTML-like tag
+# and collapse whitespace. Cheap regex, no external deps.
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _clean_copy(s: Any) -> str:
+    if not s:
+        return ""
+    out = _TAG_RE.sub("", str(s))
+    return _WS_RE.sub(" ", out).strip()
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +89,14 @@ Used by downstream entity resolution. Include both short and full forms
 **What to skip** — generic season-summary content, fixture previews with no
 new information, promotional "best bets" listicles, anything older than 48
 hours that isn't still breaking today.
+
+**CRITICAL OUTPUT RULE** — the `headline` and `summary` fields must be plain
+prose text. NEVER include XML, HTML, or citation markup of any kind. The
+web_search tool's output includes `<cite index="...">...</cite>` tags around
+quoted passages — strip those out when paraphrasing. If you cannot write the
+line without using such markup, drop the item entirely. Do not include
+`<cite>`, `<ref>`, `<sup>`, square-bracket citation numbers, or any other
+tracking syntax in your output.
 
 You are writing editorial copy that will be displayed as the hero headline
 on a card. Punchy matters more than complete."""
@@ -247,10 +269,10 @@ def _raw_to_news(row: dict[str, Any]) -> NewsItem:
     return NewsItem(
         source="llm_web_search",
         source_url=str(row.get("source_url") or "").strip(),
-        source_name=str(row.get("source_name") or "").strip(),
-        headline=str(row.get("headline") or "").strip(),
-        summary=str(row.get("summary") or "").strip(),
+        source_name=_clean_copy(row.get("source_name")),
+        headline=_clean_copy(row.get("headline")),
+        summary=_clean_copy(row.get("summary")),
         hook_type=hook,
         published_at=str(row.get("published_at") or "").strip(),
-        mentions=[str(m).strip() for m in mentions if str(m).strip()],
+        mentions=[_clean_copy(m) for m in mentions if _clean_copy(m)],
     )
