@@ -79,15 +79,19 @@ BET BUILDER MODE
 
 When the input includes a `legs` block, the card is a multi-leg Bet Builder.
 Treat all legs as one package and write an angle that justifies the STACK,
-not any individual leg. Name-drop the total odds when it sharpens the line.
-Keep to the same 25-word ceiling.
+not any individual leg. If a `total_odds` line is present in the input, that
+is the operator's real correlated BB price and you MAY quote it (e.g. "all
+of it pays 6.36"). When `total_odds` is absent, do NOT invent or estimate
+one — say something like "stacked in the slip". Individual leg odds are
+fine to reference if one sharpens the line. Keep to the same 25-word
+ceiling.
 
   BB RAW → {injury to Palmer, legs=[Brighton win 2.50, Under 2.5 Goals 1.98,
-           BTTS No 2.10], total=10.40}
+           BTTS No 2.10]}
   REWRITE →
     headline: Palmer out — Brighton tighten the grip on the whole evening
-    angle: No creativity, no goals; stack Brighton + Under + BTTS No at 10.4
-    and the whole game falls on a knock in training.
+    angle: No creativity, no goals; Brighton + Under + BTTS No turns the whole
+    game on a knock in training.
 
 CALIBRATION EXAMPLES (SINGLES)
 
@@ -129,7 +133,7 @@ CALIBRATION EXAMPLES (SINGLES)
 
 INPUT YOU RECEIVE (plain-text fields, newline-separated)
   source, hook_type, raw_headline, raw_summary, home, away, league, kickoff,
-  market_label, pick, odds, and (when bet-builder) legs + total
+  market_label, pick, odds, and (when bet-builder) legs
 
 OUTPUT
   Call the `submit_rewrite` tool exactly once with { headline, angle }.
@@ -192,8 +196,10 @@ class NarrativeRewriter:
         if legs:
             pretty = [f"{leg.market_label or '?'} · {leg.label} @ {leg.odds:.2f}" for leg in legs]
             legs_block = "legs:\n  - " + "\n  - ".join(pretty) + "\n"
-            if total_odds:
-                legs_block += f"total: {total_odds:.2f}\n"
+            # Include total_odds only when it's a real correlated/operator
+            # price (caller passes None when it's just the naive product).
+            if total_odds is not None and total_odds > 1.0:
+                legs_block += f"total_odds: {total_odds:.2f}\n"
 
         user_block = (
             f"source: {news.source_name or news.source or 'unknown'}\n"
