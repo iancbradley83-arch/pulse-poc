@@ -16,6 +16,13 @@ class FeedManager:
         self.prematch_cards.append(card)
         self._sort_prematch()
 
+    def replace_prematch_cards(self, cards: list[Card]):
+        """Atomic swap of the entire pre-match card list. Used by the
+        scheduled rerun loop so re-generation doesn't double-render cards
+        from the previous cycle. Sort happens once at the end."""
+        self.prematch_cards = list(cards)
+        self._sort_prematch()
+
     def add_live_card(self, card: Card):
         self.live_cards.insert(0, card)  # newest first
         self._prune_stale()
@@ -46,6 +53,19 @@ class FeedManager:
             "type": "new_card",
             "card": card.model_dump(),
         }, default=str)
+        dead = []
+        for ws in self._websocket_clients:
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.unregister_ws(ws)
+
+    async def broadcast_feed_refresh(self):
+        """Tell connected clients to re-pull /api/feed (used after a
+        scheduled candidate-engine rerun replaces the card list)."""
+        data = json.dumps({"type": "feed_refresh", "ts": time.time()}, default=str)
         dead = []
         for ws in self._websocket_clients:
             try:
