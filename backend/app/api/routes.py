@@ -21,7 +21,13 @@ def create_routes(
         type: str = Query("prematch", regex="^(prematch|live)$"),
         sport: Optional[str] = None,
         game_id: Optional[str] = None,
-        limit: int = 20,
+        # 50 keeps the full mix visible. With ~33 cards typical (20 news BBs +
+        # 4 featured BBs + 10 baseline singles + future combos), the prior
+        # default of 20 was clipping all singles off the bottom of a
+        # relevance-sorted list, hiding them from the UI. A proper mix-aware
+        # publisher (PULSE_BET_TYPE_MIX enforcement, top-N per bet_type) is
+        # the longer-term fix; this just stops the truncation.
+        limit: int = 50,
     ):
         if type == "prematch":
             return {"cards": feed.get_prematch_feed(sport=sport, limit=limit)}
