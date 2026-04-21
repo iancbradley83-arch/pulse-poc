@@ -226,6 +226,24 @@ class CandidateStore:
             )
             await db.commit()
 
+    async def expire_published_candidates(self) -> int:
+        """Mark all currently-published candidates as EXPIRED.
+
+        Used at the start of each candidate-engine rerun so the publish
+        loop only sees the freshly-generated batch — without this, every
+        rerun stacks on top of prior runs (boot's candidates + rerun's
+        candidates all visible at once, doubling card count per cycle).
+
+        Historical rows are kept (status=EXPIRED) so the admin table can
+        still show what was published in past cycles.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE candidates SET status = 'expired' WHERE status = 'published'"
+            )
+            await db.commit()
+            return cur.rowcount or 0
+
     async def latest_verdict_by_candidate(self) -> dict[str, str]:
         """Return {candidate_id: latest_verdict} for fast render in the admin table."""
         async with aiosqlite.connect(self._db_path) as db:
