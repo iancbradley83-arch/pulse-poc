@@ -20,13 +20,13 @@ class FeedManager:
         self.live_cards.insert(0, card)  # newest first
         self._prune_stale()
 
-    def get_prematch_feed(self, sport: str | None = None, limit: int = 20) -> list[dict]:
+    def get_prematch_feed(self, sport: str | None = None, limit: int = 50) -> list[dict]:
         cards = self.prematch_cards
         if sport:
             cards = [c for c in cards if c.game.sport.value == sport]
         return [c.model_dump() for c in cards[:limit]]
 
-    def get_live_feed(self, game_id: str | None = None, limit: int = 20) -> list[dict]:
+    def get_live_feed(self, game_id: str | None = None, limit: int = 50) -> list[dict]:
         self._prune_stale()
         cards = self.live_cards
         if game_id:
