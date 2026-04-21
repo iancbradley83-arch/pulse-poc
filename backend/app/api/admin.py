@@ -151,17 +151,58 @@ async def _render_page(
             if game else r.game_id[:16]
         )
         league = game.broadcast if game else ""
-        market_id = r.market_ids[0] if r.market_ids else ""
-        market = catalog.get(market_id) if market_id else None
-        market_label = market.label if market else "—"
-        odds = " / ".join(s.odds or "—" for s in (market.selections[:3] if market else []))
+
+        bet_type_tag = r.bet_type.value if hasattr(r.bet_type, "value") else str(r.bet_type)
+        is_bb = bet_type_tag == "bet_builder" and len(r.market_ids) >= 2
+
+        # Market cell: for BBs show every leg; for singles show the primary market.
+        if is_bb:
+            leg_rows = []
+            leg_total = 1.0
+            leg_total_valid = True
+            for mid, sid in zip(r.market_ids, r.selection_ids):
+                leg_market = catalog.get(mid)
+                leg_sel = None
+                if leg_market is not None:
+                    leg_sel = next((s for s in leg_market.selections if s.selection_id == sid), None)
+                label = leg_sel.label if leg_sel else "?"
+                mkt_label = leg_market.label if leg_market else "?"
+                odds_s = leg_sel.odds if leg_sel and leg_sel.odds else "—"
+                try:
+                    leg_total *= float(odds_s)
+                except Exception:
+                    leg_total_valid = False
+                leg_rows.append(
+                    f"<div class='bb-leg'>"
+                    f"  <span class='leg-market'>{html.escape(mkt_label)}</span>"
+                    f"  <span class='leg-label'>{html.escape(label)}</span>"
+                    f"  <span class='leg-odds'>{html.escape(str(odds_s))}</span>"
+                    f"</div>"
+                )
+            market_cell = (
+                "<div class='bb-legs'>"
+                + "".join(leg_rows)
+                + f"<div class='bb-total'>× {leg_total:.2f}</div>"
+                + "</div>"
+            ) if leg_total_valid else (
+                "<div class='bb-legs'>" + "".join(leg_rows)
+                + "<div class='bb-total'>× ?</div></div>"
+            )
+        else:
+            market_id = r.market_ids[0] if r.market_ids else ""
+            market = catalog.get(market_id) if market_id else None
+            market_label = market.label if market else "—"
+            odds = " / ".join(s.odds or "—" for s in (market.selections[:3] if market else []))
+            market_cell = (
+                f"{html.escape(market_label)}"
+                f"<div class='odds'>{html.escape(odds)}</div>"
+            )
 
         news = news_by_id.get(r.news_item_id or "")
         headline = news.headline if news else r.narrative
 
         threshold_mark = "✓" if r.threshold_passed else "✗"
         verdict = verdicts.get(r.id)
-        bet_type_tag = r.bet_type.value if hasattr(r.bet_type, "value") else str(r.bet_type)
 
         review_cell = (
             f"<div class='review' data-cand-id='{html.escape(r.id)}' data-verdict='{html.escape(verdict or '')}'>"
@@ -176,7 +217,7 @@ async def _render_page(
             f"<td class='hook hook-{html.escape(r.hook_type.value)}'>{html.escape(r.hook_type.value)}</td>"
             f"<td class='bet-type bt-{html.escape(bet_type_tag)}'>{html.escape(bet_type_tag)}</td>"
             f"<td class='teams'>{html.escape(teams)}<div class='league'>{html.escape(league or '')}</div></td>"
-            f"<td>{html.escape(market_label)}<div class='odds'>{html.escape(odds)}</div></td>"
+            f"<td class='market-cell'>{market_cell}</td>"
             f"<td class='score'>{r.score:.2f}</td>"
             f"<td class='threshold'>{threshold_mark}</td>"
             f"<td class='status status-{html.escape(r.status.value)}'>{html.escape(r.status.value)}</td>"
@@ -306,6 +347,18 @@ _PAGE_TEMPLATE = """
   .hook-article {{ color: var(--muted); }}
   .league {{ color: var(--muted); font-size: 11px; margin-top: 2px; }}
   .odds {{ color: var(--muted); font-size: 11px; margin-top: 2px; }}
+  td.market-cell {{ min-width: 260px; }}
+  .bb-legs {{ display: flex; flex-direction: column; gap: 3px; }}
+  .bb-leg {{ display: grid; grid-template-columns: 80px 1fr 50px; gap: 6px;
+    align-items: baseline; font-size: 11px; padding: 3px 0; }}
+  .bb-leg .leg-market {{ color: var(--muted); font-size: 9.5px;
+    text-transform: uppercase; letter-spacing: 0.04em; }}
+  .bb-leg .leg-label {{ color: var(--text); font-weight: 600; }}
+  .bb-leg .leg-odds {{ color: var(--text); font-family: ui-monospace, Menlo, monospace;
+    font-weight: 700; text-align: right; }}
+  .bb-total {{ color: #c6ff3d; font-family: ui-monospace, Menlo, monospace;
+    font-weight: 700; font-size: 12px; text-align: right; margin-top: 4px;
+    padding-top: 4px; border-top: 1px dashed var(--border); }}
   td.score {{ font-variant-numeric: tabular-nums; font-weight: 600; }}
   td.threshold {{ text-align: center; font-weight: 700; }}
   .status-published {{ color: var(--green); }} .status-queued {{ color: var(--orange); }}
