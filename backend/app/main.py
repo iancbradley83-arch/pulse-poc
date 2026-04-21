@@ -249,11 +249,15 @@ async def _run_candidate_engine(games_by_id: dict[str, Game], *, rogue_client: _
     published = await candidate_store.list_candidates(
         above_threshold_only=True, status="published", limit=100,
     )
-    from app.models.news import BetType as _BetType
+    from app.models.news import BetType as _BetType, CandidateStatus as _CandidateStatus
     from app.models.schemas import CardLeg as _CardLeg
+    from app.engine.quality_gates import apply_gates as _apply_gates
     import time as _time
     rewrite_hit = 0
     rewrite_miss = 0
+    gate_rejected = 0
+    gate_reject_reasons: dict[str, int] = {}
+    gated_updates: list = []
     for cand in published:
         game = games_by_id.get(cand.game_id)
         if game is None:
@@ -311,6 +315,27 @@ async def _run_candidate_engine(games_by_id: dict[str, Game], *, rogue_client: _
             else:
                 rewrite_miss += 1
 
+        # Quality gate — fail-closed rules that drop bad candidates before
+        # they hit the public feed. Rejected candidates stay in the store
+        # with status=rejected + reason so the /admin table can surface
+        # them for tuning.
+        passes, gate_reason = _apply_gates(
+            cand,
+            headline=final_headline or "",
+            angle=final_angle or "",
+            game=game,
+            legs=legs if is_bb else None,
+            total_odds=total_odds if is_bb else None,
+        )
+        if not passes:
+            gate_rejected += 1
+            gate_reject_reasons[gate_reason or "unknown"] = gate_reject_reasons.get(gate_reason or "unknown", 0) + 1
+            cand.status = _CandidateStatus.REJECTED
+            cand.threshold_passed = False
+            cand.reason = (cand.reason + " | gate: " + (gate_reason or "")).strip(" |")
+            gated_updates.append(cand)
+            continue
+
         badge = {
             "injury": BadgeType.NEWS, "team_news": BadgeType.NEWS,
             "transfer": BadgeType.NEWS, "manager_quote": BadgeType.NEWS,
@@ -336,6 +361,12 @@ async def _run_candidate_engine(games_by_id: dict[str, Game], *, rogue_client: _
     if rewriter is not None:
         logger.info("[PULSE] NarrativeRewriter: %d hits, %d misses (fell back to scout copy)",
                     rewrite_hit, rewrite_miss)
+    if gate_rejected:
+        # Persist the REJECTED status change so the admin table reflects
+        # what got blocked and why.
+        await candidate_store.save_candidates(gated_updates)
+        logger.info("[PULSE] Quality gates rejected %d candidates — reasons: %s",
+                    gate_rejected, gate_reject_reasons)
 
 
 async def _load_mock_prematch():

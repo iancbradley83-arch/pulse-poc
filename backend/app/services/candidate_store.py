@@ -72,6 +72,22 @@ CREATE TABLE IF NOT EXISTS ingest_cache (
     payload_json TEXT NOT NULL,
     PRIMARY KEY (fixture_id, cache_key)
 );
+
+-- Human labels on candidates for the learning loop. One row per review
+-- event (a card reviewed N times stores N rows so we can track flips).
+CREATE TABLE IF NOT EXISTS candidate_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id TEXT NOT NULL,
+    verdict TEXT NOT NULL,           -- 'good' | 'bad'
+    reason_code TEXT,                -- 'wrong_team' | 'bad_headline' | 'odds_nonsensical' | 'story_unrelated' | 'angle_mismatch' | 'other'
+    note TEXT,                       -- optional free-text ("rewriter hallucinated player name")
+    reviewer TEXT,                   -- email / handle / "anonymous"
+    created_at REAL NOT NULL,
+    FOREIGN KEY (candidate_id) REFERENCES candidates(id)
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_candidate ON candidate_reviews(candidate_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_verdict ON candidate_reviews(verdict);
+CREATE INDEX IF NOT EXISTS idx_reviews_created ON candidate_reviews(created_at);
 """
 
 
@@ -165,6 +181,69 @@ class CandidateStore:
             async with db.execute(sql, args) as cur:
                 rows = await cur.fetchall()
         return [_row_to_candidate(r) for r in rows]
+
+    async def save_review(
+        self,
+        *,
+        candidate_id: str,
+        verdict: str,
+        reason_code: Optional[str] = None,
+        note: Optional[str] = None,
+        reviewer: Optional[str] = None,
+    ) -> None:
+        import time as _t
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO candidate_reviews
+                    (candidate_id, verdict, reason_code, note, reviewer, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (candidate_id, verdict, reason_code, note, reviewer or "anonymous", _t.time()),
+            )
+            await db.commit()
+
+    async def latest_verdict_by_candidate(self) -> dict[str, str]:
+        """Return {candidate_id: latest_verdict} for fast render in the admin table."""
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT r.candidate_id, r.verdict
+                FROM candidate_reviews r
+                INNER JOIN (
+                    SELECT candidate_id, MAX(created_at) AS max_at
+                    FROM candidate_reviews
+                    GROUP BY candidate_id
+                ) latest ON latest.candidate_id = r.candidate_id
+                         AND latest.max_at = r.created_at
+                """
+            ) as cur:
+                rows = await cur.fetchall()
+        return {r["candidate_id"]: r["verdict"] for r in rows}
+
+    async def review_summary(self) -> dict[str, Any]:
+        """Aggregate review stats for the admin dashboard."""
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT verdict, COUNT(*) AS n FROM candidate_reviews GROUP BY verdict") as cur:
+                verdicts = {r["verdict"]: r["n"] for r in await cur.fetchall()}
+            async with db.execute(
+                """
+                SELECT reason_code, COUNT(*) AS n FROM candidate_reviews
+                WHERE verdict = 'bad' AND reason_code IS NOT NULL
+                GROUP BY reason_code ORDER BY n DESC
+                """
+            ) as cur:
+                reasons = [dict(r) for r in await cur.fetchall()]
+        total = sum(verdicts.values())
+        return {
+            "total_reviews": total,
+            "good": verdicts.get("good", 0),
+            "bad": verdicts.get("bad", 0),
+            "bad_pct": round(100 * verdicts.get("bad", 0) / total, 1) if total else 0.0,
+            "top_bad_reasons": reasons[:5],
+        }
 
     async def counts_by_hook_and_status(self) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self._db_path) as db:

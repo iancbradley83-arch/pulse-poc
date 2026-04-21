@@ -7,15 +7,34 @@ engine run for a while and have a labelling plan.
 from __future__ import annotations
 
 import html
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
 from app.models.news import CandidateStatus, HookType
 from app.services.candidate_store import CandidateStore
 from app.services.market_catalog import MarketCatalog
 from app.services.game_simulator import GameSimulator
+
+
+ALLOWED_REASON_CODES = {
+    "wrong_team",
+    "bad_headline",
+    "odds_nonsensical",
+    "story_unrelated",
+    "angle_mismatch",
+    "duplicate",
+    "other",
+}
+
+
+class ReviewBody(BaseModel):
+    verdict: str                      # "good" | "bad"
+    reason_code: Optional[str] = None
+    note: Optional[str] = None
+    reviewer: Optional[str] = None
 
 
 def create_admin_routes(
@@ -42,10 +61,14 @@ def create_admin_routes(
             limit=limit,
         )
         counts = await store.counts_by_hook_and_status()
+        verdicts = await store.latest_verdict_by_candidate()
+        summary = await store.review_summary()
 
         body = await _render_page(
             rows=rows,
             counts=counts,
+            verdicts=verdicts,
+            review_summary=summary,
             catalog=catalog,
             simulator=simulator,
             store=store,
@@ -58,6 +81,24 @@ def create_admin_routes(
             },
         )
         return HTMLResponse(body)
+
+    @router.post("/candidates/{candidate_id}/review")
+    async def review_candidate(candidate_id: str, body: ReviewBody):
+        verdict = (body.verdict or "").lower().strip()
+        if verdict not in ("good", "bad"):
+            raise HTTPException(400, "verdict must be 'good' or 'bad'")
+        reason = (body.reason_code or "").strip().lower() or None
+        if reason is not None and reason not in ALLOWED_REASON_CODES:
+            raise HTTPException(400, f"reason_code must be one of {sorted(ALLOWED_REASON_CODES)}")
+        await store.save_review(
+            candidate_id=candidate_id,
+            verdict=verdict,
+            reason_code=reason,
+            note=body.note,
+            reviewer=body.reviewer,
+        )
+        summary = await store.review_summary()
+        return {"ok": True, "summary": summary}
 
     @router.get("/candidates.json")
     async def candidates_json(
@@ -83,6 +124,8 @@ async def _render_page(
     *,
     rows,
     counts,
+    verdicts: dict,
+    review_summary: dict,
     catalog: MarketCatalog,
     simulator: GameSimulator,
     store: CandidateStore,
@@ -117,11 +160,21 @@ async def _render_page(
         headline = news.headline if news else r.narrative
 
         threshold_mark = "✓" if r.threshold_passed else "✗"
+        verdict = verdicts.get(r.id)
+        bet_type_tag = r.bet_type.value if hasattr(r.bet_type, "value") else str(r.bet_type)
+
+        review_cell = (
+            f"<div class='review' data-cand-id='{html.escape(r.id)}' data-verdict='{html.escape(verdict or '')}'>"
+            f"  <button class='thumb good{' on' if verdict == 'good' else ''}' title='Mark good' onclick=\"review('{html.escape(r.id)}','good')\">👍</button>"
+            f"  <button class='thumb bad{' on' if verdict == 'bad' else ''}' title='Mark bad' onclick=\"review('{html.escape(r.id)}','bad')\">👎</button>"
+            "</div>"
+        )
 
         body_rows.append(
             "<tr>"
             f"<td class='ts'>{_fmt_ts(r.created_at)}</td>"
             f"<td class='hook hook-{html.escape(r.hook_type.value)}'>{html.escape(r.hook_type.value)}</td>"
+            f"<td class='bet-type bt-{html.escape(bet_type_tag)}'>{html.escape(bet_type_tag)}</td>"
             f"<td class='teams'>{html.escape(teams)}<div class='league'>{html.escape(league or '')}</div></td>"
             f"<td>{html.escape(market_label)}<div class='odds'>{html.escape(odds)}</div></td>"
             f"<td class='score'>{r.score:.2f}</td>"
@@ -129,10 +182,11 @@ async def _render_page(
             f"<td class='status status-{html.escape(r.status.value)}'>{html.escape(r.status.value)}</td>"
             f"<td class='headline'>{html.escape(headline or '')[:160]}</td>"
             f"<td class='reason'>{html.escape(r.reason)[:160]}</td>"
+            f"<td class='review-cell'>{review_cell}</td>"
             "</tr>"
         )
 
-    table_html = "".join(body_rows) or "<tr><td colspan='9' class='empty'>No candidates yet. Trigger an engine run.</td></tr>"
+    table_html = "".join(body_rows) or "<tr><td colspan='11' class='empty'>No candidates yet. Trigger an engine run.</td></tr>"
 
     # Filter controls
     hook_options = ["", *[h.value for h in HookType]]
@@ -144,6 +198,10 @@ async def _render_page(
     # Counts summary
     counts_tbl = _counts_html(counts)
 
+    # Review summary — top-of-page dashboard strip
+    rev = review_summary or {"total_reviews": 0, "good": 0, "bad": 0, "bad_pct": 0.0, "top_bad_reasons": []}
+    top_reasons = ", ".join(f"{r['reason_code']}×{r['n']}" for r in rev.get("top_bad_reasons", [])[:3]) or "—"
+
     return _PAGE_TEMPLATE.format(
         total=total,
         published=published,
@@ -153,6 +211,11 @@ async def _render_page(
         above_checked=checked,
         limit=filters["limit"],
         counts_html=counts_tbl,
+        reviews_total=rev["total_reviews"],
+        reviews_good=rev["good"],
+        reviews_bad=rev["bad"],
+        reviews_bad_pct=rev["bad_pct"],
+        top_reasons=html.escape(top_reasons),
     )
 
 
@@ -209,16 +272,23 @@ _PAGE_TEMPLATE = """
   body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     background: var(--bg); color: var(--text); font-size: 13px; }}
   header {{ padding: 16px 24px; border-bottom: 1px solid var(--border);
-    display: flex; align-items: baseline; gap: 24px; background: var(--panel); }}
+    display: flex; align-items: baseline; gap: 24px; background: var(--panel); flex-wrap: wrap; }}
   h1 {{ margin: 0; font-size: 18px; letter-spacing: 0.06em; color: var(--accent); }}
   .stat {{ color: var(--muted); }} .stat strong {{ color: var(--text); }}
+  .review-strip {{ display: flex; gap: 18px; margin-left: auto; padding: 6px 10px;
+    background: rgba(124,92,255,0.06); border: 1px solid rgba(124,92,255,0.18);
+    border-radius: 8px; font-size: 12px; }}
+  .review-strip .k {{ color: var(--muted); margin-right: 4px; }}
+  .review-strip .v {{ color: var(--text); font-weight: 700; }}
+  .review-strip .bad {{ color: var(--red); font-weight: 700; }}
+  .review-strip .good {{ color: var(--green); font-weight: 700; }}
   main {{ padding: 16px 24px; }}
   form.filters {{ display: flex; gap: 12px; align-items: center; margin-bottom: 16px;
     flex-wrap: wrap; }}
   form.filters label {{ color: var(--muted); display: flex; gap: 6px; align-items: center; }}
   select, input[type=number] {{ background: var(--panel); color: var(--text);
     border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font-size: 12px; }}
-  button {{ background: var(--accent); color: white; border: 0; border-radius: 4px;
+  button.apply-btn {{ background: var(--accent); color: white; border: 0; border-radius: 4px;
     padding: 6px 12px; cursor: pointer; font-size: 12px; }}
   table {{ width: 100%; border-collapse: collapse; background: var(--panel);
     border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
@@ -228,6 +298,8 @@ _PAGE_TEMPLATE = """
   td.empty {{ text-align: center; color: var(--muted); padding: 40px 10px; }}
   td.ts {{ color: var(--muted); white-space: nowrap; }}
   td.hook {{ font-weight: 600; white-space: nowrap; }}
+  td.bet-type {{ font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }}
+  .bt-bet_builder {{ color: var(--accent); }} .bt-single {{ color: var(--muted); }} .bt-combo {{ color: var(--orange); }}
   .hook-injury {{ color: var(--red); }} .hook-team_news {{ color: var(--green); }}
   .hook-transfer {{ color: var(--orange); }} .hook-manager_quote {{ color: var(--muted); }}
   .hook-tactical {{ color: #60a5fa; }} .hook-preview {{ color: var(--muted); }}
@@ -238,15 +310,46 @@ _PAGE_TEMPLATE = """
   td.threshold {{ text-align: center; font-weight: 700; }}
   .status-published {{ color: var(--green); }} .status-queued {{ color: var(--orange); }}
   .status-rejected {{ color: var(--red); }} .status-draft {{ color: var(--muted); }}
-  td.headline {{ max-width: 360px; }} td.reason {{ max-width: 320px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }}
+  td.headline {{ max-width: 360px; }}
+  td.reason {{ max-width: 320px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }}
+  td.review-cell {{ white-space: nowrap; }}
+  .review {{ display: inline-flex; gap: 4px; }}
+  .thumb {{ background: transparent; border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 7px; cursor: pointer; font-size: 14px; color: var(--muted);
+    transition: background 120ms, color 120ms, border-color 120ms; }}
+  .thumb:hover {{ border-color: var(--accent); color: var(--text); }}
+  .thumb.good.on {{ background: rgba(61, 220, 151, 0.18); border-color: var(--green); color: var(--green); }}
+  .thumb.bad.on {{ background: rgba(239, 68, 68, 0.15); border-color: var(--red); color: var(--red); }}
   .counts {{ margin-top: 24px; max-width: 720px; }}
   .counts td.total {{ font-weight: 700; }}
+  .dialog-backdrop {{ position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    display: none; align-items: center; justify-content: center; z-index: 10; }}
+  .dialog-backdrop.open {{ display: flex; }}
+  .dialog {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px 20px; min-width: 320px; max-width: 440px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }}
+  .dialog h3 {{ margin: 0 0 10px; font-size: 14px; font-weight: 700; color: var(--text); }}
+  .dialog label {{ display: flex; align-items: center; gap: 8px; padding: 6px 0;
+    color: var(--muted); font-size: 13px; cursor: pointer; }}
+  .dialog label:hover {{ color: var(--text); }}
+  .dialog input[type=text] {{ width: 100%; background: #0b1121; color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font-size: 12px;
+    margin-top: 4px; }}
+  .dialog .buttons {{ display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }}
+  .dialog .buttons button {{ background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 12px; }}
+  .dialog .buttons button.primary {{ background: var(--accent); color: white; border-color: var(--accent); }}
 </style>
 </head>
 <body>
 <header>
   <h1>PULSE · CANDIDATES</h1>
   <span class='stat'><strong>{total}</strong> in view · <strong>{published}</strong> above threshold</span>
+  <div class='review-strip'>
+    <span><span class='k'>reviewed</span><span class='v'>{reviews_total}</span></span>
+    <span><span class='k'>good</span><span class='v good'>{reviews_good}</span></span>
+    <span><span class='k'>bad</span><span class='v bad'>{reviews_bad}</span> <span class='k'>({reviews_bad_pct}%)</span></span>
+    <span><span class='k'>top bad</span><span class='v'>{top_reasons}</span></span>
+  </div>
 </header>
 <main>
   <form class='filters' method='get'>
@@ -254,18 +357,73 @@ _PAGE_TEMPLATE = """
     <label>status {status_select}</label>
     <label><input type='checkbox' name='above_threshold_only' value='true' {above_checked}> above threshold only</label>
     <label>limit <input type='number' name='limit' value='{limit}' min='1' max='1000' style='width:80px'></label>
-    <button type='submit'>Apply</button>
+    <button type='submit' class='apply-btn'>Apply</button>
   </form>
   <table>
     <thead><tr>
-      <th>Created</th><th>Hook</th><th>Fixture</th><th>Market</th>
-      <th>Score</th><th>≥thr</th><th>Status</th><th>Headline</th><th>Reason</th>
+      <th>Created</th><th>Hook</th><th>Type</th><th>Fixture</th><th>Market</th>
+      <th>Score</th><th>≥thr</th><th>Status</th><th>Headline</th><th>Reason</th><th>Review</th>
     </tr></thead>
     <tbody>{rows_html}</tbody>
   </table>
   <h3 style='color:var(--muted);font-weight:600;margin-top:32px;'>Counts by hook × status</h3>
   {counts_html}
 </main>
+
+<div class='dialog-backdrop' id='reason-dialog'>
+  <div class='dialog'>
+    <h3>Why is this card bad?</h3>
+    <form id='reason-form'>
+      <label><input type='radio' name='reason' value='wrong_team'> Wrong team attached</label>
+      <label><input type='radio' name='reason' value='story_unrelated'> Story isn't about this match</label>
+      <label><input type='radio' name='reason' value='bad_headline'> Headline is weak / off</label>
+      <label><input type='radio' name='reason' value='angle_mismatch'> Angle doesn't fit the market</label>
+      <label><input type='radio' name='reason' value='odds_nonsensical'> Odds / BB combo looks wrong</label>
+      <label><input type='radio' name='reason' value='duplicate'> Duplicate of another card</label>
+      <label><input type='radio' name='reason' value='other' checked> Other</label>
+      <label>Note (optional): <input type='text' name='note' placeholder='free-text detail'></label>
+      <div class='buttons'>
+        <button type='button' onclick='closeDialog()'>Cancel</button>
+        <button type='submit' class='primary'>Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  const _state = {{ pendingId: null }};
+  async function review(candId, verdict) {{
+    if (verdict === 'bad') {{
+      _state.pendingId = candId;
+      document.getElementById('reason-dialog').classList.add('open');
+      return;
+    }}
+    await postReview(candId, 'good', null, null);
+    location.reload();
+  }}
+  function closeDialog() {{
+    _state.pendingId = null;
+    document.getElementById('reason-dialog').classList.remove('open');
+  }}
+  document.getElementById('reason-form').addEventListener('submit', async (e) => {{
+    e.preventDefault();
+    const form = e.target;
+    const reason = form.reason.value;
+    const note = form.note.value || null;
+    const id = _state.pendingId;
+    closeDialog();
+    if (!id) return;
+    await postReview(id, 'bad', reason, note);
+    location.reload();
+  }});
+  async function postReview(candId, verdict, reason_code, note) {{
+    await fetch('/admin/candidates/' + encodeURIComponent(candId) + '/review', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ verdict, reason_code, note }}),
+    }});
+  }}
+</script>
 </body>
 </html>
 """
