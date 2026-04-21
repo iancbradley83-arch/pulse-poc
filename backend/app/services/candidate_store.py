@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS candidates (
     -- Price provenance: "rogue_calculate_bets" (real correlated/boosted),
     -- "naive" (leg-product fallback), or NULL (not priced).
     price_source TEXT,
+    -- Rogue VirtualSelection id (returned by /betbuilder/match). Persisted
+    -- so the SSEPricingManager can re-quote the BB on leg ticks without
+    -- rebuilding the piped id from leg ids.
+    virtual_selection TEXT,
     FOREIGN KEY (news_item_id) REFERENCES news_items(id)
 );
 CREATE INDEX IF NOT EXISTS idx_candidates_created_at ON candidates(created_at);
@@ -105,22 +109,31 @@ class CandidateStore:
 
     async def init(self) -> None:
         async with aiosqlite.connect(self._db_path) as db:
-            # One-time migration: the candidates table used to lack
-            # `total_odds` and `price_source` columns. If we detect the old
-            # shape, drop + recreate so ComboBuilder's stamped prices actually
-            # persist. The 26-ish pre-migration candidates are lost — next
-            # candidate engine run regenerates them with real prices. Orphan
-            # rows in candidate_reviews are kept as historical labels.
+            # Schema migrations — additive only, idempotent. The candidates
+            # table grew over multiple PRs:
+            #   - PR #8 added total_odds + price_source
+            #   - PR #16 (this) adds virtual_selection
+            # We use ALTER TABLE ADD COLUMN (preserves existing rows) when
+            # only the newest column is missing, and fall back to a
+            # drop-and-recreate when the table predates total_odds.
             async with db.execute("PRAGMA table_info(candidates)") as cur:
                 cols = {row[1] for row in await cur.fetchall()}
-            if cols and "total_odds" not in cols:
-                logger.warning(
-                    "[CandidateStore] Dropping candidates table (old schema "
-                    "missing total_odds/price_source); will recreate on next "
-                    "CREATE TABLE IF NOT EXISTS."
-                )
-                await db.execute("DROP TABLE candidates")
-                await db.commit()
+            if cols:
+                # Old (pre-PR-#8) schema: drop + recreate, lose history
+                if "total_odds" not in cols:
+                    logger.warning(
+                        "[CandidateStore] Dropping candidates table (old schema "
+                        "missing total_odds/price_source); will recreate."
+                    )
+                    await db.execute("DROP TABLE candidates")
+                    await db.commit()
+                # Mid (post-PR-#8, pre-PR-#16) schema: ALTER ADD COLUMN
+                elif "virtual_selection" not in cols:
+                    logger.info(
+                        "[CandidateStore] Migrating candidates: ADD COLUMN virtual_selection"
+                    )
+                    await db.execute("ALTER TABLE candidates ADD COLUMN virtual_selection TEXT")
+                    await db.commit()
             await db.executescript(_SCHEMA)
             await db.commit()
 
@@ -165,8 +178,9 @@ class CandidateStore:
                     id, created_at, expires_at, news_item_id, hook_type,
                     bet_type, game_id, market_ids_json, selection_ids_json,
                     score, threshold_passed, reason, status, narrative,
-                    supporting_stats_json, total_odds, price_source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    supporting_stats_json, total_odds, price_source,
+                    virtual_selection
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -396,6 +410,7 @@ def _candidate_to_row(c: CandidateCard) -> tuple:
         c.supporting_stats_json,
         c.total_odds,
         c.price_source,
+        c.virtual_selection,
     )
 
 
@@ -425,6 +440,7 @@ def _row_to_candidate(row: aiosqlite.Row) -> CandidateCard:
         supporting_stats_json=row["supporting_stats_json"] or "",
         total_odds=_get("total_odds"),
         price_source=_get("price_source"),
+        virtual_selection=_get("virtual_selection"),
     )
 
 
