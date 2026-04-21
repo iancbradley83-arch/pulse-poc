@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app.models.news import (
+    BetType,
     CandidateCard,
     CandidateStatus,
     HookType,
@@ -136,10 +137,10 @@ class PolicyLayer:
         self._per_fixture_cap = per_fixture_cap
 
     def apply(self, candidates: list[CandidateCard]) -> list[CandidateCard]:
-        # 0. One candidate per news_item_id globally — even if the entity
-        #    resolver has (incorrectly) attached the same story to multiple
-        #    fixtures, only keep the highest-scoring attach. Prevents "same
-        #    headline on two different match cards" that users were seeing.
+        # 0. One candidate per news_item_id globally. Prefer validated Bet
+        #    Builders over singles from the same news item (BB is the richer
+        #    product — same story, more interesting bet). Among BBs or among
+        #    singles, pick highest score.
         by_news: dict[str, CandidateCard] = {}
         no_news: list[CandidateCard] = []
         for c in candidates:
@@ -147,7 +148,15 @@ class PolicyLayer:
                 no_news.append(c)
                 continue
             prev = by_news.get(c.news_item_id)
-            if prev is None or c.score > prev.score:
+            if prev is None:
+                by_news[c.news_item_id] = c
+                continue
+            # BB beats single; otherwise higher score wins.
+            prev_is_bb = prev.bet_type == BetType.BET_BUILDER
+            cur_is_bb = c.bet_type == BetType.BET_BUILDER
+            if cur_is_bb and not prev_is_bb:
+                by_news[c.news_item_id] = c
+            elif cur_is_bb == prev_is_bb and c.score > prev.score:
                 by_news[c.news_item_id] = c
         candidates = list(by_news.values()) + no_news
 

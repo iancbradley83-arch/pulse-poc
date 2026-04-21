@@ -150,7 +150,15 @@ const PULSE = (() => {
     const sourceName = card.source_name || '';
     const ago = formatAgo(card.ago_minutes);
 
-    const totalOdds = pick?.odds || 0;
+    // Multi-leg (Bet Builder / combo) cards stack their legs in the Pulse
+    // Pick block with a big total-odds badge on the right. Singles render
+    // the one selected leg exactly like before.
+    const betType = card.bet_type || 'single';
+    const multiLegs = Array.isArray(card.legs) ? card.legs : [];
+    const isMultiLeg = multiLegs.length > 1;
+    const totalOdds = isMultiLeg
+      ? (typeof card.total_odds === 'number' ? card.total_odds : multiLegs.reduce((p, l) => p * (l.odds || 1), 1))
+      : (pick?.odds || 0);
 
     // Hook-color CSS vars for per-card tint
     const style = [
@@ -186,7 +194,27 @@ const PULSE = (() => {
             ${card.game?.start_time ? `<span class="kickoff">· ${escape(formatKickoff(card.game.start_time))}</span>` : ''}
           </div>
 
-          ${pick ? `
+          ${isMultiLeg ? `
+            <div class="pulse-pick pulse-pick--stack">
+              <div class="pick-meta">
+                <div class="pick-label">
+                  Pulse ${betType === 'bet_builder' ? 'Bet Builder' : 'Combo'} · ${multiLegs.length} legs
+                </div>
+                <div class="leg-stack">
+                  ${multiLegs.map(l => `
+                    <div class="leg">
+                      <div class="leg-meta">
+                        <span class="leg-market">${escape(l.market_label || '')}</span>
+                        <span class="leg-label">${escape(l.label || '')}</span>
+                      </div>
+                      <span class="leg-odds">${(Number(l.odds) || 0).toFixed(2)}</span>
+                    </div>
+                  `).join('')}
+                </div>
+              </div>
+              <div class="pick-odds pick-odds--total">${(Number(totalOdds) || 0).toFixed(2)}</div>
+            </div>
+          ` : pick ? `
             <div class="pulse-pick">
               <div class="pick-meta">
                 <div class="pick-label">Pulse Pick · ${escape(card.market?.label || 'Match Winner')}</div>
@@ -200,10 +228,10 @@ const PULSE = (() => {
 
           <button class="cta-button" type="button">
             <span class="cta-left">
-              Tap to bet
+              ${isMultiLeg ? (betType === 'bet_builder' ? 'Add Bet Builder' : 'Add Combo') : 'Tap to bet'}
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
             </span>
-            ${totalOdds ? `<span class="cta-odds">${totalOdds.toFixed(2)}</span>` : ''}
+            ${totalOdds ? `<span class="cta-odds">${(Number(totalOdds) || 0).toFixed(2)}</span>` : ''}
           </button>
 
           <div class="card-foot">

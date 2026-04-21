@@ -266,7 +266,12 @@ def _selections(market: dict[str, Any], market_type: str) -> list[MarketSelectio
         # For totals, make the label explicit ("Over 2.5" / "Under 2.5").
         if market_type == "over_under" and sel.get("Points") is not None:
             label = f"{label} {sel['Points']}"
-        out.append(MarketSelection(label=label, odds=_display_odds(sel)))
+        out.append(MarketSelection(
+            label=label,
+            odds=_display_odds(sel),
+            selection_id=str(sel.get("_id") or "") or None,
+            outcome_type=str(sel.get("OutcomeType") or "") or None,
+        ))
     return out
 
 

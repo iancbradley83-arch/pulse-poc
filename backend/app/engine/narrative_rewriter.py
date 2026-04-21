@@ -24,7 +24,7 @@ from typing import Any, Optional
 from anthropic import AsyncAnthropic
 
 from app.models.news import CandidateCard, NewsItem
-from app.models.schemas import Game, Market
+from app.models.schemas import CardLeg, Game, Market
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,21 @@ FORBIDDEN PHRASES (never use — automatic fail)
   "could potentially", "might be expected to", "is said to be",
   "sources close to", "understood to be"
 
-CALIBRATION EXAMPLES
+BET BUILDER MODE
+
+When the input includes a `legs` block, the card is a multi-leg Bet Builder.
+Treat all legs as one package and write an angle that justifies the STACK,
+not any individual leg. Name-drop the total odds when it sharpens the line.
+Keep to the same 25-word ceiling.
+
+  BB RAW → {injury to Palmer, legs=[Brighton win 2.50, Under 2.5 Goals 1.98,
+           BTTS No 2.10], total=10.40}
+  REWRITE →
+    headline: Palmer out — Brighton tighten the grip on the whole evening
+    angle: No creativity, no goals; stack Brighton + Under + BTTS No at 10.4
+    and the whole game falls on a knock in training.
+
+CALIBRATION EXAMPLES (SINGLES)
 
   RAW → "Bournemouth officially announced Marco Rose as successor to departing
   Andoni Iraola. Focus must remain on European qualification push despite
@@ -115,7 +129,7 @@ CALIBRATION EXAMPLES
 
 INPUT YOU RECEIVE (plain-text fields, newline-separated)
   source, hook_type, raw_headline, raw_summary, home, away, league, kickoff,
-  market_label, pick, odds
+  market_label, pick, odds, and (when bet-builder) legs + total
 
 OUTPUT
   Call the `submit_rewrite` tool exactly once with { headline, angle }.
@@ -159,6 +173,8 @@ class NarrativeRewriter:
         market: Optional[Market],
         game: Optional[Game],
         candidate: CandidateCard,
+        legs: Optional[list[CardLeg]] = None,
+        total_odds: Optional[float] = None,
     ) -> Optional[dict[str, str]]:
         pick_label = ""
         pick_odds: Optional[float] = None
@@ -172,6 +188,13 @@ class NarrativeRewriter:
             except Exception:
                 pick_odds = None
 
+        legs_block = ""
+        if legs:
+            pretty = [f"{leg.market_label or '?'} · {leg.label} @ {leg.odds:.2f}" for leg in legs]
+            legs_block = "legs:\n  - " + "\n  - ".join(pretty) + "\n"
+            if total_odds:
+                legs_block += f"total: {total_odds:.2f}\n"
+
         user_block = (
             f"source: {news.source_name or news.source or 'unknown'}\n"
             f"hook_type: {news.hook_type.value}\n"
@@ -184,6 +207,7 @@ class NarrativeRewriter:
             f"market_label: {market_label or '?'}\n"
             f"pick: {pick_label or '?'}\n"
             f"odds: {pick_odds if pick_odds is not None else '?'}\n"
+            f"{legs_block}"
         )
 
         try:

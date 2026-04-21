@@ -20,6 +20,7 @@ import logging
 from typing import Optional, Protocol
 
 from app.engine.candidate_builder import CandidateBuilder
+from app.engine.combo_builder import ComboBuilder
 from app.engine.news_entity_resolver import NewsEntityResolver
 from app.engine.news_scorer import NewsScorer, PolicyLayer
 from app.models.news import CandidateCard, NewsItem
@@ -51,6 +52,7 @@ class CandidateEngine:
         scorer: NewsScorer,
         policy: PolicyLayer,
         store: CandidateStore,
+        combo_builder: Optional[ComboBuilder] = None,
     ):
         self._ingester = ingester
         self._resolver = resolver
@@ -58,6 +60,7 @@ class CandidateEngine:
         self._scorer = scorer
         self._policy = policy
         self._store = store
+        self._combo_builder = combo_builder
 
     async def run_once(
         self,
@@ -89,7 +92,20 @@ class CandidateEngine:
                         item.headline[:60], item.mentions,
                     )
                     continue
+                # Always build a single; it's the safety net if BB generation
+                # fails or is rejected by the book.
                 drafts.extend(self._builder.build(item))
+
+                # Try a Bet Builder per news item's *primary* fixture (resolver
+                # now returns one fixture; defensive iteration if that changes).
+                if self._combo_builder is not None:
+                    for fixture_id in item.fixture_ids:
+                        fixture = games.get(fixture_id)
+                        if fixture is None:
+                            continue
+                        bb = await self._combo_builder.build(item, fixture)
+                        if bb is not None:
+                            drafts.append(bb)
 
             # Score
             scored: list[CandidateCard] = []

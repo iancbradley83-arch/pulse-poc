@@ -47,6 +47,7 @@ from app.engine.narrative_generator import NarrativeGenerator
 from app.engine.card_assembler import CardAssembler
 from app.engine.news_entity_resolver import NewsEntityResolver
 from app.engine.candidate_builder import CandidateBuilder
+from app.engine.combo_builder import ComboBuilder
 from app.engine.news_scorer import NewsScorer, PolicyLayer
 from app.api.routes import create_routes
 from app.api.admin import create_admin_routes
@@ -162,37 +163,38 @@ async def _load_rogue_prematch():
             days_ahead=ROGUE_CATALOGUE_DAYS_AHEAD,
             max_events=ROGUE_CATALOGUE_MAX_EVENTS,
         )
+
+        if not games:
+            logger.warning("[PULSE] Rogue returned no usable fixtures — falling back to mock.")
+            await _load_mock_prematch()
+            return
+
+        catalog.replace_all(markets)
+        simulator._games = {g.id: g for g in games}
+
+        # Baseline pre-match cards (1X2 per fixture). The candidate engine
+        # below overlays news-driven cards on top.
+        cards = build_prematch_cards(games, catalog, assembler)
+        for card in cards:
+            feed.add_prematch_card(card)
+
+        # Keep the Rogue client alive through the candidate engine run so the
+        # ComboBuilder can validate Bet Builders via /betbuilder/match.
+        await _run_candidate_engine(simulator._games, rogue_client=client)
     finally:
         await client.close()
-
-    if not games:
-        logger.warning("[PULSE] Rogue returned no usable fixtures — falling back to mock.")
-        await _load_mock_prematch()
-        return
-
-    catalog.replace_all(markets)
-    # Expose the real fixtures to the rest of the app by registering them
-    # on the simulator's game registry — the API routes read from there.
-    simulator._games = {g.id: g for g in games}
-
-    # Baseline pre-match cards (1X2 per fixture). The candidate engine below
-    # overlays news-driven cards on top.
-    cards = build_prematch_cards(games, catalog, assembler)
-    for card in cards:
-        feed.add_prematch_card(card)
-
-    await _run_candidate_engine(simulator._games)
 
     logger.info("[PULSE] Rogue mode — %d games, %d markets, %d cards",
                 len(games), len(markets), len(feed.prematch_cards))
 
 
-async def _run_candidate_engine(games_by_id: dict[str, Game]):
+async def _run_candidate_engine(games_by_id: dict[str, Game], *, rogue_client: _Optional[RogueClient] = None):
     """Run the news-driven engine across the live catalogue.
 
     Uses MockNewsIngester by default (no API key). When ANTHROPIC_API_KEY is
     set, we can swap in the real NewsIngester — imported lazily so missing
-    SDK deps don't break the mock path.
+    SDK deps don't break the mock path. When a Rogue client is passed in,
+    the ComboBuilder uses it for Bet Builder validation.
     """
     global candidate_engine
     await candidate_store.init()
@@ -228,10 +230,14 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
     builder = CandidateBuilder(catalog)
     scorer = NewsScorer()
     policy = PolicyLayer(publish_threshold=PULSE_PUBLISH_THRESHOLD)
+    # Bet Builder generator — only active when we have a Rogue client to
+    # validate combos against. Mock mode skips BBs.
+    combo_builder = ComboBuilder(catalog, rogue_client) if rogue_client is not None else None
 
     candidate_engine = CandidateEngine(
         ingester=ingester, resolver=resolver, builder=builder,
         scorer=scorer, policy=policy, store=candidate_store,
+        combo_builder=combo_builder,
     )
 
     counts = await candidate_engine.run_once(
@@ -243,6 +249,8 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
     published = await candidate_store.list_candidates(
         above_threshold_only=True, status="published", limit=100,
     )
+    from app.models.news import BetType as _BetType
+    from app.models.schemas import CardLeg as _CardLeg
     import time as _time
     rewrite_hit = 0
     rewrite_miss = 0
@@ -256,12 +264,46 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
             continue
         news = await candidate_store.get_news_item(cand.news_item_id) if cand.news_item_id else None
 
+        # Resolve leg markets for Bet Builder candidates.
+        is_bb = cand.bet_type == _BetType.BET_BUILDER and len(cand.selection_ids) >= 2
+        legs: list[_CardLeg] = []
+        total_odds: "float | None" = None
+        if is_bb:
+            for mid, sid in zip(cand.market_ids, cand.selection_ids):
+                leg_market = catalog.get(mid)
+                if leg_market is None:
+                    continue
+                leg_sel = next((s for s in leg_market.selections if s.selection_id == sid), None)
+                if leg_sel is None:
+                    continue
+                try:
+                    leg_odds = float(leg_sel.odds)
+                except Exception:
+                    leg_odds = 0.0
+                legs.append(_CardLeg(
+                    label=leg_sel.label,
+                    market_label=leg_market.label,
+                    odds=leg_odds,
+                    selection_id=sid,
+                ))
+            if legs:
+                product = 1.0
+                for leg in legs:
+                    if leg.odds > 0:
+                        product *= leg.odds
+                total_odds = round(product, 2) if product > 1.0 else None
+            else:
+                is_bb = False  # couldn't resolve any leg → fall back to single
+
         # Journalist voice pass — replace the scout's raw headline + summary
         # with card-ready copy. Falls back to scout output on failure.
         final_headline = news.headline if news else (cand.narrative or "")
         final_angle = news.summary if news else (cand.narrative or "")
         if rewriter is not None and news is not None:
-            rewrite = await rewriter.rewrite(news=news, market=market, game=game, candidate=cand)
+            rewrite = await rewriter.rewrite(
+                news=news, market=market, game=game, candidate=cand,
+                legs=legs if is_bb else None, total_odds=total_odds if is_bb else None,
+            )
             if rewrite:
                 final_headline = rewrite.get("headline") or final_headline
                 final_angle = rewrite.get("angle") or final_angle
@@ -279,13 +321,16 @@ async def _run_candidate_engine(games_by_id: dict[str, Game]):
             game=game, market=market, narrative=final_angle or "",
             badge=badge, relevance=cand.score, stats=[], tweets=[],
         )
-        # Design-handoff fields so the Hero variant has source / recency / hook
         card.hook_type = cand.hook_type.value
         card.headline = final_headline
         card.source_name = news.source_name if news else None
         ingested = news.ingested_at if news else cand.created_at
         if ingested:
             card.ago_minutes = max(0, int((_time.time() - ingested) / 60))
+        if is_bb:
+            card.legs = legs
+            card.total_odds = total_odds
+            card.bet_type = "bet_builder"
         feed.add_prematch_card(card)
 
     if rewriter is not None:

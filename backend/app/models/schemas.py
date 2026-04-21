@@ -79,6 +79,14 @@ class MarketSelection(BaseModel):
     label: str  # e.g., "Over 27.5", "Arsenal"
     odds: str  # e.g., "-115", "+260"
     previous_odds: Optional[str] = None
+    # Rogue selection ID — required for Bet Builder validation via
+    # /v1/sportsdata/betbuilder/match. Optional because mock data and other
+    # sources won't have one.
+    selection_id: Optional[str] = None
+    # Outcome classification from Rogue — "Home" / "Away" / "Draw" / "Over" /
+    # "Under" / "Yes" / "No" etc. Used by the ComboBuilder to pick the right
+    # leg per hook theme without parsing labels.
+    outcome_type: Optional[str] = None
 
 
 class Market(BaseModel):
@@ -154,6 +162,20 @@ class GameEvent(BaseModel):
 
 # ── Feed Card (the output) ──
 
+class CardLeg(BaseModel):
+    """One leg of a multi-selection card (Bet Builder or combo).
+
+    For singles, we leave `legs` empty on the Card and let the frontend render
+    from `market.selections` as before. Legs carry enough data for the design
+    pack's stacked-pick block: a label, optional sub-line, and decimal odds.
+    """
+    label: str
+    sub: Optional[str] = None
+    odds: float = 0.0
+    market_label: Optional[str] = None       # "FT 1X2", "Total Goals O/U"
+    selection_id: Optional[str] = None       # Rogue selection id (for deep-link)
+
+
 class Card(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4())[:12])
     card_type: CardType
@@ -178,3 +200,10 @@ class Card(BaseModel):
     source_name: Optional[str] = None        # "BBC Sport", "Sky Sports"
     source_handle: Optional[str] = None      # "@SkySportsNews"
     ago_minutes: Optional[int] = None        # minutes since news was published/ingested
+
+    # Stage 3 — multi-leg cards (Bet Builder / combo). When legs is non-empty,
+    # the frontend stacks them in the Pulse Pick block and shows total_odds
+    # instead of the single selection's odds.
+    legs: list[CardLeg] = []
+    total_odds: Optional[float] = None
+    bet_type: str = "single"                 # "single" | "combo" | "bet_builder"
