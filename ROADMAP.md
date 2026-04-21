@@ -229,6 +229,28 @@ That's Stages 1 → 5. Everything after is enhancement.
 
 ## Current status
 
+### 2026-04-21 session end — commit `d66c93f` on main, deployed to Railway
+
+- **Stage 3a — DONE.** News-driven Bet Builders live on prod. `ComboBuilder` in `app/engine/combo_builder.py` maps hook-type to abstract leg themes (`injury → opponent win + Under 2.5 + BTTS No`, etc.), resolves abstract legs to actual selection IDs against the catalogue, validates every combo via Rogue `/v1/sportsdata/betbuilder/match`, emits a `BetType.BET_BUILDER` candidate. Policy layer prefers validated BBs over singles for the same news item. Frontend renders stacked legs + total odds in the Pulse Pick block. Rewriter has a Bet Builder mode that writes one angle covering the stack.
+- **Confidence pass — DONE.** Quality gates at `app/engine/quality_gates.py` (fail-closed rules: headline/angle length + substance, BB leg count + floor + ceiling, fixture attribution). Rejections persisted to the store with reason so `/admin/candidates` surfaces them. New `candidate_reviews` table + `POST /admin/candidates/{id}/review` endpoint. Admin UI gains 👍/👎 per row (bad-click opens reason-code dialog), top-of-page review-stats strip, and full BB legs rendering in the Market column (showed only primary market before — reviewer couldn't see what combo was).
+
+**Open issues / known gaps at session end:**
+
+1. **BB total odds are naively multiplied** — correct for cross-event accas (independent events) but **wrong for same-event BBs** (correlated). Apuesta Total's slip prices a 3-leg BB at ~18.9 where our product gives ~43. Rogue `/betbuilder/match` returns only `IsSuccess` + `VirtualSelection`, no correlated price. The MCP README flags **"Betting | 8 endpoints | Read-only ops monitor, no placement"** — 8 Rogue betting endpoints were intentionally NOT exposed by the MCP. Next session: read Rogue's own OpenAPI docs for those 8 endpoints + inspect Apuesta Total web client's network calls to find the correlated-price endpoint (likely `/v1/betting/quote` or `/v1/betting/betslip`). If pricing requires a customer session (not our anonymous JWT), the UI fallback is: hide the total, show legs only, CTA says "Price in bet slip".
+2. **Railway cold-start blip** — ingest + rewrite pass runs on every boot (~45s), during which Railway serves 502. Move to a scheduled cron separate from the web process; also cuts LLM spend per restart (~$0.30).
+3. **Theme repetition** — three hook-themes in `combo_builder.HOOK_THEMES` means many BBs look alike. Stage 3b breaks this up with player-prop markets.
+4. **Small-club team colours missing** — `CLUB_COLORS` in `catalogue_loader.py` only covers ~15 big clubs; Bournemouth/Leeds/Getafe render grey. Polish task.
+5. **Learning loop** — labels DB exists, the nightly aggregator that summarises failures into prompt tweaks isn't built yet. Waits for 100+ labelled rows.
+
+**Stage 3 sequence going forward:**
+- **3b — Richer market support.** `includeMarkets=all` on deep-scan, new market_type classifiers (anytime_goalscorer, first_goalscorer, shots, cards), carry player_id through the schema.
+- **3c — Player Bet Builders.** Player news → player prop + team outcome + totals stack.
+- **3d — Goalscorers of the Day.** Curated cross-event accumulator (naive decimal product works here — independent events).
+
+---
+
+### Earlier session milestones
+
 - **Stage 2 — DONE locally (2026-04-20).** News-driven recommendation engine + validation surface running end-to-end.
   - Schemas + SQLite store: `app/models/news.py`, `app/services/candidate_store.py`.
   - News ingester: `app/services/news_ingester.py` (Claude Haiku 4.5 + native web search + terminal `submit_news_items` tool, prompt-cached system prompt). Mock fallback `app/services/mock_news_ingester.py` (20 curated stories) when `ANTHROPIC_API_KEY` is not set.
