@@ -6,10 +6,19 @@ import os
 import time
 import uuid
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+# Configure logging BEFORE any module-level loggers are created. Without this,
+# our `logger.info(...)` calls go nowhere on Railway — only WARNING+ slips
+# through Python's default lastResort handler. Keep it INFO so we can see
+# pricing decisions in Railway log shipping.
+logging.basicConfig(
+    level=os.getenv("PULSE_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 from app.config import (
     ANTHROPIC_API_KEY,
@@ -111,6 +120,39 @@ async def serve_index():
         _INDEX_HTML,
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
+
+
+# ── Debug: live calculate_bets probe ────────────────────────────────────
+# Temporary diagnostic endpoint while we verify the Betting API integration.
+# Returns the raw Rogue calculate_bets response for any selection IDs.
+# Disable in prod by unsetting PULSE_DEBUG_CALC_BETS once we have what we
+# need (or leave on — it's read-only and uses the same JWT we already use).
+@app.get("/debug/calc_bets")
+async def debug_calc_bets(ids: str, oddsStyle: str = "decimal", locale: str = "en"):
+    if os.getenv("PULSE_DEBUG_CALC_BETS", "true").lower() != "true":
+        raise HTTPException(403, "PULSE_DEBUG_CALC_BETS=false")
+    if not ROGUE_CONFIG_JWT:
+        raise HTTPException(503, "ROGUE_CONFIG_JWT not set")
+    selection_ids = [s.strip() for s in ids.split(",") if s.strip()]
+    if not selection_ids:
+        raise HTTPException(400, "ids query param required (comma-separated)")
+    client = RogueClient(
+        base_url=ROGUE_BASE_URL,
+        config_jwt=ROGUE_CONFIG_JWT,
+        per_second=ROGUE_RATE_LIMIT_PER_SECOND,
+    )
+    try:
+        result = await client.calculate_bets(
+            selection_ids, odds_style=oddsStyle, locale=locale,
+        )
+        return JSONResponse({"selection_ids": selection_ids, "result": result})
+    except Exception as exc:
+        return JSONResponse(
+            {"selection_ids": selection_ids, "error": str(exc), "type": type(exc).__name__},
+            status_code=500,
+        )
+    finally:
+        await client.close()
 
 
 # ── WebSocket ──
