@@ -319,6 +319,62 @@ class RogueClient:
             {"selectionIDs": ",".join(selection_ids)},
         )
 
+    async def calculate_bets(
+        self,
+        selection_ids: list[str],
+        *,
+        odds_style: str = "decimal",
+        locale: str = "en",
+        extended_additional_info: bool = False,
+    ) -> Any:
+        """Server-side bet pricing for any combination of selection IDs.
+
+        Endpoint: POST /v1/betting/calculateBets (per the official OpenAPI spec
+        at spec/openapi.json — security is the same anonymous Bearer JWT we
+        already use elsewhere; no customer session required).
+
+        Args:
+            selection_ids: list of leg selection ids. For Bet Builders pass the
+                single VirtualSelection id (`0VS<piped-leg-ids>`) returned by
+                `betbuilder_match`. For cross-event combos pass each leg id.
+            odds_style: 'decimal' | 'american' | 'fractional' | 'malay' | 'indo' | 'hk'
+            locale: 'en' or 'es-pe'
+            extended_additional_info: pulls richer per-leg breakdowns
+
+        Returns the raw API response. Useful fields:
+            data["Selections"][i]: per-leg `TrueOdds`, `DisplayOdds`, `BetslipLine`
+            data["Bets"][i]: each candidate bet TYPE the selections support
+                ("Single", "Combo", "BetBuilder", "System"), each with
+                `TrueOdds`, `DisplayOdds`, `MaxStake`, `MinStake`, `ComboBonus`
+                (`{Percent, Gain, ...}` — the operator's combo boost as a
+                multiplicative %).
+            data["Errors"][i]: combinability problems (e.g. "BetBuilderInvalid")
+
+        This replaces the prior Kmianko bet-slip detour — the official Rogue
+        API exposes the same prices natively, no Cloudflare bypass needed.
+        """
+        await self._limiter.acquire()
+        body = {
+            "Selections": [{"Id": sid} for sid in selection_ids],
+            "OddsStyle": odds_style,
+            "Locale": locale,
+            "ExtendedAdditionalInfo": extended_additional_info,
+        }
+        headers = await self._auth.headers()
+        headers["Content-Type"] = "application/json"
+        url = f"{self._base_url}/v1/betting/calculateBets"
+        res = await self._http.post(url, json=body, headers=headers)
+        if res.status_code == 401:
+            self._auth.invalidate()
+            headers = await self._auth.headers()
+            headers["Content-Type"] = "application/json"
+            res = await self._http.post(url, json=body, headers=headers)
+        if res.status_code == 204:
+            return None
+        if res.status_code >= 400:
+            raise RogueApiError(res.status_code, res.text[:400])
+        return res.json()
+
 
 def _coerce_param(v: Any) -> Any:
     if isinstance(v, bool):

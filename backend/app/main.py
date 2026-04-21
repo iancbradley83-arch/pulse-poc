@@ -36,8 +36,6 @@ from app.services.game_simulator import GameSimulator
 from app.services.rogue_client import RogueClient
 from app.services.catalogue_loader import fetch_soccer_snapshot
 from app.services.rogue_prematch import build_prematch_cards
-from app.services.kmianko_session import KmiankoSession
-from app.services.kmianko_betslip import KmiankoBetslipClient
 from app.services.candidate_store import CandidateStore
 from app.services.mock_news_ingester import MockNewsIngester
 from app.services.candidate_engine import CandidateEngine
@@ -180,32 +178,12 @@ async def _load_rogue_prematch():
         for card in cards:
             feed.add_prematch_card(card)
 
-        # Spin up the Kmianko bet-slip client too so the ComboBuilder can
-        # quote real correlated BB prices (and the cross-event combo path
-        # below picks up operator combo-bonus boosts). Disabled when env says
-        # so or when Playwright isn't installed — falls back to naive product.
-        kmianko_client: _Optional[KmiankoBetslipClient] = None
-        kmianko_session: _Optional[KmiankoSession] = None
-        if os.getenv("PULSE_KMIANKO_PRICING", "true").lower() == "true":
-            try:
-                kmianko_session = KmiankoSession()
-                kmianko_client = KmiankoBetslipClient(kmianko_session)
-                logger.info("[PULSE] Kmianko bet-slip pricing enabled")
-            except Exception as exc:
-                logger.warning("[PULSE] Kmianko pricing init failed (%s) — naive prices", exc)
-                kmianko_client = None
-
-        try:
-            # Keep the Rogue client alive through the candidate engine run so
-            # the ComboBuilder can validate Bet Builders via /betbuilder/match.
-            await _run_candidate_engine(
-                simulator._games,
-                rogue_client=client,
-                kmianko_client=kmianko_client,
-            )
-        finally:
-            if kmianko_client is not None:
-                await kmianko_client.close()
+        # Real correlated BB + combo prices come from the same RogueClient
+        # via POST /v1/betting/calculateBets — no separate service or auth.
+        await _run_candidate_engine(
+            simulator._games,
+            rogue_client=client,
+        )
     finally:
         await client.close()
 
@@ -217,16 +195,14 @@ async def _run_candidate_engine(
     games_by_id: dict[str, Game],
     *,
     rogue_client: _Optional[RogueClient] = None,
-    kmianko_client: _Optional[KmiankoBetslipClient] = None,
 ):
     """Run the news-driven engine across the live catalogue.
 
     Uses MockNewsIngester by default (no API key). When ANTHROPIC_API_KEY is
     set, we can swap in the real NewsIngester — imported lazily so missing
     SDK deps don't break the mock path. When a Rogue client is passed in,
-    the ComboBuilder uses it for Bet Builder validation. When a Kmianko
-    client is also passed, BB candidates get real correlated prices and
-    cross-event combos get operator combo-bonus boosts.
+    the ComboBuilder uses it for Bet Builder validation AND for real
+    correlated pricing via POST /v1/betting/calculateBets.
     """
     global candidate_engine
     await candidate_store.init()
@@ -262,14 +238,10 @@ async def _run_candidate_engine(
     builder = CandidateBuilder(catalog)
     scorer = NewsScorer()
     policy = PolicyLayer(publish_threshold=PULSE_PUBLISH_THRESHOLD)
-    # Bet Builder generator — only active when we have a Rogue client to
-    # validate combos against. Mock mode skips BBs. The Kmianko client (when
-    # present) lets us replace the naive leg-product with the real correlated
-    # price the operator quotes in the bet slip.
-    combo_builder = (
-        ComboBuilder(catalog, rogue_client, kmianko_client=kmianko_client)
-        if rogue_client is not None else None
-    )
+    # Bet Builder generator — only active when we have a Rogue client.
+    # The same client provides real correlated BB pricing via the Betting
+    # API (calculate_bets). Mock mode (no Rogue client) skips BBs entirely.
+    combo_builder = ComboBuilder(catalog, rogue_client) if rogue_client is not None else None
 
     candidate_engine = CandidateEngine(
         ingester=ingester, resolver=resolver, builder=builder,
@@ -283,34 +255,41 @@ async def _run_candidate_engine(
     logger.info("[PULSE] Candidate engine counts: %s", counts)
 
     # Cross-event combo pricing — when (in a future stage) the engine starts
-    # emitting BetType.COMBO candidates, fetch the operator-boosted price from
-    # Kmianko before the publish gate. Today this is a no-op because nothing
+    # emitting BetType.COMBO candidates, fetch the operator-boosted price via
+    # Rogue's calculate_bets endpoint. Today this is a no-op because nothing
     # produces COMBO candidates yet; the wiring is here so Stage 3d
     # ("Goalscorers of the Day" cross-event accumulators) gets real prices
-    # the moment it ships.
-    if kmianko_client is not None:
+    # the moment it ships. Combo math = `Bets[Type=='Combo'].TrueOdds`, which
+    # already includes the operator's `ComboBonus.Percent` boost.
+    if rogue_client is not None:
         from app.models.news import BetType as _BTypeForCombo
         all_pending = await candidate_store.list_candidates(limit=500)
         combo_priced = 0
         for c in all_pending:
             if c.bet_type != _BTypeForCombo.COMBO:
                 continue
-            if c.price_source in ("kmianko_combo",):
+            if c.price_source == "rogue_calculate_bets":
                 continue
             if not c.selection_ids or len(c.selection_ids) < 2:
                 continue
             try:
-                quote = await kmianko_client.quote_combo(c.selection_ids)
+                quote = await rogue_client.calculate_bets(c.selection_ids)
             except Exception as exc:
-                logger.warning("[PULSE] Kmianko combo quote errored for %s: %s", c.id, exc)
+                logger.warning("[PULSE] calculate_bets errored for combo %s: %s", c.id, exc)
                 continue
-            if quote and quote.get("decimal"):
-                c.total_odds = round(float(quote["decimal"]), 2)
-                c.price_source = "kmianko_combo"
-                combo_priced += 1
+            if isinstance(quote, dict):
+                bets = quote.get("Bets") or []
+                combo_bet = next(
+                    (b for b in bets if (b or {}).get("Type") == "Combo"),
+                    None,
+                )
+                if combo_bet and isinstance(combo_bet.get("TrueOdds"), (int, float)):
+                    c.total_odds = round(float(combo_bet["TrueOdds"]), 2)
+                    c.price_source = "rogue_calculate_bets"
+                    combo_priced += 1
         if combo_priced:
-            await candidate_store.save_candidates([c for c in all_pending if c.price_source == "kmianko_combo"])
-            logger.info("[PULSE] Kmianko combo pricing applied to %d candidates", combo_priced)
+            await candidate_store.save_candidates([c for c in all_pending if c.price_source == "rogue_calculate_bets"])
+            logger.info("[PULSE] calculate_bets combo pricing applied to %d candidates", combo_priced)
 
     # Promote published candidates into the public feed
     published = await candidate_store.list_candidates(
@@ -378,12 +357,13 @@ async def _run_candidate_engine(
         final_headline = news.headline if news else (cand.narrative or "")
         final_angle = news.summary if news else (cand.narrative or "")
         if rewriter is not None and news is not None:
-            # Pass total_odds to the rewriter ONLY when we have a real
-            # correlated/operator price (kmianko_bb / kmianko_combo). Naive
-            # products are misleading — the LLM is instructed to stay vague
-            # when total_odds is absent.
+            # Pass total_odds to the rewriter ONLY when we have a real price
+            # from Rogue's calculate_bets (rogue_calculate_bets) or — for
+            # back-compat with anything still in the candidate store — the
+            # legacy kmianko sources. Naive products are misleading; the LLM
+            # is instructed to stay vague when total_odds is absent.
             rewriter_total: "float | None" = None
-            if cand.price_source in ("kmianko_bb", "kmianko_combo") and total_odds:
+            if cand.price_source in ("rogue_calculate_bets", "kmianko_bb", "kmianko_combo") and total_odds:
                 rewriter_total = total_odds
             rewrite = await rewriter.rewrite(
                 news=news, market=market, game=game, candidate=cand,
@@ -436,12 +416,12 @@ async def _run_candidate_engine(
         if is_bb:
             card.legs = legs
             # Show the real correlated price when ComboBuilder fetched one
-            # from the Kmianko bet-slip endpoint. Hide it when we only have
-            # the naive leg-product (which over-states the correlated book
-            # price by ~1-2x). The frontend renders "Price in bet slip" when
-            # total_odds is null. The (still-naive-fallback) total_odds is
-            # used upstream for quality gating regardless.
-            if cand.price_source == "kmianko_bb":
+            # via Rogue calculate_bets. Hide it when we only have the naive
+            # leg-product (over-states the correlated book price by ~1-2x).
+            # The frontend renders "Price in bet slip" when total_odds is
+            # null. The naive total is still used upstream for quality
+            # gating regardless of whether it surfaces on the card.
+            if cand.price_source in ("rogue_calculate_bets", "kmianko_bb"):
                 card.total_odds = total_odds
             else:
                 card.total_odds = None

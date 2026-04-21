@@ -26,7 +26,6 @@ from app.models.news import BetType, CandidateCard, CandidateStatus, HookType, N
 from app.models.schemas import Game, Market, MarketSelection
 from app.services.market_catalog import MarketCatalog
 from app.services.rogue_client import RogueApiError, RogueClient
-from app.services.kmianko_betslip import KmiankoBetslipClient
 
 logger = logging.getLogger(__name__)
 
@@ -234,13 +233,9 @@ class ComboBuilder:
         self,
         catalog: MarketCatalog,
         rogue_client: Optional[RogueClient],
-        kmianko_client: Optional[KmiankoBetslipClient] = None,
     ):
         self._catalog = catalog
         self._rogue = rogue_client
-        # Optional — when present, BB candidates get a real correlated price
-        # from Apuesta Total's bet-slip endpoint instead of the naive product.
-        self._kmianko = kmianko_client
 
     async def build(self, news: NewsItem, game: Game) -> Optional[CandidateCard]:
         """Build a Bet Builder candidate from a news item + its resolved fixture."""
@@ -294,19 +289,31 @@ class ComboBuilder:
                 total_odds = odds
                 price_source = "rogue_bb"
 
-        if total_odds is None and self._kmianko is not None and virtual_selection:
+        # Real correlated BB price via Rogue's official Betting API
+        # (POST /v1/betting/calculateBets). Same anonymous Bearer JWT, same
+        # host as the rest of RogueClient — no separate auth, no headless
+        # browser. Returns per-leg odds + a Bets[] array of supportable bet
+        # types; for a BB virtual-selection id the relevant entry is
+        # Type=='BetBuilder' carrying the correlated TrueOdds.
+        if total_odds is None and self._rogue is not None and virtual_selection:
             try:
-                quote = await self._kmianko.quote_bet_builder(virtual_selection)
+                quote = await self._rogue.calculate_bets([virtual_selection])
             except Exception as exc:
-                logger.warning("ComboBuilder: Kmianko BB quote errored: %s", exc)
+                logger.warning("ComboBuilder: Rogue calculate_bets errored: %s", exc)
                 quote = None
-            if quote and quote.get("decimal"):
-                total_odds = round(float(quote["decimal"]), 2)
-                price_source = "kmianko_bb"
-                logger.debug(
-                    "ComboBuilder: BB %s priced at %.2f via Kmianko (legs=%s)",
-                    virtual_selection[:32], total_odds, quote.get("leg_decimals"),
+            if isinstance(quote, dict):
+                bets = quote.get("Bets") or []
+                bb_bet = next(
+                    (b for b in bets if (b or {}).get("Type") in ("BetBuilder", "Single")),
+                    None,
                 )
+                if bb_bet and isinstance(bb_bet.get("TrueOdds"), (int, float)):
+                    total_odds = round(float(bb_bet["TrueOdds"]), 2)
+                    price_source = "rogue_calculate_bets"
+                    logger.debug(
+                        "ComboBuilder: BB %s priced at %.2f via calculate_bets",
+                        virtual_selection[:32], total_odds,
+                    )
 
         # Fallback total: multiply decimal odds naively if neither Rogue nor
         # Kmianko gave us a real number. Naive product over-states correlated
