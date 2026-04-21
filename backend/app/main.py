@@ -236,59 +236,134 @@ async def generate_prematch_cards():
     await _load_mock_prematch()
 
 
-# In-flight on-demand rerun task — guarded so /admin/rerun can't kick off
+# In-flight on-demand rerun state. Guarded so /admin/rerun can't kick off
 # parallel runs. While one is running, the endpoint returns 409.
 _ondemand_rerun_inflight: bool = False
+_ondemand_rerun_started_at: float = 0.0
+_ondemand_rerun_last_result: dict = {}
 
 
-@app.post("/admin/rerun")
-async def admin_rerun():
-    """On-demand candidate-engine rerun for demos. Builds into a staging
-    FeedManager and atomic-swaps when complete (visible feed never goes
-    empty during the ~3-min run). Guarded against parallel invocations —
-    second call while one is in flight returns 409.
-
-    No auth on the endpoint today (POC). Cost: same ~$0.30-0.50 per run as
-    the scheduled loop.
-    """
-    global _ondemand_rerun_inflight
-    if PULSE_DATA_SOURCE != "rogue":
-        raise HTTPException(400, "rerun only valid when PULSE_DATA_SOURCE=rogue")
-    if _ondemand_rerun_inflight:
-        raise HTTPException(409, "a rerun is already in flight")
-    _ondemand_rerun_inflight = True
+async def _do_ondemand_rerun():
+    """Background task body for /admin/rerun. Runs the same staging-and-
+    swap logic as the scheduled loop but is fire-and-forget so the HTTP
+    request can return immediately (Railway's edge cuts at 60s, and a
+    rerun takes ~3 min)."""
+    global _ondemand_rerun_inflight, _ondemand_rerun_last_result
     t0 = time.time()
     try:
         staging = FeedManager()
-        await _load_rogue_prematch(target_feed=staging)
+        await _load_rogue_prematch(target_feed=staging, is_rerun=True)
         new_cards = list(staging.prematch_cards)
         if not new_cards:
-            raise HTTPException(500, "rerun produced 0 cards — keeping prior feed")
+            _ondemand_rerun_last_result = {
+                "ok": False, "error": "rerun produced 0 cards — kept prior feed",
+                "elapsed_s": round(time.time() - t0, 1),
+                "finished_at": time.time(),
+            }
+            logger.warning("[PULSE] On-demand rerun produced 0 cards")
+            return
         feed.replace_prematch_cards(new_cards)
         try:
             await feed.broadcast_feed_refresh()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("[PULSE] feed_refresh broadcast errored: %s", exc)
         elapsed = time.time() - t0
+        _ondemand_rerun_last_result = {
+            "ok": True, "cards": len(new_cards),
+            "elapsed_s": round(elapsed, 1),
+            "finished_at": time.time(),
+        }
         logger.info(
             "[PULSE] On-demand rerun complete: %d cards swapped in (%.1fs)",
             len(new_cards), elapsed,
         )
-        return {"ok": True, "cards": len(new_cards), "elapsed_s": round(elapsed, 1)}
+    except Exception as exc:
+        logger.exception("[PULSE] On-demand rerun failed: %s", exc)
+        _ondemand_rerun_last_result = {
+            "ok": False, "error": str(exc),
+            "elapsed_s": round(time.time() - t0, 1),
+            "finished_at": time.time(),
+        }
     finally:
         _ondemand_rerun_inflight = False
 
 
-async def _load_rogue_prematch(target_feed: _Optional[FeedManager] = None) -> None:
+@app.post("/admin/rerun")
+async def admin_rerun():
+    """On-demand candidate-engine rerun for demos. Fires-and-forgets so
+    the HTTP response returns immediately (rerun takes ~3 min; Railway's
+    edge cuts at 60s). Status of the most recent run is available at
+    GET /admin/rerun/status. Frontend clients listen on the existing
+    `/ws/feed` socket for `{type:"feed_refresh"}` to know when to re-pull.
+
+    Guarded against parallel invocations — second call while one is in
+    flight returns 409.
+
+    No auth on the endpoint today (POC). Cost: same ~$0.30-0.50 per run
+    as the scheduled loop.
+    """
+    global _ondemand_rerun_inflight, _ondemand_rerun_started_at
+    if PULSE_DATA_SOURCE != "rogue":
+        raise HTTPException(400, "rerun only valid when PULSE_DATA_SOURCE=rogue")
+    if _ondemand_rerun_inflight:
+        raise HTTPException(
+            409,
+            f"a rerun is already in flight (started {int(time.time() - _ondemand_rerun_started_at)}s ago)",
+        )
+    _ondemand_rerun_inflight = True
+    _ondemand_rerun_started_at = time.time()
+    import asyncio as _asyncio
+    _asyncio.create_task(_do_ondemand_rerun())
+    return {
+        "ok": True,
+        "status": "started",
+        "estimated_seconds": 180,
+        "poll": "/admin/rerun/status",
+        "ws_event": "feed_refresh",
+    }
+
+
+@app.get("/admin/rerun/status")
+async def admin_rerun_status():
+    return {
+        "in_flight": _ondemand_rerun_inflight,
+        "started_at": _ondemand_rerun_started_at if _ondemand_rerun_inflight else None,
+        "running_for_seconds": (
+            round(time.time() - _ondemand_rerun_started_at, 1)
+            if _ondemand_rerun_inflight else None
+        ),
+        "last_result": _ondemand_rerun_last_result or None,
+    }
+
+
+async def _load_rogue_prematch(
+    target_feed: _Optional[FeedManager] = None,
+    *,
+    is_rerun: bool = False,
+) -> None:
     """Build the Rogue-sourced pre-match feed.
 
     target_feed: which FeedManager to populate. Defaults to the live `feed`
     singleton (startup case). The scheduled rerun loop passes a fresh
     staging FeedManager and atomically swaps it into the live one once
     fully built — so rerunning never leaves the visible feed empty.
+
+    is_rerun: when True, expires all currently-published candidates BEFORE
+    re-running the engine. Without this, each rerun's freshly-generated
+    candidates stack on top of prior runs (publish loop reads ALL
+    status='published' rows, not just the latest cycle).
     """
     if target_feed is None:
         target_feed = feed
+    if is_rerun:
+        # Expire prior batch so the publish loop only sees this cycle's
+        # candidates. Historical rows kept as status=EXPIRED for admin
+        # visibility.
+        try:
+            n_expired = await candidate_store.expire_published_candidates()
+            logger.info("[PULSE] Rerun: expired %d prior published candidates", n_expired)
+        except Exception as exc:
+            logger.warning("[PULSE] Rerun: expire prior candidates failed: %s", exc)
     if not ROGUE_CONFIG_JWT:
         logger.warning(
             "[PULSE] PULSE_DATA_SOURCE=rogue but ROGUE_CONFIG_JWT is empty — falling back to mock."
@@ -411,7 +486,7 @@ async def _scheduled_rerun_loop():
         # the visible feed never goes empty.
         staging = FeedManager()
         try:
-            await _load_rogue_prematch(target_feed=staging)
+            await _load_rogue_prematch(target_feed=staging, is_rerun=True)
         except Exception as exc:
             logger.exception("[PULSE] Scheduled rerun failed (keeping prior feed): %s", exc)
             continue
