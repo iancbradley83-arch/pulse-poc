@@ -2,16 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
+# Build context = repo root (so we reference paths through `backend/`).
+COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Chromium + the OS libraries Playwright needs to drive it. We only
 # need chromium (not firefox/webkit) — saves ~250MB of image. `--with-deps`
-# installs apt packages too; it must run as root, before USER drop (we don't
-# drop user here, so this is fine).
+# installs apt packages too via apt-get; needs root (which we have here).
 RUN python -m playwright install --with-deps chromium
 
-COPY app/ app/
+COPY backend/app/ app/
 
 EXPOSE 8000
 
