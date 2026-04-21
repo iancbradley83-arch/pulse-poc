@@ -1,3 +1,11 @@
+[build]
+# Force nixpacks (not Railpack). We need the nixpacks.toml at the repo root
+# to run `playwright install chromium` during build and pull the apt libs
+# Chromium needs at runtime — Railpack auto-detects Python/FastAPI but has
+# no hook for the browser install step.
+builder = "NIXPACKS"
+nixpacksConfigPath = "nixpacks.toml"
+
 [deploy]
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
