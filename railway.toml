@@ -1,10 +1,11 @@
 [build]
-# Force nixpacks (not Railpack). We need the nixpacks.toml at the repo root
-# to run `playwright install chromium` during build and pull the apt libs
-# Chromium needs at runtime — Railpack auto-detects Python/FastAPI but has
-# no hook for the browser install step.
-builder = "NIXPACKS"
-nixpacksConfigPath = "nixpacks.toml"
+# Switched from nixpacks to Dockerfile after the nixpacks path lost `pip` on
+# the PATH (custom [phases.install] override skips nixpacks's auto-detected
+# Python venv setup). The Dockerfile is on python:3.11-slim — known-good
+# base — and runs `playwright install --with-deps chromium` to fetch both
+# the browser and the apt libs it needs.
+builder = "DOCKERFILE"
+dockerfilePath = "backend/Dockerfile"
 
 [deploy]
 restartPolicyType = "ON_FAILURE"
