@@ -1,36 +1,15 @@
 [phases.setup]
 nixPkgs = ["python311"]
-# OS libraries Chromium needs at runtime. nixpacks builds on a Debian base,
-# so apt-style packages work via aptPkgs. These mirror what
-# `playwright install --with-deps chromium` would install — listed
-# explicitly so we don't depend on the playwright CLI shelling out to
-# apt-get during build.
-aptPkgs = [
-  "libnss3",
-  "libnspr4",
-  "libatk1.0-0",
-  "libatk-bridge2.0-0",
-  "libcups2",
-  "libdbus-1-3",
-  "libdrm2",
-  "libxkbcommon0",
-  "libxcomposite1",
-  "libxdamage1",
-  "libxfixes3",
-  "libxrandr2",
-  "libgbm1",
-  "libpango-1.0-0",
-  "libcairo2",
-  "libasound2",
-  "libatspi2.0-0",
-]
 
 [phases.install]
+# pip install the app deps (including playwright), then let the playwright
+# CLI install Chromium and all the apt libs it needs for the current distro.
+# `--with-deps` invokes apt-get internally with the correct package names
+# (Ubuntu Noble's `libasound2t64` vs Jammy's `libasound2`, etc.) so we don't
+# hand-maintain that list here.
 cmds = [
   "cd backend && pip install -r requirements.txt",
-  # Download the chromium browser binary into the default cache. We skip
-  # --with-deps because the OS libs are already pinned via aptPkgs above.
-  "cd backend && python -m playwright install chromium",
+  "cd backend && python -m playwright install --with-deps chromium",
 ]
 
 [start]
