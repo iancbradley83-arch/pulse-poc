@@ -277,21 +277,26 @@ async def _load_rogue_prematch():
         # /v1/featured/betbuilder picks). Each is priced via calculate_bets
         # and rendered as a self-contained Card — bypasses candidate_store
         # and MarketCatalog because the operator picks markets we don't
-        # whitelist (Goalscorer, Corners O/U etc.).
+        # whitelist (Goalscorer, Corners O/U etc.). Wrapped in a try so any
+        # failure (schema drift, transient 5xx) can't take down the whole
+        # startup: the rest of the feed is already populated.
         if os.getenv("PULSE_FEATURED_BB_ENABLED", "true").lower() == "true":
             try:
                 featured_max = int(os.getenv("PULSE_FEATURED_BB_MAX", "6"))
             except ValueError:
                 featured_max = 6
-            featured_cards = await fetch_and_build_featured_bb_cards(
-                client, simulator._games, max_count=featured_max,
-            )
-            for c in featured_cards:
-                feed.add_prematch_card(c)
-            logger.info(
-                "[PULSE] Featured BBs added to feed: %d (out of %d max)",
-                len(featured_cards), featured_max,
-            )
+            try:
+                featured_cards = await fetch_and_build_featured_bb_cards(
+                    client, simulator._games, max_count=featured_max,
+                )
+                for c in featured_cards:
+                    feed.add_prematch_card(c)
+                logger.info(
+                    "[PULSE] Featured BBs added to feed: %d (out of %d max)",
+                    len(featured_cards), featured_max,
+                )
+            except Exception as exc:
+                logger.exception("[PULSE] Featured BB step failed: %s", exc)
     finally:
         await client.close()
 
