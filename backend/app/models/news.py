@@ -100,12 +100,18 @@ class CandidateCard(BaseModel):
     supporting_stats_json: str = ""      # Stage 4 fills this (JSON-encoded list[StatDisplay])
 
     # Multi-leg pricing — populated by ComboBuilder when we successfully fetch a
-    # real correlated BB price (or operator-boosted combo price) from the
-    # Kmianko bet-slip endpoint. None means "compute naively downstream".
+    # real correlated BB price (or operator-boosted combo price). None means
+    # "compute naively downstream".
     total_odds: Optional[float] = None
     # Where `total_odds` came from. One of:
-    #   "kmianko_bb"   — real correlated BB price (POST betslip with isBetBuilderBet)
-    #   "kmianko_combo"— naive product × operator combo bonus
-    #   "naive"        — pure product, no bonus / no real quote
-    #   None           — total_odds not set
+    #   "rogue_calculate_bets" — real correlated/boosted price via Rogue API
+    #   "naive"                — pure product, no bonus / no real quote
+    #   None                   — total_odds not set
+    # Legacy: "kmianko_bb" / "kmianko_combo" from the deprecated bet-slip
+    # path. Read paths still tolerate them for back-compat.
     price_source: Optional[str] = None
+    # Rogue VirtualSelection id (returned by /v1/sportsdata/betbuilder/match)
+    # used for re-pricing the BB via /v1/betting/calculateBets. Persisted so
+    # the SSEPricingManager can re-quote on leg ticks without rebuilding the
+    # piped id from leg ids each time.
+    virtual_selection: Optional[str] = None

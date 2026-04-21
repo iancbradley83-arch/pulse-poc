@@ -361,6 +361,7 @@ class ComboBuilder:
             selection_ids=selection_ids,
             narrative=narrative,
             status=CandidateStatus.DRAFT,
+            virtual_selection=virtual_selection,
             total_odds=total_odds,
             price_source=price_source,
         )
