@@ -319,6 +319,29 @@ class RogueClient:
             {"selectionIDs": ",".join(selection_ids)},
         )
 
+    async def featured_betbuilders(self, *, locale: str = "en") -> Any:
+        """Operator-curated featured Bet Builders.
+
+        Endpoint: GET /v1/featured/betbuilder (per OpenAPI). Returns BBs the
+        operator has hand-picked + pre-priced (correlated odds already done
+        on their side). Useful for surfacing 'Recommended BBs' on Pulse
+        without us building/pricing our own.
+
+        Returns the raw API response. Shape unknown until probed — we'll
+        document fields once we see real data.
+        """
+        return await self._request(
+            "/v1/featured/betbuilder",
+            {"locale": locale},
+        )
+
+    async def featured_boosted_selections(self, *, locale: str = "en") -> Any:
+        """Operator-boosted singles (price boosts, multilanguage variant)."""
+        return await self._request(
+            "/v1/featured/multilanguage/boostedSelections",
+            {"locale": locale},
+        )
+
     async def calculate_bets(
         self,
         selection_ids: list[str],

@@ -155,6 +155,51 @@ async def debug_calc_bets(ids: str, oddsStyle: str = "decimal", locale: str = "e
         await client.close()
 
 
+# ── Debug: probe featured BBs ───────────────────────────────────────────
+# Inspect the /v1/featured/betbuilder response shape so we can design the
+# integration. Same gating as /debug/calc_bets.
+@app.get("/debug/featured_bb")
+async def debug_featured_bb(locale: str = "en"):
+    if os.getenv("PULSE_DEBUG_CALC_BETS", "true").lower() != "true":
+        raise HTTPException(403, "PULSE_DEBUG_CALC_BETS=false")
+    if not ROGUE_CONFIG_JWT:
+        raise HTTPException(503, "ROGUE_CONFIG_JWT not set")
+    client = RogueClient(
+        base_url=ROGUE_BASE_URL, config_jwt=ROGUE_CONFIG_JWT,
+        per_second=ROGUE_RATE_LIMIT_PER_SECOND,
+    )
+    try:
+        result = await client.featured_betbuilders(locale=locale)
+        return JSONResponse({"locale": locale, "result": result})
+    except Exception as exc:
+        return JSONResponse(
+            {"error": str(exc), "type": type(exc).__name__}, status_code=500,
+        )
+    finally:
+        await client.close()
+
+
+@app.get("/debug/boosted")
+async def debug_boosted(locale: str = "en"):
+    if os.getenv("PULSE_DEBUG_CALC_BETS", "true").lower() != "true":
+        raise HTTPException(403, "PULSE_DEBUG_CALC_BETS=false")
+    if not ROGUE_CONFIG_JWT:
+        raise HTTPException(503, "ROGUE_CONFIG_JWT not set")
+    client = RogueClient(
+        base_url=ROGUE_BASE_URL, config_jwt=ROGUE_CONFIG_JWT,
+        per_second=ROGUE_RATE_LIMIT_PER_SECOND,
+    )
+    try:
+        result = await client.featured_boosted_selections(locale=locale)
+        return JSONResponse({"locale": locale, "result": result})
+    except Exception as exc:
+        return JSONResponse(
+            {"error": str(exc), "type": type(exc).__name__}, status_code=500,
+        )
+    finally:
+        await client.close()
+
+
 # ── WebSocket ──
 @app.websocket("/ws/feed")
 async def websocket_endpoint(websocket: WebSocket):
