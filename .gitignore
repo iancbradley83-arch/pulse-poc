@@ -1,11 +1,25 @@
 venv/
 __pycache__/
 *.pyc
+*.egg-info/
+
+# Env + secrets — never commit
 .env
+.env.local
+.env.production
+# Keep .env.example trackable if/when we add one
+!.env.example
+*.pem
+*.key
+*.p12
+*.crt
+credentials.json
+
 .DS_Store
 node_modules/
-.env
 twitter-bot/.env
 .claude/
+
+# Local SQLite (pulse.db + WAL/SHM sidecars)
 backend/app/data/pulse.db
 backend/app/data/pulse.db-*
