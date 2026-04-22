@@ -231,9 +231,24 @@ class NewsIngester:
 
         # Persist the raw payload in the cache as list[dict] (pre-NewsItem);
         # saving the resolved NewsItem fields lets us round-trip on cache hit.
-        cache_payload = [item.model_dump() for item in news_items]
-        await self._store.save_cached_ingest(fixture_id, cache_key, cache_payload)
-        await self._store.save_news_items(news_items)
+        #
+        # IMPORTANT: do NOT cache empty results. The LLM call returning 0
+        # items is almost always a transient failure (credit balance, rate
+        # limit, network) — not a real "this fixture has no news" verdict.
+        # Caching `[]` poisons subsequent runs in the cache TTL window: every
+        # rerun reads the empty cache + skips the LLM, so the feed stays
+        # broken for 6 hours after a single failure burst. (Hit this on
+        # 2026-04-22 PM after the credit-wall outage.)
+        if news_items:
+            cache_payload = [item.model_dump() for item in news_items]
+            await self._store.save_cached_ingest(fixture_id, cache_key, cache_payload)
+            await self._store.save_news_items(news_items)
+        else:
+            logger.info(
+                "News ingest: %s -> 0 items, skipping cache write so the next "
+                "run can retry the LLM (likely transient failure)",
+                fixture_id,
+            )
 
         logger.info(
             "News ingest: %s (%s vs %s) -> %d items",
