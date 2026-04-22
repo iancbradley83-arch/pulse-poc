@@ -1,7 +1,12 @@
 """Combo / Bet Builder engine — turns a single news item into a multi-leg pick.
 
-Stage 3a scope: same-event Bet Builders on main markets only (FT 1X2, Total
-Goals O/U, BTTS, Double Chance). Player props arrive in Stage 3b.
+Same-event Bet Builders on:
+  - Main markets: FT 1X2, Total Goals O/U, BTTS, Double Chance, Draw No Bet.
+  - Half markets: 1st Half 1X2.
+  - Side markets: Corners FT O/U, Cards FT O/U.
+
+Each theme picks 2-3 legs that hang together narratively. We keep BBs short
+(≤3 legs) — Rogue rejects more correlations as the leg count climbs.
 
 Pipeline:
 
@@ -49,31 +54,42 @@ ThemeLeg = tuple[str, str]
 # Default themes per hook. Kept conservative — two-leg BBs are less likely to
 # be rejected by the book than 3-leg ones, and the voice rewriter can carry
 # a lot of the storytelling load.
+#
+# After the market-coverage expansion, themes can pull from corners / cards /
+# 1st-half / DNB markets too. Theme picker takes the FIRST 3 legs that
+# successfully resolve (catalog has the market AND we can find the right
+# selection); legs beyond that are dropped. So order matters — put the most
+# narratively-aligned legs first.
 HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
     # Injury to anyone on the affected side tends to dull the game. Back the
-    # opponent to win and goals to dry up.
+    # opponent (DNB is safer than 1X2 and strictly dominates it; don't stack
+    # both), expect goals to dry up, fewer corners.
     HookType.INJURY: [
-        ("match_result", "opponent"),
-        ("over_under",   "under"),
-        ("btts",         "btts_no"),
+        ("draw_no_bet", "opponent"),
+        ("over_under",  "under"),
+        ("corners_ou",  "under"),
+        ("btts",        "btts_no"),
     ],
     # Team news (return from suspension, fit XI, etc.) — lean into the
     # affected side attacking better.
     HookType.TEAM_NEWS: [
         ("match_result", "affected"),
         ("over_under",   "over"),
+        ("corners_ou",   "over"),
         ("btts",         "btts_yes"),
     ],
     # Managerial quotes about "must-win" / "vital" tend to energise the
-    # affected side. Back them and expect goals.
+    # affected side. Lean to early intent (1st-half lead) + back them to win.
     HookType.MANAGER_QUOTE: [
-        ("match_result", "affected"),
-        ("over_under",   "over"),
+        ("first_half_result", "affected"),
+        ("match_result",      "affected"),
+        ("over_under",        "over"),
     ],
-    # Tactical stories (aggressive press, new formation) — expect goals
-    # either way, lean to the affected side winning.
+    # Tactical stories (aggressive press, new formation, high block) — expect
+    # set pieces and bookings, plus goals either way.
     HookType.TACTICAL: [
-        ("match_result", "affected"),
+        ("corners_ou",   "over"),
+        ("cards_ou",     "over"),
         ("over_under",   "over"),
         ("btts",         "btts_yes"),
     ],
@@ -83,8 +99,17 @@ HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
         ("match_result", "affected"),
         ("over_under",   "over"),
     ],
-    # Transfer / article / other -> no BB; the single-bet path handles these.
+    # Transfer — usually a new attacker. Back the affected side + goals.
+    HookType.TRANSFER: [
+        ("match_result", "affected"),
+        ("over_under",   "over"),
+    ],
+    # Article / other -> no BB; the single-bet path handles these.
 }
+
+# Cap how many legs end up in any one BB. More legs => Rogue rejects more
+# combos as uncorrelated. 3 is the sweet spot from prior PRs.
+MAX_BB_LEGS = 3
 
 
 def _affected_side(
@@ -248,13 +273,21 @@ class ComboBuilder:
             return None
 
         legs: list[tuple[Market, MarketSelection]] = []
+        seen_market_types: set[str] = set()
         for market_type, outcome_key in theme:
+            if len(legs) >= MAX_BB_LEGS:
+                break
+            # One leg per market_type — themes list multiple alternates so
+            # we can fall through if the catalog is missing the preferred one;
+            # we don't want both an over_under and a corners_ou + cards_ou
+            # ballooning the BB to 4 legs in some unlucky case.
+            if market_type in seen_market_types:
+                continue
             picked = _pick_leg_selection(self._catalog, game, market_type, outcome_key, affected)
             if picked is None:
-                # Missing market or selection — skip this leg but keep going;
-                # we accept 2-leg BBs if only one failed, else bail.
                 continue
             legs.append(picked)
+            seen_market_types.add(market_type)
 
         if len(legs) < 2:
             logger.debug("ComboBuilder: only %d valid legs for news %s", len(legs), news.id)

@@ -6,11 +6,14 @@ Scope (Stage 1):
   - International top leagues only (EPL, La Liga, Bundesliga, Serie A, Ligue 1,
     UCL, Europa) — identified by league-name match since Rogue's LeagueIds are
     per-operator.
-  - Deep-scan each fixture with `includeMarkets=default` to get main markets.
+  - Deep-scan each fixture with `includeMarkets=all` so we can surface richer
+    market types (corners, cards, anytime scorer, half-time, AH, DNB) on top of
+    the original FT 1X2 / O/U / BTTS / Double Chance set.
   - Map to internal Game + Market objects.
 
-Kept narrow on purpose — additional market coverage, bet-builder flags, and
-context enrichment land in later stages.
+Whitelist by exact market Name (case-insensitive) — Rogue returns ~250 markets
+per fixture, most of which are noise (alt lines, cast markets, odd specials).
+Only a curated set is surfaced as `Market` objects.
 """
 from __future__ import annotations
 
@@ -168,53 +171,96 @@ def _display_odds(selection: dict[str, Any]) -> str:
 # Rogue has many variants (`1st Half 1X2`, `FT 1X2 - Super Odds`,
 # `First To Score 1X2`, `Total Corners O/U`, etc.) that we do NOT want to
 # surface as the primary pre-match market. Only the full-time standard
-# market of each type is accepted.
-MATCH_RESULT_NAMES = {
-    "ft 1x2",
-    "ft match result",
-    "match result",
-    "full time result",
-}
-
-TOTAL_GOALS_NAMES = {
-    "total goals o/u",
-    "ft total goals",
-    "total goals",
-    "total goals over/under",
-}
-
-BTTS_NAMES = {
-    "both teams to score",
-    "btts",
-}
-
-DOUBLE_CHANCE_NAMES = {
-    "double chance",
-    "ft double chance",
+# market of each type is accepted, plus the richer half-time / corners /
+# cards / scorer / AH / DNB set added in the market-coverage expansion.
+#
+# A market name in `ALL_MARKET_NAME_MAP` keys is normalised (strip + lower)
+# and looked up directly. Use a tuple value when multiple Rogue spellings
+# should map to the same internal type; the dict is exhaustive so the
+# default branch returns "other".
+_NAME_TO_TYPE: dict[str, str] = {
+    # Match result (FT 1X2)
+    "ft 1x2": "match_result",
+    "ft match result": "match_result",
+    "match result": "match_result",
+    "full time result": "match_result",
+    # Full-time goals O/U
+    "total goals o/u": "over_under",
+    "ft total goals": "over_under",
+    "total goals": "over_under",
+    "total goals over/under": "over_under",
+    "ft o/u": "over_under",
+    # BTTS
+    "both teams to score": "btts",
+    "btts": "btts",
+    # Double Chance
+    "double chance": "double_chance",
+    "ft double chance": "double_chance",
+    # ── New (market-coverage expansion) ────────────────────────────────
+    # Corners
+    "corners ft o/u": "corners_ou",
+    "corners ft 1x2": "corners_3way",
+    # Cards
+    "cards ft o/u": "cards_ou",
+    "total cards over/under": "cards_ou",
+    "cards ft 1x2": "cards_3way",
+    # First half
+    "1st half 1x2": "first_half_result",
+    "1st half total goals o/u": "first_half_goals_ou",
+    # Asian Handicap (FT) — main line
+    "ft asian handicap": "asian_handicap",
+    # Draw No Bet
+    "draw no bet": "draw_no_bet",
+    # Anytime scorer
+    "goalscorer": "goalscorer",
 }
 
 
 def _classify_market(name: str, raw_type: str) -> str:
     key = (name or "").strip().lower()
-    if key in MATCH_RESULT_NAMES:
-        return "match_result"
-    if key in TOTAL_GOALS_NAMES:
-        return "over_under"
-    if key in BTTS_NAMES:
-        return "btts"
-    if key in DOUBLE_CHANCE_NAMES:
-        return "double_chance"
-    return "other"
+    return _NAME_TO_TYPE.get(key, "other")
 
 
-# Markets we surface on pre-match cards for Stage 1. Asian Handicap /
-# correct score / player props require richer card shapes — deferred.
+# Markets we surface on pre-match cards. Correct score / scorecast / player
+# 2+ goals require richer card shapes — deferred.
 ALLOWED_MARKET_TYPES = {
     "match_result",
     "over_under",
     "btts",
     "double_chance",
+    "corners_ou",
+    "corners_3way",
+    "cards_ou",
+    "cards_3way",
+    "first_half_result",
+    "first_half_goals_ou",
+    "asian_handicap",
+    "draw_no_bet",
+    "goalscorer",
 }
+
+# Market types that share the "Over / Under at a single Points line" shape
+# and should be collapsed to one main line. Adding a new totals-style market
+# type? Add it here too so `_pick_main_ou_line` runs on it.
+_OU_STYLE_TYPES = {
+    "over_under",
+    "corners_ou",
+    "cards_ou",
+    "first_half_goals_ou",
+}
+
+# Market types that share the home/draw/away (or home/away) shape. Sort key
+# uses _MATCH_RESULT_ORDER for these.
+_3WAY_STYLE_TYPES = {
+    "match_result",
+    "first_half_result",
+    "corners_3way",
+    "cards_3way",
+}
+
+# Goalscorer markets carry 100+ player selections. Cap to the top-N
+# favorites (lowest decimal odds) so cards stay readable.
+GOALSCORER_TOP_N = 6
 
 
 def _selection_name(sel: dict[str, Any]) -> str:
@@ -234,38 +280,62 @@ _OU_ORDER = {"over": 0, "under": 1}
 
 
 def _sort_selections(raw: list[dict[str, Any]], market_type: str) -> list[dict[str, Any]]:
-    def key(sel: dict[str, Any]) -> int:
+    def key(sel: dict[str, Any]) -> tuple[Any, ...]:
         side = (sel.get("OutcomeType") or "").strip().lower()
         name = _selection_name(sel).lower()
-        if market_type == "match_result":
+        if market_type in _3WAY_STYLE_TYPES:
             # Try OutcomeType first, then fall back to selection name
             # (Rogue's draw selection has Name="X" but no consistent OutcomeType).
             if side in _MATCH_RESULT_ORDER:
-                return _MATCH_RESULT_ORDER[side]
+                return (_MATCH_RESULT_ORDER[side],)
             if name in _MATCH_RESULT_ORDER:
-                return _MATCH_RESULT_ORDER[name]
-            return 99
+                return (_MATCH_RESULT_ORDER[name],)
+            return (99,)
         if market_type == "btts":
-            return _BTTS_ORDER.get(name, 99)
-        if market_type == "over_under":
-            return _OU_ORDER.get(side, 99)
-        return 99
+            return (_BTTS_ORDER.get(name, 99),)
+        if market_type in _OU_STYLE_TYPES:
+            return (_OU_ORDER.get(side, 99),)
+        if market_type == "asian_handicap":
+            # Home then Away within a single line.
+            return (_MATCH_RESULT_ORDER.get(side, 99),)
+        if market_type == "draw_no_bet":
+            return (_MATCH_RESULT_ORDER.get(side, 99),)
+        if market_type == "goalscorer":
+            # Favourite first.
+            try:
+                return (float(sel.get("TrueOdds") or 99),)
+            except (TypeError, ValueError):
+                return (99,)
+        return (99,)
     return sorted(raw, key=key)
 
 
 def _selections(market: dict[str, Any], market_type: str) -> list[MarketSelection]:
     raw = _active_selections(market)
-    if market_type == "over_under":
-        raw = _pick_main_total_line(raw)
+    if market_type in _OU_STYLE_TYPES:
+        raw = _pick_main_ou_line(raw)
+    elif market_type == "asian_handicap":
+        raw = _pick_main_ah_line(raw)
+    elif market_type == "goalscorer":
+        # Cap to top-N favourites by ascending odds. Sort first then slice
+        # so the slice is stable across runs.
+        raw = sorted(
+            raw,
+            key=lambda s: float(s.get("TrueOdds") or 9999),
+        )[:GOALSCORER_TOP_N]
     raw = _sort_selections(raw, market_type)
     out: list[MarketSelection] = []
     for sel in raw:
         label = _selection_name(sel)
         if not label:
             continue
-        # For totals, make the label explicit ("Over 2.5" / "Under 2.5").
-        if market_type == "over_under" and sel.get("Points") is not None:
+        # For OU-style, suffix the points so the label is explicit
+        # ("Over 2.5", "Over 9" for corners, "Over 4" for cards).
+        if market_type in _OU_STYLE_TYPES and sel.get("Points") is not None:
             label = f"{label} {sel['Points']}"
+        # For Asian Handicap, suffix the handicap value ("Atletico Madrid -0.5").
+        if market_type == "asian_handicap" and sel.get("Points") is not None:
+            label = f"{label} {sel['Points']:+g}"
         out.append(MarketSelection(
             label=label,
             odds=_display_odds(sel),
@@ -275,12 +345,13 @@ def _selections(market: dict[str, Any], market_type: str) -> list[MarketSelectio
     return out
 
 
-def _pick_main_total_line(selections: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse a multi-line Total Goals O/U market to a single line pair.
+def _pick_main_ou_line(selections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse a multi-line Over/Under market to a single line pair.
 
+    Works for any totals-shaped market — goals, corners, cards, half goals.
     Strategy: pick the (Over, Under) pair whose odds are closest to a true
     coin flip (difference between decimal odds minimised). That's almost
-    always the 2.5-ish line for soccer.
+    always the main line the operator is balancing.
     """
     by_points: dict[Any, dict[str, dict[str, Any]]] = {}
     for sel in selections:
@@ -306,6 +377,47 @@ def _pick_main_total_line(selections: list[dict[str, Any]]) -> list[dict[str, An
         if gap < best_gap:
             best_gap = gap
             best = [pair["over"], pair["under"]]
+    return best or selections[:2]
+
+
+def _pick_main_ah_line(selections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse a multi-line Asian Handicap market to one (Home, Away) pair.
+
+    Strategy: pick the line whose absolute Points value is smallest (closest
+    to a pick-em). On ties prefer the line with home/away odds closest to
+    each other. Returns the (home, away) pair sorted by VenueRole.
+    """
+    by_abs_points: dict[float, dict[str, dict[str, Any]]] = {}
+    for sel in selections:
+        points = sel.get("Points")
+        if points is None:
+            continue
+        side = (sel.get("OutcomeType") or "").strip().lower()
+        if side not in ("home", "away"):
+            continue
+        try:
+            abs_pt = abs(float(points))
+        except (TypeError, ValueError):
+            continue
+        by_abs_points.setdefault(abs_pt, {})[side] = sel
+
+    best: list[dict[str, Any]] | None = None
+    best_gap = float("inf")
+    for abs_pt in sorted(by_abs_points.keys()):
+        pair = by_abs_points[abs_pt]
+        if "home" not in pair or "away" not in pair:
+            continue
+        try:
+            h = float(pair["home"].get("TrueOdds") or 0)
+            a = float(pair["away"].get("TrueOdds") or 0)
+        except Exception:
+            continue
+        # Prefer the line whose two prices are closest. Within that, smaller
+        # abs(handicap) wins (sorted iteration above keeps that monotone).
+        gap = abs(h - a)
+        if gap < best_gap:
+            best_gap = gap
+            best = [pair["home"], pair["away"]]
     return best or selections[:2]
 
 
@@ -441,7 +553,7 @@ async def fetch_soccer_snapshot(
         if not eid:
             continue
         try:
-            full = await client.get_event(str(eid), include_markets="default", locale="en")
+            full = await client.get_event(str(eid), include_markets="all", locale="en")
         except Exception as exc:
             logger.warning("Rogue: deep scan failed for %s: %s", eid, exc)
             continue
