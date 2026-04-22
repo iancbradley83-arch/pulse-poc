@@ -10,7 +10,6 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 
 # Configure logging BEFORE any module-level loggers are created. Without this,
 # our `logger.info(...)` calls go nowhere on Railway — only WARNING+ slips
@@ -119,13 +118,21 @@ app.add_middleware(
 )
 
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+class SecurityHeadersMiddleware:
     """Apply standard web-security response headers.
 
     HSTS, X-Content-Type-Options, X-Frame-Options, Referrer-Policy,
     Permissions-Policy, and a CSP tuned for this app (inline styles/scripts
     in index.html, same-origin SSE/fetch). CSP is set to report-only when
     PULSE_CSP_REPORT_ONLY=true so we can iterate without breaking the UI.
+
+    Implemented as a *pure ASGI* middleware (not BaseHTTPMiddleware). The
+    original BaseHTTPMiddleware version added a ~1s baseline latency to
+    every request in production: BaseHTTPMiddleware bridges ASGI through
+    anyio memory streams and a separate task, which on a busy event loop
+    (the SSE pricing manager fires constantly) starves the response. Pure
+    ASGI middleware just mutates the outgoing message in place — no extra
+    task, no streams.
     """
 
     _CSP = (
@@ -139,19 +146,46 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         "object-src 'none'"
     )
 
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-        response.headers.setdefault(
-            "Permissions-Policy",
-            "geolocation=(), microphone=(), camera=(), interest-cohort=()",
+    def __init__(self, app):
+        self.app = app
+        # Resolve the CSP header name once at startup. The env var was
+        # checked per-request in the old middleware; it's a process-level
+        # config flag, so reading it once is fine and saves the lookup.
+        report_only = os.environ.get("PULSE_CSP_REPORT_ONLY", "false").lower() == "true"
+        self._csp_header_name = (
+            b"content-security-policy-report-only" if report_only else b"content-security-policy"
         )
-        csp_header = "Content-Security-Policy-Report-Only" if os.environ.get("PULSE_CSP_REPORT_ONLY", "false").lower() == "true" else "Content-Security-Policy"
-        response.headers.setdefault(csp_header, self._CSP)
-        return response
+        # Pre-encode the header tuples once. ASGI wants (bytes, bytes).
+        self._extra_headers: list[tuple[bytes, bytes]] = [
+            (b"strict-transport-security", b"max-age=31536000; includeSubDomains"),
+            (b"x-content-type-options", b"nosniff"),
+            (b"x-frame-options", b"DENY"),
+            (b"referrer-policy", b"strict-origin-when-cross-origin"),
+            (b"permissions-policy", b"geolocation=(), microphone=(), camera=(), interest-cohort=()"),
+            (self._csp_header_name, self._CSP.encode("latin-1")),
+        ]
+
+    async def __call__(self, scope, receive, send):
+        # Only touch HTTP responses. WebSocket / lifespan pass through.
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        extra = self._extra_headers
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                # Build a set of existing header names (lowercased) so we
+                # mirror BaseHTTPMiddleware's `setdefault` semantics — don't
+                # clobber a value the route already set.
+                existing = {name for name, _ in headers}
+                for name, value in extra:
+                    if name not in existing:
+                        headers.append((name, value))
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
 app.add_middleware(SecurityHeadersMiddleware)
@@ -185,6 +219,14 @@ async def serve_index():
         _INDEX_HTML,
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
+
+
+# Liveness probe. Intentionally trivial — no I/O, no DB, no external calls —
+# so it stays in single-digit ms even when the SSE pricing loop is busy.
+# Use this for Railway healthchecks and uptime monitors.
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
 
 # ── Debug: live calculate_bets probe ────────────────────────────────────
