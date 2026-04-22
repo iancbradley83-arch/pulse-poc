@@ -258,9 +258,10 @@ _3WAY_STYLE_TYPES = {
     "cards_3way",
 }
 
-# Goalscorer markets carry 100+ player selections. Cap to the top-N
-# favorites (lowest decimal odds) so cards stay readable.
-GOALSCORER_TOP_N = 6
+# Goalscorer markets carry 100+ player selections. We keep all of them in
+# the catalogue (sorted favourite-first) so the engine can match a player
+# named in news.mentions; the candidate builder trims down before publish.
+GOALSCORER_DEFAULT_TOP_N = 6
 
 
 def _selection_name(sel: dict[str, Any]) -> str:
@@ -317,12 +318,16 @@ def _selections(market: dict[str, Any], market_type: str) -> list[MarketSelectio
     elif market_type == "asian_handicap":
         raw = _pick_main_ah_line(raw)
     elif market_type == "goalscorer":
-        # Cap to top-N favourites by ascending odds. Sort first then slice
-        # so the slice is stable across runs.
+        # Sort all players by ascending odds (favourite first). We KEEP the
+        # full list so candidate_builder can match a specific player from
+        # news.mentions (e.g. "Saka returns" → find the Saka selection
+        # even though he's not in the top-6 favourites). The card never
+        # publishes the whole list — candidate_builder trims to a single
+        # matched player, or to the top-N favourites as a fallback.
         raw = sorted(
             raw,
             key=lambda s: float(s.get("TrueOdds") or 9999),
-        )[:GOALSCORER_TOP_N]
+        )
     raw = _sort_selections(raw, market_type)
     out: list[MarketSelection] = []
     for sel in raw:
