@@ -299,21 +299,49 @@ class ComboBuilder:
 
         # Validate via Rogue BB endpoint. Mock mode (no Rogue client) skips
         # validation and just trusts the combo — fine for local dev.
+        #
+        # If a 3-leg combo is rejected ("uncorrelated"), retry with the first
+        # 2 legs before giving up. The market-coverage expansion increased
+        # rejection rate because (e.g.) corners-over + goals-over + match-
+        # winner-affected sometimes flags as conflicting; the underlying
+        # 2-leg variant almost always passes.
         total_odds: Optional[float] = None
         price_source: Optional[str] = None
         virtual_selection: Optional[str] = None
         if self._rogue is not None:
-            try:
-                resp = await self._rogue.betbuilder_match(selection_ids)
-            except RogueApiError as exc:
-                logger.info("ComboBuilder: Rogue rejected combo %s (%s)", selection_ids, exc)
-                return None
-            except Exception as exc:
-                logger.warning("ComboBuilder: Rogue BB call errored: %s", exc)
-                return None
-            valid, odds, reason, virtual_selection = _parse_bb_validation(resp)
+            valid = False
+            reason = ""
+            odds = None
+            attempts: list[list[str]] = [selection_ids]
+            if len(selection_ids) >= 3:
+                attempts.append(selection_ids[:2])
+            for idx, attempt in enumerate(attempts):
+                try:
+                    resp = await self._rogue.betbuilder_match(attempt)
+                except RogueApiError as exc:
+                    logger.info("ComboBuilder: Rogue rejected combo %s (%s)", attempt, exc)
+                    return None
+                except Exception as exc:
+                    logger.warning("ComboBuilder: Rogue BB call errored: %s", exc)
+                    return None
+                valid, odds, reason, virtual_selection = _parse_bb_validation(resp)
+                if valid:
+                    if idx > 0:
+                        # Trim legs/selection_ids to match the accepted set
+                        # so downstream pricing + persistence match the BB
+                        # the book actually validated.
+                        legs = legs[: len(attempt)]
+                        selection_ids = attempt
+                        logger.info(
+                            "ComboBuilder: 3-leg rejected, fell back to 2-leg (news=%s)",
+                            news.id,
+                        )
+                    break
+                logger.info(
+                    "ComboBuilder: combo invalid — %s (selection_ids=%s)",
+                    reason or "no reason", attempt,
+                )
             if not valid:
-                logger.info("ComboBuilder: combo invalid — %s (selection_ids=%s)", reason or "no reason", selection_ids)
                 return None
             # Rogue itself returns no correlated odds. If we have a Kmianko
             # client and a VirtualSelection id, use those to get the *real*
