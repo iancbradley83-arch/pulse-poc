@@ -36,16 +36,33 @@ logger = logging.getLogger(__name__)
 
 # Which internal market_type values each hook prefers, in priority order.
 # First match wins. Unlisted hooks fall back to HOOK_DEFAULT_MARKETS.
+#
+# After the market-coverage expansion, hooks can now route to richer markets:
+#   - INJURY            → goalscorer (striker out → who scores instead?),
+#                         over/under (goal-impact), then DNB / FT 1X2.
+#   - TEAM_NEWS         → goalscorer (key player back) → over/under → 1X2.
+#   - TACTICAL          → corners O/U + cards O/U (chaos signals), totals,
+#                         then 1X2.
+#   - MANAGER_QUOTE     → 1st-half 1X2 (intent for early pressure) + 1X2.
+#   - PREVIEW / ARTICLE → totals + 1X2 (safest defaults).
+#   - TRANSFER          → 1X2 + goalscorer (new signing).
 HOOK_MARKET_PRIORITY: dict[HookType, list[str]] = {
-    HookType.INJURY: ["match_result", "over_under", "btts"],
-    HookType.TEAM_NEWS: ["match_result", "over_under"],
-    HookType.TACTICAL: ["over_under", "btts", "match_result"],
-    HookType.TRANSFER: ["match_result"],
-    HookType.MANAGER_QUOTE: ["match_result"],
-    HookType.PREVIEW: ["match_result"],
-    HookType.ARTICLE: ["match_result"],
+    # Injury → totals lean (less goals), DNB safer than 1X2. Goalscorer is
+    # last because we don't yet match the leg's player to news.mentions —
+    # surfacing "Anytime Scorer · Haaland" on a Burnley-keeper-out story
+    # would be a non-sequitur. Player-aware routing is a follow-up PR.
+    HookType.INJURY: ["over_under", "draw_no_bet", "match_result", "btts", "goalscorer"],
+    HookType.TEAM_NEWS: ["over_under", "match_result", "goalscorer", "btts"],
+    # Tactical = chaos signal: corners + cards first, then totals.
+    HookType.TACTICAL: ["corners_ou", "cards_ou", "over_under", "btts", "match_result"],
+    # Transfer = usually a new attacker, goalscorer angle is natural.
+    HookType.TRANSFER: ["goalscorer", "match_result", "over_under"],
+    # Manager quote = intent + early pressure. 1st half result fits.
+    HookType.MANAGER_QUOTE: ["first_half_result", "match_result", "over_under"],
+    HookType.PREVIEW: ["over_under", "match_result", "double_chance"],
+    HookType.ARTICLE: ["match_result", "over_under"],
 }
-HOOK_DEFAULT_MARKETS = ["match_result"]
+HOOK_DEFAULT_MARKETS = ["match_result", "over_under"]
 
 
 class CandidateBuilder:
