@@ -6,10 +6,11 @@ import os
 import time
 import uuid
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # Configure logging BEFORE any module-level loggers are created. Without this,
 # our `logger.info(...)` calls go nowhere on Railway — only WARNING+ slips
@@ -83,15 +84,77 @@ simulator = GameSimulator(
 )
 
 # ── Create app ──
-app = FastAPI(title="PULSE POC", version="0.1.0")
+# Production hardening: Railway sets RAILWAY_ENVIRONMENT automatically.
+# In prod: disable OpenAPI docs (attackers love a full API surface),
+# require an explicit CORS allowlist, and apply security headers to every
+# response. Dev stays permissive so local work isn't disrupted.
+_IS_PROD = bool(os.environ.get("RAILWAY_ENVIRONMENT"))
+_EXPOSE_DOCS = (not _IS_PROD) or os.environ.get("PULSE_EXPOSE_DOCS", "false").lower() == "true"
+
+app = FastAPI(
+    title="PULSE POC",
+    version="0.1.0",
+    docs_url="/docs" if _EXPOSE_DOCS else None,
+    redoc_url="/redoc" if _EXPOSE_DOCS else None,
+    openapi_url="/openapi.json" if _EXPOSE_DOCS else None,
+)
+
+# CORS: explicit allowlist in prod via PULSE_CORS_ALLOWED_ORIGINS (comma-separated).
+# No allowlist in prod → deny cross-origin. Same-origin requests (app serving its
+# own UI) don't need CORS headers, so the UI keeps working.
+_cors_env = os.environ.get("PULSE_CORS_ALLOWED_ORIGINS", "").strip()
+if _IS_PROD:
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+    _cors_credentials = bool(_cors_origins)
+else:
+    _cors_origins = ["*"]
+    _cors_credentials = False  # `*` with credentials is invalid per the CORS spec
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_credentials,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Apply standard web-security response headers.
+
+    HSTS, X-Content-Type-Options, X-Frame-Options, Referrer-Policy,
+    Permissions-Policy, and a CSP tuned for this app (inline styles/scripts
+    in index.html, same-origin SSE/fetch). CSP is set to report-only when
+    PULSE_CSP_REPORT_ONLY=true so we can iterate without breaking the UI.
+    """
+
+    _CSP = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "object-src 'none'"
+    )
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "geolocation=(), microphone=(), camera=(), interest-cohort=()",
+        )
+        csp_header = "Content-Security-Policy-Report-Only" if os.environ.get("PULSE_CSP_REPORT_ONLY", "false").lower() == "true" else "Content-Security-Policy"
+        response.headers.setdefault(csp_header, self._CSP)
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # ── Candidate engine plumbing ──
 from typing import Optional as _Optional
