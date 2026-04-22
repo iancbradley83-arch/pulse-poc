@@ -4,7 +4,10 @@ WORKDIR /app
 
 # Build context = repo root (so paths reference `backend/`).
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Cache-bust 2026-04-22: slowapi was missed on a prior build despite
+# requirements.txt changing. Force a fresh pip install layer.
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app/ app/
 
