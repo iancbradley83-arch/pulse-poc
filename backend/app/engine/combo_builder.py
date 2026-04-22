@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal, Optional
 
+from app.engine.candidate_builder import _match_player_selection
 from app.models.news import BetType, CandidateCard, CandidateStatus, HookType, NewsItem
 from app.models.schemas import Game, Market, MarketSelection
 from app.services.market_catalog import MarketCatalog
@@ -71,20 +72,18 @@ HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
         ("btts",        "btts_no"),
     ],
     # Team news (return from suspension, fit XI, etc.) — lean into the
-    # affected side attacking better.
+    # affected side attacking better. Goalscorer-by-mentioned-player is
+    # tried first; if no player in the news matches the goalscorer market
+    # it's skipped silently and the BB falls through to the generic legs.
     HookType.TEAM_NEWS: [
+        ("goalscorer",   "mentioned_player"),
         ("match_result", "affected"),
         ("over_under",   "over"),
         ("corners_ou",   "over"),
         ("btts",         "btts_yes"),
     ],
-    # Managerial quotes about "must-win" / "vital" tend to energise the
-    # affected side. Lean to early intent (1st-half lead) + back them to win.
-    HookType.MANAGER_QUOTE: [
-        ("first_half_result", "affected"),
-        ("match_result",      "affected"),
-        ("over_under",        "over"),
-    ],
+    # MANAGER_QUOTE theme is set further down (it includes the player-aware
+    # goalscorer leg, so the entry lives next to TRANSFER for clarity).
     # Tactical stories (aggressive press, new formation, high block) — expect
     # set pieces and bookings, plus goals either way.
     HookType.TACTICAL: [
@@ -99,10 +98,20 @@ HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
         ("match_result", "affected"),
         ("over_under",   "over"),
     ],
-    # Transfer — usually a new attacker. Back the affected side + goals.
+    # Transfer — usually a new attacker. Lead with the named player as
+    # anytime scorer if we can match them; back the affected side + goals.
     HookType.TRANSFER: [
+        ("goalscorer",   "mentioned_player"),
         ("match_result", "affected"),
         ("over_under",   "over"),
+    ],
+    # Manager quote that names a specific player (e.g. "I expect Saka to
+    # punish them today") — reuse the player-aware path.
+    HookType.MANAGER_QUOTE: [
+        ("goalscorer",        "mentioned_player"),
+        ("first_half_result", "affected"),
+        ("match_result",      "affected"),
+        ("over_under",        "over"),
     ],
     # Article / other -> no BB; the single-bet path handles these.
 }
@@ -135,13 +144,14 @@ def _pick_leg_selection(
     market_type: str,
     outcome_key: str,
     affected: Literal["home", "away"],
+    mentions: Optional[list[str]] = None,
 ) -> Optional[tuple[Market, MarketSelection]]:
     """Resolve (market_type, outcome_key) → (Market, MarketSelection) or None."""
     markets = [m for m in catalog.get_by_game(game.id) if m.market_type == market_type]
     if not markets:
         return None
     market = markets[0]
-    selection = _find_selection(market, outcome_key, affected, game)
+    selection = _find_selection(market, outcome_key, affected, game, mentions)
     if selection is None or not selection.selection_id:
         return None
     return market, selection
@@ -152,6 +162,7 @@ def _find_selection(
     outcome_key: str,
     affected: Literal["home", "away"],
     game: Game,
+    mentions: Optional[list[str]] = None,
 ) -> Optional[MarketSelection]:
     """Pick the right selection from a market based on the abstract outcome key."""
     opponent = "away" if affected == "home" else "home"
@@ -182,6 +193,12 @@ def _find_selection(
         return by_label_substr("yes") or (market.selections[0] if market.selections else None)
     if outcome_key == "btts_no":
         return by_label_substr("no") or (market.selections[1] if len(market.selections) > 1 else None)
+    if outcome_key == "mentioned_player":
+        # Goalscorer-leg-by-name. Returns None if no mentioned player matches
+        # a selection in this market — caller falls through to the next leg.
+        if not mentions:
+            return None
+        return _match_player_selection(market, mentions)
     return None
 
 
@@ -283,7 +300,10 @@ class ComboBuilder:
             # ballooning the BB to 4 legs in some unlucky case.
             if market_type in seen_market_types:
                 continue
-            picked = _pick_leg_selection(self._catalog, game, market_type, outcome_key, affected)
+            picked = _pick_leg_selection(
+                self._catalog, game, market_type, outcome_key, affected,
+                mentions=news.mentions,
+            )
             if picked is None:
                 continue
             legs.append(picked)

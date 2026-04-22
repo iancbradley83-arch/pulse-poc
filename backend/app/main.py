@@ -43,7 +43,7 @@ from app.services.market_catalog import MarketCatalog
 from app.services.feed_manager import FeedManager
 from app.services.game_simulator import GameSimulator
 from app.services.rogue_client import RogueClient
-from app.services.catalogue_loader import fetch_soccer_snapshot
+from app.services.catalogue_loader import GOALSCORER_DEFAULT_TOP_N, fetch_soccer_snapshot
 from app.services.rogue_prematch import build_prematch_cards
 from app.services.featured_bb import fetch_and_build_featured_bb_cards
 from app.services.sse_pricing import SSEPricingManager
@@ -666,6 +666,19 @@ async def _run_candidate_engine(
         market = catalog.get(market_id) if market_id else None
         if market is None:
             continue
+        # Render-time goalscorer trim. Catalogue keeps every player so the
+        # engine can match by name; the publisher narrows to either the
+        # matched player (when CandidateBuilder hinted via selection_ids)
+        # or the top-N favourites. Skip for BB legs — those resolve via
+        # selection_ids per leg below.
+        if cand.bet_type == _BetType.SINGLE and market.market_type == "goalscorer":
+            wanted_sid = cand.selection_ids[0] if cand.selection_ids else None
+            if wanted_sid:
+                matched = next((s for s in market.selections if s.selection_id == wanted_sid), None)
+                if matched is not None:
+                    market = market.model_copy(update={"selections": [matched]})
+            else:
+                market = market.model_copy(update={"selections": list(market.selections[:GOALSCORER_DEFAULT_TOP_N])})
         news = await candidate_store.get_news_item(cand.news_item_id) if cand.news_item_id else None
 
         # Resolve leg markets for Bet Builder candidates.
