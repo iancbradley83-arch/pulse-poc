@@ -237,7 +237,7 @@ const PULSE = (() => {
           ` : pick ? `
             <div class="pulse-pick">
               <div class="pick-meta">
-                <div class="pick-label">Pulse Pick · ${escape(card.market?.label || 'Match Winner')}</div>
+                <div class="pick-label">Pulse Angle · ${escape(card.market?.label || 'Match Winner')}</div>
                 <div class="pick-selection">${escape(pick.label)}</div>
               </div>
               <div class="pick-odds">${pick.odds.toFixed(2)}</div>

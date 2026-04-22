@@ -46,11 +46,11 @@ logger = logging.getLogger(__name__)
 #   - PREVIEW / ARTICLE → totals + 1X2 (safest defaults).
 #   - TRANSFER          → 1X2 + goalscorer (new signing).
 HOOK_MARKET_PRIORITY: dict[HookType, list[str]] = {
-    # Injury → totals lean (less goals), DNB safer than 1X2. Goalscorer is
-    # last because we don't yet match the leg's player to news.mentions —
-    # surfacing "Anytime Scorer · Haaland" on a Burnley-keeper-out story
-    # would be a non-sequitur. Player-aware routing is a follow-up PR.
-    HookType.INJURY: ["over_under", "draw_no_bet", "match_result", "btts", "goalscorer"],
+    # Injury: a named player is out → their team is weaker → opponent without
+    # draw risk (DNB-opp) is the natural read. "Less goals" (over_under-under)
+    # is generic and only true when the injured player is an attacker — we
+    # don't differentiate position yet, so DNB-opp is the safer first hop.
+    HookType.INJURY: ["draw_no_bet", "over_under", "match_result", "btts", "goalscorer"],
     HookType.TEAM_NEWS: ["over_under", "match_result", "goalscorer", "btts"],
     # Tactical = chaos signal: corners + cards first, then totals.
     HookType.TACTICAL: ["corners_ou", "cards_ou", "over_under", "btts", "match_result"],
@@ -62,6 +62,36 @@ HOOK_MARKET_PRIORITY: dict[HookType, list[str]] = {
     HookType.ARTICLE: ["match_result", "over_under"],
 }
 HOOK_DEFAULT_MARKETS = ["match_result", "over_under"]
+
+
+# Hooks that, even without a player-aware match, pass the "specific actor"
+# test by virtue of the hook type itself (an INJURY card is about a named
+# actor; a TRANSFER is about a named signing; a MANAGER_QUOTE is about a
+# named manager — even if we can't player-match the goalscorer market).
+# PREVIEW and ARTICLE are NOT in this set: they're generic "look at this
+# fixture" hooks with no specific actor, so their singles get dropped.
+_HOOKS_WITH_INTRINSIC_ACTOR = {
+    HookType.INJURY,
+    HookType.TRANSFER,
+    HookType.MANAGER_QUOTE,
+    HookType.TEAM_NEWS,
+    HookType.TACTICAL,
+}
+
+
+def _has_specific_actor(item: NewsItem) -> bool:
+    """A news item has a 'specific actor' when its mentions list includes
+    at least one name that isn't just a team. Conservative heuristic: if
+    there are mentions beyond the resolved team_ids count, at least one is
+    likely a player or coach. Falls back to True for hook types whose news
+    is intrinsically actor-led (INJURY, TRANSFER, MANAGER_QUOTE)."""
+    if item.hook_type in _HOOKS_WITH_INTRINSIC_ACTOR:
+        # Even without parseable player names, these hook types are
+        # about a specific real-world actor by definition.
+        return True
+    # Generic hooks (PREVIEW, ARTICLE, OTHER): require at least 2 mentions
+    # so we can be confident there's a player/coach beyond the team itself.
+    return len(item.mentions or []) >= 2
 
 
 # Hooks where naming a specific player shifts the card angle positively
@@ -149,6 +179,17 @@ class CandidateBuilder:
 
     def build(self, item: NewsItem) -> list[CandidateCard]:
         if not item.fixture_ids:
+            return []
+        # Principle 2: singles fire only when the news has a specific actor.
+        # Generic "back the favourite on a fixture preview" cards get dropped;
+        # the BB version of the news item (which can spread the angle across
+        # legs) carries the story instead. PREVIEW + ARTICLE hooks with no
+        # named entity beyond the team name fail this gate.
+        if not _has_specific_actor(item):
+            logger.info(
+                "CandidateBuilder: dropping single — no specific actor "
+                "(hook=%s mentions=%s)", item.hook_type.value, item.mentions,
+            )
             return []
         priority = HOOK_MARKET_PRIORITY.get(item.hook_type, HOOK_DEFAULT_MARKETS)
         out: list[CandidateCard] = []

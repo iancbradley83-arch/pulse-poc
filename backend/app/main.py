@@ -531,11 +531,17 @@ async def _load_rogue_prematch(
         catalog.replace_all(markets)
         simulator._games = {g.id: g for g in games}
 
-        # Baseline pre-match cards (1X2 per fixture). The candidate engine
-        # below overlays news-driven cards on top.
-        cards = build_prematch_cards(games, catalog, assembler)
-        for card in cards:
-            target_feed.add_prematch_card(card)
+        # Baseline pre-match cards (1X2 per fixture) — DISABLED by default
+        # per principle 3 ("no-news fixtures get dropped"). Pulse is the
+        # additive layer; we'd rather show 4 fixtures with stories than
+        # 10 with fillers. Set PULSE_BASELINE_FALLBACK=true to revive the
+        # safety net (e.g. when the news scout / Anthropic is having a bad
+        # day and we still need cards on the feed).
+        if os.getenv("PULSE_BASELINE_FALLBACK", "false").lower() == "true":
+            cards = build_prematch_cards(games, catalog, assembler)
+            for card in cards:
+                target_feed.add_prematch_card(card)
+            logger.info("[PULSE] Baseline pre-match cards added: %d (PULSE_BASELINE_FALLBACK=true)", len(cards))
 
         # Real correlated BB + combo prices come from the same RogueClient
         # via POST /v1/betting/calculateBets — no separate service or auth.
