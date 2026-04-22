@@ -10,6 +10,10 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 # Configure logging BEFORE any module-level loggers are created. Without this,
 # our `logger.info(...)` calls go nowhere on Railway — only WARNING+ slips
@@ -191,6 +195,26 @@ class SecurityHeadersMiddleware:
 
 app.add_middleware(SecurityHeadersMiddleware)
 
+# Rate limiting: per-IP defaults applied to every route. slowapi uses
+# request.client.host as the key — behind Railway's edge that's the
+# proxy IP, so effective per-client limiting requires a custom key_func
+# reading X-Forwarded-For. Tracked as a follow-up.
+#
+# Defaults chosen for a low-traffic SSE-heavy service:
+#   300/minute caps sustained hammering (~5 RPS average)
+#   20/second tolerates short bursts (SSE reconnects, UI polling)
+# Override per deploy with PULSE_RATE_LIMIT_DEFAULTS="N/unit,N/unit".
+_RATE_LIMIT_DEFAULTS = os.environ.get(
+    "PULSE_RATE_LIMIT_DEFAULTS", "300/minute,20/second"
+).split(",")
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[l.strip() for l in _RATE_LIMIT_DEFAULTS if l.strip()],
+)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 # ── Candidate engine plumbing ──
 from typing import Optional as _Optional
 candidate_store = CandidateStore(PULSE_DB_PATH)
@@ -226,7 +250,8 @@ async def serve_index():
 # so it stays in single-digit ms even when the SSE pricing loop is busy.
 # Use this for Railway healthchecks and uptime monitors.
 @app.get("/health")
-async def health():
+@limiter.exempt
+async def health(request: Request):
     return {"ok": True}
 
 
