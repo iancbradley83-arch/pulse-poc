@@ -93,6 +93,33 @@ ceiling.
     angle: No creativity, no goals; Brighton + Under + BTTS No turns the whole
     game on a knock in training.
 
+PLAYER-LED BB MODE (NEW — read carefully)
+
+When the input includes a `lead_player` field, the BB is built around an
+anytime-scorer leg for that named player. The card's whole story is "this
+specific player is the angle". The headline MUST contain the player's name
+(or their surname). Generic headlines that omit the player name are wrong.
+
+  PLAYER BB RAW → {team_news, lead_player: "Frenkie de Jong",
+                   legs=[Goalscorer · Frenkie de Jong @ 5.50,
+                         FT 1X2 · Barcelona @ 1.45,
+                         Total Goals O/U · Over 2.5 @ 1.80]}
+  REWRITE →
+    headline: De Jong returns — Barcelona's engine room fires up
+    angle: De Jong back from suspension; Barcelona to win + Over 2.5 + the man
+    himself to find the net.
+
+  PLAYER BB RAW → {transfer, lead_player: "Cole Palmer",
+                   legs=[Goalscorer · Cole Palmer @ 2.40,
+                         FT 1X2 · Chelsea @ 1.85]}
+  REWRITE →
+    headline: Palmer leads the line — Chelsea ride him to the win
+    angle: New role, same edge; Palmer to score and Chelsea to win, stacked
+    in the slip.
+
+  WRONG (player name dropped) → "Farke tips Bournemouth — his Leeds walk into a trap"
+  RIGHT (player named)        → "Farke trusts James — Leeds attack runs through him"
+
 CALIBRATION EXAMPLES (SINGLES)
 
   RAW → "Bournemouth officially announced Marco Rose as successor to departing
@@ -133,7 +160,8 @@ CALIBRATION EXAMPLES (SINGLES)
 
 INPUT YOU RECEIVE (plain-text fields, newline-separated)
   source, hook_type, raw_headline, raw_summary, home, away, league, kickoff,
-  market_label, pick, odds, and (when bet-builder) legs
+  market_label, pick, odds, and (when bet-builder) legs and (sometimes)
+  lead_player. When `lead_player` is present, the headline must name them.
 
 OUTPUT
   Call the `submit_rewrite` tool exactly once with { headline, angle }.
@@ -193,6 +221,7 @@ class NarrativeRewriter:
                 pick_odds = None
 
         legs_block = ""
+        lead_player_block = ""
         if legs:
             pretty = [f"{leg.market_label or '?'} · {leg.label} @ {leg.odds:.2f}" for leg in legs]
             legs_block = "legs:\n  - " + "\n  - ".join(pretty) + "\n"
@@ -200,6 +229,19 @@ class NarrativeRewriter:
             # price (caller passes None when it's just the naive product).
             if total_odds is not None and total_odds > 1.0:
                 legs_block += f"total_odds: {total_odds:.2f}\n"
+            # When a goalscorer leg is present its label IS the player name.
+            # Surface it as an explicit `lead_player` field so the rewriter
+            # can't drop it from the headline (the model is bad at inferring
+            # "this leg is the story" from the legs block alone).
+            for leg in legs:
+                if (leg.market_label or "").strip().lower() == "goalscorer":
+                    lead_player_block = f"lead_player: {leg.label}\n"
+                    break
+        elif market and market.market_type == "goalscorer" and market.selections:
+            # Single-bet path: a player-matched goalscorer single carries
+            # exactly one selection, the matched player.
+            if len(market.selections) == 1:
+                lead_player_block = f"lead_player: {market.selections[0].label}\n"
 
         user_block = (
             f"source: {news.source_name or news.source or 'unknown'}\n"
@@ -213,6 +255,7 @@ class NarrativeRewriter:
             f"market_label: {market_label or '?'}\n"
             f"pick: {pick_label or '?'}\n"
             f"odds: {pick_odds if pick_odds is not None else '?'}\n"
+            f"{lead_player_block}"
             f"{legs_block}"
         )
 
