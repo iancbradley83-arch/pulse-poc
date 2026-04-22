@@ -246,7 +246,7 @@ const PULSE = (() => {
 
           ${angle ? `<p class="card-angle">${escape(angle)}</p>` : ''}
 
-          <button class="cta-button" type="button">
+          <button class="cta-button" type="button" data-card-id="${escape(card.id || '')}">
             <span class="cta-left">
               ${isMultiLeg ? (betType === 'bet_builder' ? 'Add Bet Builder' : 'Add Combo') : 'Tap to bet'}
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
@@ -393,12 +393,124 @@ const PULSE = (() => {
       });
     });
 
-    // CTA placeholder — Stage 5 deep-links to operator bet slip
+    // CTA — emits a postMessage to the parent window so the operator
+    // host can populate its bet slip. Spec: see /static/EMBED.md
+    // (or https://pulse-poc-production.up.railway.app/static/EMBED.md).
+    // Standalone mode (no parent / parent === self) shows a debug toast
+    // with the JSON payload so demos still feel responsive.
     feed.querySelectorAll('.cta-button').forEach(btn => {
       btn.addEventListener('click', () => {
         btn.animate([{ transform: 'scale(0.98)' }, { transform: 'scale(1)' }], { duration: 120 });
+        const cardId = btn.getAttribute('data-card-id');
+        const card = allCards.find(c => c.id === cardId);
+        if (!card) return;
+        const message = buildAddToSlipMessage(card);
+        emitAddToSlip(message);
       });
     });
+  }
+
+  // ── Bet-slip postMessage contract ─────────────────────────────────
+  // Sent to window.parent when the user clicks a card's CTA. Operator
+  // host listens, validates origin, mints/updates its own slip state.
+  //
+  // Schema (v1):
+  //   {
+  //     type: "pulse:add_to_slip",
+  //     schema_version: 1,
+  //     card_id: "<pulse internal id>",
+  //     bet_type: "single" | "bet_builder" | "combo",
+  //     legs: [{ market_label, label, selection_id, odds }, ...],
+  //     selection_ids: [...],
+  //     virtual_selection: "0VS<piped>" | null,  // for BBs
+  //     total_odds: 4.13 | null,
+  //     fixture_id: "<rogue event _id>",
+  //     hook_type: "team_news" | "injury" | "featured" | ...,
+  //     headline: "<rewritten card headline>",
+  //     source: "pulse"
+  //   }
+  //
+  // Operator should respond with (optional, lets Pulse animate):
+  //   { type: "pulse:slip_ack", card_id, status: "added" | "rejected",
+  //     reason?: "session_required" | "selection_invalid" | "duplicate" }
+  function buildAddToSlipMessage(card) {
+    const legs = (card.legs && card.legs.length)
+      ? card.legs.map(l => ({
+          market_label: l.market_label || '',
+          label: l.label || '',
+          selection_id: l.selection_id || null,
+          odds: Number(l.odds) || 0,
+        }))
+      : (card.market && card.market.selections && card.market.selections.length
+          ? [{
+              market_label: card.market.label || '',
+              label: card.market.selections[0].label || '',
+              selection_id: card.market.selections[0].selection_id || null,
+              odds: Number(card.market.selections[0].odds) || 0,
+            }]
+          : []);
+    return {
+      type: 'pulse:add_to_slip',
+      schema_version: 1,
+      card_id: card.id || null,
+      bet_type: card.bet_type || 'single',
+      legs,
+      selection_ids: legs.map(l => l.selection_id).filter(Boolean),
+      virtual_selection: card.virtual_selection || null,
+      total_odds: card.total_odds != null ? Number(card.total_odds) : null,
+      fixture_id: card.game?.id || null,
+      hook_type: card.hook_type || null,
+      headline: card.headline || card.narrative_hook || '',
+      source: 'pulse',
+    };
+  }
+
+  function emitAddToSlip(message) {
+    const isStandalone = (window.parent === window || !window.parent);
+    if (!isStandalone) {
+      // Production embedded mode: post to parent. Operator MUST set their
+      // origin in the inbound listener; Pulse posts to '*' because the
+      // embedded widget doesn\'t know which operator host wraps it.
+      try { window.parent.postMessage(message, '*'); } catch (e) { /* ignore */ }
+    }
+    // Always show the toast in standalone OR alongside the postMessage
+    // in embed (small dev affordance, can be hidden via CSS by operators).
+    showSlipToast(message, isStandalone);
+  }
+
+  function showSlipToast(message, isStandalone) {
+    const existing = document.getElementById('pulse-slip-toast');
+    if (existing) existing.remove();
+    const toast = document.createElement('div');
+    toast.id = 'pulse-slip-toast';
+    toast.className = 'pulse-toast' + (isStandalone ? ' pulse-toast--standalone' : '');
+    const legCount = (message.legs || []).length;
+    const odds = message.total_odds || (message.legs[0] && message.legs[0].odds) || 0;
+    const headline = message.headline || '';
+    toast.innerHTML = `
+      <div class="pulse-toast__row">
+        <span class="pulse-toast__check">${isStandalone ? '👁' : '✓'}</span>
+        <span class="pulse-toast__main">
+          ${isStandalone ? 'Standalone preview · would post to slip' : 'Sent to slip'}
+          · <strong>${legCount} leg${legCount === 1 ? '' : 's'}</strong>
+          ${odds ? `· <strong>${Number(odds).toFixed(2)}</strong>` : ''}
+        </span>
+        <button class="pulse-toast__copy" type="button" aria-label="Copy payload">copy JSON</button>
+      </div>
+      ${isStandalone ? `<div class="pulse-toast__sub">${escape(headline.slice(0, 80))}</div>` : ''}
+    `;
+    document.body.appendChild(toast);
+    toast.querySelector('.pulse-toast__copy').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(message, null, 2));
+        toast.querySelector('.pulse-toast__copy').textContent = 'copied';
+      } catch (e) { /* clipboard might be denied */ }
+    });
+    setTimeout(() => toast.classList.add('pulse-toast--visible'), 10);
+    setTimeout(() => {
+      toast.classList.remove('pulse-toast--visible');
+      setTimeout(() => toast.remove(), 220);
+    }, 4000);
   }
 
   async function loadFeed() {

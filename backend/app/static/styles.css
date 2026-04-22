@@ -647,3 +647,53 @@ button { font: inherit; cursor: pointer; }
  * ───────────────────────────────────────────────────────────── */
 body.embed { background: transparent; }
 body.embed #app { max-width: 100%; margin: 0; padding-bottom: 0; }
+
+/* ─────────────────────────────────────────────────────────────
+ *  SLIP TOAST — feedback for the postMessage CTA flow
+ * ───────────────────────────────────────────────────────────── */
+.pulse-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translate(-50%, 12px);
+  background: #11141c;
+  color: #e5e9f2;
+  border: 1px solid #2a3044;
+  border-radius: 12px;
+  padding: 10px 14px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.4);
+  font-size: 13px;
+  max-width: 92vw;
+  z-index: 1000;
+  opacity: 0;
+  transition: opacity .2s ease, transform .2s ease;
+  pointer-events: auto;
+}
+.pulse-toast--visible { opacity: 1; transform: translate(-50%, 0); }
+.pulse-toast--standalone { border-color: #f5a52488; }
+.pulse-toast__row { display: flex; align-items: center; gap: 10px; }
+.pulse-toast__check {
+  width: 22px; height: 22px; border-radius: 50%;
+  background: #7cf06f22; color: #7cf06f;
+  display: grid; place-items: center; font-size: 12px;
+  flex-shrink: 0;
+}
+.pulse-toast--standalone .pulse-toast__check {
+  background: #f5a52422; color: #f5a524;
+}
+.pulse-toast__main { flex: 1; }
+.pulse-toast__sub {
+  font-size: 11px; color: #8b93a7; margin-top: 4px;
+  padding-left: 32px;
+}
+.pulse-toast__copy {
+  background: transparent;
+  color: #8b93a7;
+  border: 1px solid #2a3044;
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.pulse-toast__copy:hover { color: #e5e9f2; border-color: #7cf06f; }
