@@ -39,6 +39,13 @@ PULSE_NEWS_MAX_SEARCHES = int(os.getenv("PULSE_NEWS_MAX_SEARCHES", "5"))
 PULSE_NEWS_MAX_FIXTURES = int(os.getenv("PULSE_NEWS_MAX_FIXTURES", "12"))
 PULSE_NEWS_CACHE_TTL_HOURS = int(os.getenv("PULSE_NEWS_CACHE_TTL_HOURS", "6"))
 
+# Cost controls.
+#   PULSE_NEWS_INGEST_ENABLED=false  → skip ALL scout calls (kill switch).
+#                                       Featured BBs still load (no LLM).
+#                                       Useful when iterating without a demo,
+#                                       or when the API key is out of credits.
+PULSE_NEWS_INGEST_ENABLED = os.getenv("PULSE_NEWS_INGEST_ENABLED", "true").lower() == "true"
+
 # Publish gate. Only candidates at or above this score reach the public feed.
 PULSE_PUBLISH_THRESHOLD = float(os.getenv("PULSE_PUBLISH_THRESHOLD", "0.55"))
 

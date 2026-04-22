@@ -25,6 +25,7 @@ from app.config import (
     PULSE_DATA_SOURCE,
     PULSE_DB_PATH,
     PULSE_NEWS_CACHE_TTL_HOURS,
+    PULSE_NEWS_INGEST_ENABLED,
     PULSE_NEWS_MAX_FIXTURES,
     PULSE_NEWS_MAX_SEARCHES,
     PULSE_NEWS_MODEL,
@@ -441,6 +442,12 @@ async def admin_rerun():
     global _ondemand_rerun_inflight, _ondemand_rerun_started_at
     if PULSE_DATA_SOURCE != "rogue":
         raise HTTPException(400, "rerun only valid when PULSE_DATA_SOURCE=rogue")
+    if not PULSE_NEWS_INGEST_ENABLED:
+        raise HTTPException(
+            503,
+            "rerun blocked: PULSE_NEWS_INGEST_ENABLED=false (kill switch). "
+            "Set the env var to true on Railway and the next call will proceed.",
+        )
     if _ondemand_rerun_inflight:
         raise HTTPException(
             409,
@@ -543,13 +550,23 @@ async def _load_rogue_prematch(
                 target_feed.add_prematch_card(card)
             logger.info("[PULSE] Baseline pre-match cards added: %d (PULSE_BASELINE_FALLBACK=true)", len(cards))
 
-        # Real correlated BB + combo prices come from the same RogueClient
-        # via POST /v1/betting/calculateBets — no separate service or auth.
-        await _run_candidate_engine(
-            simulator._games,
-            rogue_client=client,
-            target_feed=target_feed,
-        )
+        # Cost guard — kill switch. Flip PULSE_NEWS_INGEST_ENABLED=false on
+        # Railway to stop ALL Anthropic-spending engine calls. Featured BBs
+        # still load (no LLM). Useful when iterating without a demo, or
+        # when the API key is bouncing on credits.
+        if not PULSE_NEWS_INGEST_ENABLED:
+            logger.info(
+                "[PULSE] Candidate engine SKIPPED (PULSE_NEWS_INGEST_ENABLED=false). "
+                "Feed will show only featured BBs."
+            )
+        else:
+            # Real correlated BB + combo prices come from the same
+            # RogueClient via POST /v1/betting/calculateBets.
+            await _run_candidate_engine(
+                simulator._games,
+                rogue_client=client,
+                target_feed=target_feed,
+            )
 
         # Surface operator-curated featured BBs (Apuesta Total's
         # /v1/featured/betbuilder picks). Each is priced via calculate_bets
