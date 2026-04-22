@@ -1,8 +1,18 @@
-fastapi==0.115.6
+# Core web framework. Floor at 0.120 required for starlette>=0.49.1
+# which closes CVE-2025-54121 + CVE-2025-62727.
+fastapi>=0.120.0,<0.140
+
+# Explicit starlette pin — closes the multipart-DoS + Range-header
+# quadratic-time DoS CVEs against starlette <0.49.1.
+starlette>=0.49.1,<0.51
+
 uvicorn==0.34.0
 websockets==14.1
 pydantic==2.10.3
-python-dotenv==1.0.1
+
+# python-dotenv pin closes CVE-2026-28684 (symlink attack in set_key/unset_key).
+python-dotenv>=1.2.2,<2
+
 anthropic==0.42.0
 httpx==0.28.1
 aiosqlite==0.20.0
