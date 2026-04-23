@@ -409,17 +409,32 @@ const PULSE = (() => {
       });
     });
 
-    // CTA — emits a postMessage to the parent window so the operator
-    // host can populate its bet slip. Spec: see /static/EMBED.md
-    // (or https://pulse-poc-production.up.railway.app/static/EMBED.md).
-    // Standalone mode (no parent / parent === self) shows a debug toast
-    // with the JSON payload so demos still feel responsive.
+    // CTA — Stage 5: the backend stamps `card.deep_link` with the
+    // operator's bet-slip URL (Apuesta Total's kmianko iframe URL with
+    // the Rogue selectionId / virtual_selection pre-loaded). Prefer that
+    // over the postMessage path.
+    //
+    // Order of preference:
+    //   1. card.deep_link present → fire click-track (sendBeacon) then
+    //      window.open in new tab. Covers singles, news BBs, featured BBs,
+    //      combos, storylines uniformly.
+    //   2. No deep_link AND we're inside an operator iframe → fall back to
+    //      the postMessage schema so embed integrations keep working.
+    //   3. Standalone demo with no deep_link → show debug toast.
     feed.querySelectorAll('.cta-button').forEach(btn => {
       btn.addEventListener('click', () => {
         btn.animate([{ transform: 'scale(0.98)' }, { transform: 'scale(1)' }], { duration: 120 });
         const cardId = btn.getAttribute('data-card-id');
         const card = allCards.find(c => c.id === cardId);
         if (!card) return;
+        if (card.deep_link) {
+          if (window.PulseClicks) window.PulseClicks.track(card.id);
+          // target=_blank + rel=noopener — bet slip opens in new tab
+          // so Pulse widget stays alive for the next recommendation.
+          window.open(card.deep_link, '_blank', 'noopener');
+          return;
+        }
+        // Legacy embed path (operator host that listens for pulse:add_to_slip)
         const message = buildAddToSlipMessage(card);
         emitAddToSlip(message);
       });

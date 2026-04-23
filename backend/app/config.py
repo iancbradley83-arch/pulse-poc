@@ -69,3 +69,45 @@ def _parse_mix(s: str) -> dict[str, int]:
     return out
 
 PULSE_BET_TYPE_MIX = _parse_mix(os.getenv("PULSE_BET_TYPE_MIX", "singles=40,bb=30,combos=30"))
+
+# ── Stage 5 — deep-link CTA ────────────────────────────────────────────
+# The card's "Tap to bet" / "Add Bet Builder" CTA opens this URL (target=
+# _blank) with the card's Rogue selection_ids pre-loaded on the operator's
+# bet slip. Discovered Phase 1 for Apuesta Total: the sportsbook runs
+# inside a kmianko iframe (`/es-pe/spbkv3`) whose parent page at
+# `apuestatotal.com/apuestas-deportivas` forwards the query string
+# *inside* the `fpath` param to the iframe. The iframe reads `selectionId`
+# from its own URL and fires the addSelection flow on boot (see
+# km_index.js → queryOverrides.bscode / redirectData.selectionId).
+#
+# Three templates so we can evolve per-bet-type independently without
+# redeploying. `{selection_ids}` is comma-joined Rogue IDs (legs for
+# combos, single id for singles); `{virtual_selection}` is the BB's
+# `0VS<leg1>|<leg2>|…` virtual-selection id (same shape the kmianko
+# iframe already recognises as a BetBuilderBet thanks to the Vd="0VS"
+# prefix check and `si()` pipe-split helper).
+#
+# For cross-event combos we deep-link to the FIRST leg only — the kmianko
+# iframe currently picks up one `selectionId` per load and ignores a
+# repeated param. That's a known operator limitation; the frontend still
+# renders the full leg list, the user just has to add legs 2+ manually
+# after the first lands. When the operator ships `bscode` minting we can
+# swap this for a multi-leg template.
+PULSE_DEEPLINK_ENABLED = os.getenv("PULSE_DEEPLINK_ENABLED", "true").lower() == "true"
+PULSE_DEEPLINK_TEMPLATE_SINGLE = os.getenv(
+    "PULSE_DEEPLINK_TEMPLATE_SINGLE",
+    # Default: Apuesta Total pre-match sportsbook; iframe path encoded
+    # inside `fpath` so the iframe's own query string carries selectionId.
+    "https://www.apuestatotal.com/apuestas-deportivas?fpath=%2Fes-pe%2Fspbkv3%3FselectionId%3D{selection_ids}",
+)
+PULSE_DEEPLINK_TEMPLATE_BB = os.getenv(
+    "PULSE_DEEPLINK_TEMPLATE_BB",
+    # BB: pass the virtual-selection id. kmianko treats 0VS-prefixed IDs
+    # as BetBuilder and splits on `|` internally.
+    "https://www.apuestatotal.com/apuestas-deportivas?fpath=%2Fes-pe%2Fspbkv3%3FselectionId%3D{virtual_selection}",
+)
+PULSE_DEEPLINK_TEMPLATE_COMBO = os.getenv(
+    "PULSE_DEEPLINK_TEMPLATE_COMBO",
+    # Cross-event combo / storyline: first leg only (see caveat above).
+    "https://www.apuestatotal.com/apuestas-deportivas?fpath=%2Fes-pe%2Fspbkv3%3FselectionId%3D{selection_ids}",
+)

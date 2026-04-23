@@ -11,16 +11,36 @@ class FeedManager:
         self.prematch_cards: list[Card] = []
         self.live_cards: list[Card] = []
         self._websocket_clients: list = []
+        # Optional render-time card decorator — used by main.py to stamp
+        # card.deep_link from the Stage 5 env templates without having to
+        # patch every add_prematch_card caller (there are 7, spread across
+        # the baseline/engine/featured/mock paths). Callers set this once
+        # after instantiation; None means pass-through.
+        self._decorator: "callable | None" = None
+
+    def set_decorator(self, decorator) -> None:
+        """Install a per-card decorator called on every insert. The callable
+        receives a Card and returns it (mutated in place is fine)."""
+        self._decorator = decorator
+
+    def _decorate(self, card: Card) -> Card:
+        if self._decorator is not None:
+            try:
+                return self._decorator(card)
+            except Exception:
+                # Never block a card from being added over a decorator bug.
+                return card
+        return card
 
     def add_prematch_card(self, card: Card):
-        self.prematch_cards.append(card)
+        self.prematch_cards.append(self._decorate(card))
         self._sort_prematch()
 
     def replace_prematch_cards(self, cards: list[Card]):
         """Atomic swap of the entire pre-match card list. Used by the
         scheduled rerun loop so re-generation doesn't double-render cards
         from the previous cycle. Sort happens once at the end."""
-        self.prematch_cards = list(cards)
+        self.prematch_cards = [self._decorate(c) for c in cards]
         self._sort_prematch()
 
     def add_live_card(self, card: Card):

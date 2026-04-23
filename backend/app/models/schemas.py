@@ -218,3 +218,9 @@ class Card(BaseModel):
     # Suspension state — set true when the SSE feed reports the event or any
     # leg market suspends. Frontend grays the CTA.
     suspended: bool = False
+    # Stage 5 deep-link — operator bet-slip URL with this card's selection(s)
+    # pre-loaded. Built server-side from env templates so the frontend stays
+    # operator-agnostic (client just `window.open`s whatever lands in this
+    # field). None => CTA renders dead (e.g. cross-event combo on an operator
+    # whose slip URL can't encode multi-event selections).
+    deep_link: Optional[str] = None

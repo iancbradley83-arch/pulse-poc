@@ -97,20 +97,91 @@ def create_reactions_routes(
         if not _reactions_enabled():
             raise HTTPException(404, "reactions disabled")
         rows = await store.reaction_aggregates()
-        return HTMLResponse(_render_admin_html(rows))
+        # Stage 5: join per-card click totals so the admin table shows
+        # which cards drove through-to-slip opens, not just thumbs. We
+        # aggregate in Python (not a second GROUP BY in SQL) because
+        # reaction_aggregates already collapses by (fixture, hook, bet,
+        # storyline) and the click count for THAT cohort needs a second
+        # pass via the candidates table — cheap at current volumes (~30
+        # cards per cycle).
+        click_totals = await store.click_totals()
+        # Pull fixture/hook/bet/storyline for every clicked card so we
+        # can re-aggregate click totals onto the same cohort grouping
+        # that reactions use.
+        import aiosqlite as _aio
+        cohort_clicks: dict[tuple, int] = {}
+        async with _aio.connect(store._db_path) as db:
+            db.row_factory = _aio.Row
+            async with db.execute(
+                """
+                SELECT
+                    c.game_id      AS fixture,
+                    c.hook_type    AS hook_type,
+                    c.bet_type     AS bet_type,
+                    c.storyline_id AS storyline,
+                    COUNT(k.id)    AS n
+                FROM card_clicks k
+                LEFT JOIN candidates c ON c.id = k.card_id
+                GROUP BY c.game_id, c.hook_type, c.bet_type, c.storyline_id
+                """
+            ) as cur:
+                click_rows = await cur.fetchall()
+        for cr in click_rows:
+            key = (cr["fixture"], cr["hook_type"], cr["bet_type"], cr["storyline"])
+            cohort_clicks[key] = int(cr["n"] or 0)
+        # Also count orphan clicks (featured BBs / any click on cards
+        # that never landed in the candidates table) so the summary
+        # bar isn't short a few entries.
+        orphan_clicks = sum(click_totals.values()) - sum(cohort_clicks.values())
+        for r in rows:
+            key = (r.get("fixture"), r.get("hook_type"), r.get("bet_type"), r.get("storyline"))
+            r["clicks"] = cohort_clicks.get(key, 0)
+        return HTMLResponse(_render_admin_html(rows, orphan_clicks=orphan_clicks))
+
+    @router.post("/api/cards/{card_id}/click")
+    @limiter.limit("60/minute")
+    async def track_click(
+        request: Request,
+        card_id: str,
+        pulse_anon_id: Optional[str] = Cookie(None),
+    ):
+        """Log a CTA click before the deep-link opens. Does NOT validate
+        the card_id against the live feed — a card just-replaced by a
+        rerun could still fire this on its way out, and we don't want to
+        drop that signal. Kept intentionally cheap (single INSERT, no
+        lookups) because it's called inline before `window.open`."""
+        if not _reactions_enabled():
+            # Piggy-back on PULSE_REACTIONS_ENABLED for now: same analytics
+            # surface, same kill switch. If we ever split them we'll add a
+            # dedicated PULSE_CLICK_TRACKING_ENABLED flag.
+            raise HTTPException(404, "analytics disabled")
+        try:
+            await store.save_click(card_id=card_id, anon_id=pulse_anon_id)
+        except Exception as exc:
+            logger.exception("[clicks] save_click failed: %s", exc)
+            # Don't 500 on analytics failure — the click still happened,
+            # user is already being navigated. Best-effort log.
+            return {"ok": False}
+        return {"ok": True}
 
     return router
 
 
-def _render_admin_html(rows: list[dict[str, Any]]) -> str:
-    """Simple admin page, sorted by total desc.
+def _render_admin_html(
+    rows: list[dict[str, Any]],
+    *,
+    orphan_clicks: int = 0,
+) -> str:
+    """Simple admin page, sorted by total reactions desc.
 
-    Columns: fixture, hook_type, bet_type, storyline, up, down, total, up_rate.
+    Columns: fixture, hook_type, bet_type, storyline, up, down, total, up_rate, clicks.
+    Stage 5 added the clicks column (deep-link opens from card CTA).
     No auth (POC); same posture as /admin/candidates.
     """
     total_rows = len(rows)
     total_up = sum(r.get("up", 0) for r in rows)
     total_down = sum(r.get("down", 0) for r in rows)
+    total_clicks = sum(r.get("clicks", 0) for r in rows) + int(orphan_clicks or 0)
     total_all = total_up + total_down
     overall_up_rate = (100 * total_up / total_all) if total_all else 0.0
 
@@ -118,6 +189,7 @@ def _render_admin_html(rows: list[dict[str, Any]]) -> str:
     for r in rows:
         up = int(r.get("up", 0) or 0)
         down = int(r.get("down", 0) or 0)
+        clicks = int(r.get("clicks", 0) or 0)
         total = up + down
         up_rate = (100 * up / total) if total else 0.0
         tbody.append(
@@ -130,6 +202,7 @@ def _render_admin_html(rows: list[dict[str, Any]]) -> str:
             f"<td style='text-align:right;'>{down}</td>"
             f"<td style='text-align:right;'>{total}</td>"
             f"<td style='text-align:right;'>{up_rate:.0f}%</td>"
+            f"<td style='text-align:right;'>{clicks}</td>"
             "</tr>"
         )
     return f"""<!doctype html>
@@ -156,7 +229,8 @@ def _render_admin_html(rows: list[dict[str, Any]]) -> str:
     {total_rows} cards rated ·
     {total_up} thumbs up ·
     {total_down} thumbs down ·
-    overall {overall_up_rate:.0f}% up
+    overall {overall_up_rate:.0f}% up ·
+    {total_clicks} CTA clicks
   </div>
   <table>
     <thead><tr>
@@ -165,9 +239,10 @@ def _render_admin_html(rows: list[dict[str, Any]]) -> str:
       <th style="text-align:right;">Down</th>
       <th style="text-align:right;">Total</th>
       <th style="text-align:right;">Up rate</th>
+      <th style="text-align:right;">Clicks</th>
     </tr></thead>
     <tbody>
-      {''.join(tbody) if tbody else '<tr><td colspan="8" class="empty">No reactions yet.</td></tr>'}
+      {''.join(tbody) if tbody else '<tr><td colspan="9" class="empty">No reactions yet.</td></tr>'}
     </tbody>
   </table>
 </body></html>"""
