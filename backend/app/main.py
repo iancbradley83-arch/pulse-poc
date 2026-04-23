@@ -912,29 +912,75 @@ async def _run_candidate_engine(
         legs: list[_CardLeg] = []
         total_odds: "float | None" = None
         bb_excluded = False
+        # Cap how many Goalscorer-leg substitutions we'll try per BB when
+        # the originally-picked player is on the out/suspended list. 3 is
+        # enough to work down to the 3rd-shortest-odds alternative — if
+        # we can't find a non-excluded player in the top 3, the market
+        # itself is probably a bad fit. PR #33 feedback point 3 (2026-04-23).
+        _MAX_SCORER_SUBS = 3
         if is_bb:
-            for mid, sid in zip(cand.market_ids, cand.selection_ids):
+            # Mutable copy so we can rewrite the selection id when we swap
+            # a Goalscorer leg's player. Downstream persistence + pricing
+            # reads back from this list via candidate/card state.
+            cand_selection_ids = list(cand.selection_ids)
+            cand_market_ids = list(cand.market_ids)
+            for leg_idx, (mid, sid) in enumerate(zip(cand_market_ids, cand_selection_ids)):
                 leg_market = catalog.get(mid)
                 if leg_market is None:
                     continue
                 leg_sel = next((s for s in leg_market.selections if s.selection_id == sid), None)
                 if leg_sel is None:
                     continue
-                # Exclude BBs whose Goalscorer leg resolves to an
-                # out/suspended player (catches the PR #20 carry-through
-                # where a Lejeune-injury news item and a Lejeune-scorer
-                # BB shipped together).
+                # Exclude-player retry for Goalscorer legs: if the scorer
+                # this BB was built with turns out to be on the out/
+                # suspended list (catches the PR #20 carry-through where a
+                # Lejeune-injury news item and a Lejeune-scorer BB shipped
+                # together), walk down the Goalscorer market's selection
+                # list (price-ordered at ingest time) and pick the first
+                # player who isn't on the exclusion list. Cap at
+                # _MAX_SCORER_SUBS substitutions before dropping the BB.
                 if (
                     leg_market.market_type == "goalscorer"
                     and _label_contains_excluded_player(leg_sel.label, excluded_player_names)
                 ):
+                    substitute = None
+                    # Build the ordered candidate pool of same-market
+                    # selections we haven't already rejected. Skip the
+                    # originally-picked sid and anything else already
+                    # used elsewhere in this BB (avoid duplicate legs).
+                    already_used = set(cand_selection_ids)
+                    tried = 0
+                    for alt in leg_market.selections:
+                        if alt.selection_id == sid:
+                            continue
+                        if not alt.selection_id:
+                            continue
+                        if alt.selection_id in already_used:
+                            continue
+                        if tried >= _MAX_SCORER_SUBS:
+                            break
+                        tried += 1
+                        if _label_contains_excluded_player(alt.label, excluded_player_names):
+                            continue
+                        substitute = alt
+                        break
+                    if substitute is None:
+                        logger.info(
+                            "[PULSE] BB rejected — goalscorer leg player %r is on "
+                            "the out/suspended list for game %s, no substitute in "
+                            "top %d non-excluded selections",
+                            leg_sel.label, cand.game_id, _MAX_SCORER_SUBS,
+                        )
+                        bb_excluded = True
+                        break
                     logger.info(
-                        "[PULSE] BB rejected — goalscorer leg player %r is on "
-                        "the out/suspended list for game %s",
-                        leg_sel.label, cand.game_id,
+                        "[PULSE] BB goalscorer leg swapped — %r (excluded) -> %r "
+                        "(game %s)",
+                        leg_sel.label, substitute.label, cand.game_id,
                     )
-                    bb_excluded = True
-                    break
+                    leg_sel = substitute
+                    sid = substitute.selection_id
+                    cand_selection_ids[leg_idx] = sid
                 try:
                     leg_odds = float(leg_sel.odds)
                 except Exception:
@@ -945,6 +991,12 @@ async def _run_candidate_engine(
                     odds=leg_odds,
                     selection_id=sid,
                 ))
+            # Persist the (possibly substituted) selection_ids back onto
+            # the candidate so downstream pricing + the virtual_selection
+            # id (re-quoted via calculate_bets when available) match the
+            # legs we actually rendered.
+            if not bb_excluded:
+                cand.selection_ids = cand_selection_ids
             if bb_excluded:
                 # BB carried an out-player goalscorer leg — drop the card
                 # entirely. Better to publish nothing than a self-contradicting

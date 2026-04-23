@@ -92,10 +92,14 @@ OUT, SUSPENDED, DOUBTFUL, or has just RETURNED from injury, populate
   - `player_name`: full name as it would appear on a team sheet
   - `team`: which of the two fixture teams they play for
   - `position_guess`: one of "striker", "winger", "attacking_mid",
-    "defensive_mid", "midfielder", "centre_back", "fullback",
-    "goalkeeper", "unknown". Guess from the story ("their striker X",
-    "centre-back Y torn his ACL"); when the story doesn't say and you
-    can't infer confidently from general knowledge, use "unknown".
+    "defensive_mid", "centre_back", "fullback", "goalkeeper",
+    "unknown". Guess from the story ("their striker X", "centre-back
+    Y torn his ACL"); when the story doesn't say and you can't infer
+    confidently from general knowledge, use "unknown". For midfielders
+    you MUST pick either "attacking_mid" (number 10, creative / box-to-
+    box / winger-ish) or "defensive_mid" (6, holder, destroyer). If
+    you truly can't tell from context or general knowledge, use
+    "unknown" — there is no generic "midfielder" bucket.
   - `is_out_confirmed`: true for confirmed OUT / SUSPENDED / RULED OUT,
     false for DOUBTFUL / ASSESSMENT / RETURN (i.e. the player might
     still play).
@@ -179,7 +183,7 @@ def _submit_tool_schema() -> dict[str, Any]:
                                             "enum": [
                                                 "striker", "winger",
                                                 "attacking_mid",
-                                                "defensive_mid", "midfielder",
+                                                "defensive_mid",
                                                 "centre_back", "fullback",
                                                 "goalkeeper", "unknown",
                                             ],
@@ -375,6 +379,12 @@ def _raw_to_news(row: dict[str, Any]) -> NewsItem:
             if not isinstance(entry, dict):
                 continue
             pos = str(entry.get("position_guess") or "unknown").lower()
+            # Legacy compat: PR #33 v1 cached rows can still contain a bare
+            # "midfielder" bucket. That value is no longer part of the enum
+            # and no longer has a route, so fold it down to "unknown" and
+            # let the downstream router fall through.
+            if pos == "midfielder":
+                pos = "unknown"
             injury_details.append({
                 "player_name": _clean_copy(entry.get("player_name")),
                 "team": _clean_copy(entry.get("team")),

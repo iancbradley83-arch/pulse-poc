@@ -5,8 +5,10 @@ Same-event Bet Builders on:
   - Half markets: 1st Half 1X2.
   - Side markets: Corners FT O/U, Cards FT O/U.
 
-Each theme picks 2-3 legs that hang together narratively. We keep BBs short
-(≤3 legs) — Rogue rejects more correlations as the leg count climbs.
+Each theme picks 2-6 legs that hang together narratively. Leg count is
+driven by narrative fit, not a fixed ceiling (PR #33 2026-04-23). When
+Rogue rejects the combo we walk down one leg at a time until it
+validates, down to the 2-leg minimum.
 
 Pipeline:
 
@@ -70,14 +72,17 @@ HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
     # carries injury_details with a known position, _injury_theme_for()
     # rewrites this list into a position-specific stack (striker out =>
     # unders + BTTS NO; defender out => overs + BTTS YES; etc). The entries
-    # below are the fallback used when position is unknown — deliberately
-    # removed DNB-opponent because backing a heavy fav with no edge was
-    # the exact 1-2/5 pathology. Default to under goals + no BTTS + fewer
-    # corners — a softer "injury dulls the game" read.
+    # below are the fallback used when position is unknown (scout emitted
+    # no injury_details, or the named player resolved to "unknown"). We
+    # deliberately REMOVED DNB-opponent because backing a heavy fav with
+    # no edge was the exact 1-2/5 pathology. The replacement default is
+    # Over 2.5 + BTTS YES — a conservative "injury story =/= direct fade
+    # on either team" stance that isn't wrong on any specific injury
+    # narrative and keeps the card shippable as a 2-leg BB. See PR #33
+    # review feedback point 2 (2026-04-23).
     HookType.INJURY: [
-        ("over_under",  "under"),
-        ("btts",        "btts_no"),
-        ("corners_ou",  "under"),
+        ("over_under", "over"),
+        ("btts",       "btts_yes"),
     ],
     # Team news (return from suspension, fit XI, etc.) — lean into the
     # affected side attacking better. Goalscorer-by-mentioned-player is
@@ -124,9 +129,14 @@ HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
     # Article / other -> no BB; the single-bet path handles these.
 }
 
-# Cap how many legs end up in any one BB. More legs => Rogue rejects more
-# combos as uncorrelated. 3 is the sweet spot from prior PRs.
-MAX_BB_LEGS = 3
+# BB leg count is driven by narrative fit, not a fixed count (user decision
+# 2026-04-23, PR #33 review feedback point 4). We accept 2..6 legs; the
+# Rogue betbuilder/match endpoint is the ground truth for whether the combo
+# is legal. When more than MAX_BB_LEGS candidate legs resolve, the dedup-
+# on-market-type rule + theme ordering (most narratively-aligned first,
+# player-matched legs preferred) picks the top MAX_BB_LEGS.
+MIN_BB_LEGS = 2
+MAX_BB_LEGS = 6
 
 
 # Position-aware INJURY theme. Mirrors _INJURY_ROUTES in candidate_builder
@@ -379,9 +389,11 @@ class ComboBuilder:
             if len(legs) >= MAX_BB_LEGS:
                 break
             # One leg per market_type — themes list multiple alternates so
-            # we can fall through if the catalog is missing the preferred one;
-            # we don't want both an over_under and a corners_ou + cards_ou
-            # ballooning the BB to 4 legs in some unlucky case.
+            # we can fall through if the catalog is missing the preferred
+            # one. Dedup-on-market-type preserved even under the 6-leg cap
+            # (PR #33 feedback point 4): order in the theme encodes
+            # narrative fit / player-matched preference, and we trust the
+            # author to put the must-have legs first.
             if market_type in seen_market_types:
                 continue
             picked = _pick_leg_selection(
@@ -393,7 +405,7 @@ class ComboBuilder:
             legs.append(picked)
             seen_market_types.add(market_type)
 
-        if len(legs) < 2:
+        if len(legs) < MIN_BB_LEGS:
             logger.debug("ComboBuilder: only %d valid legs for news %s", len(legs), news.id)
             return None
 
@@ -404,11 +416,12 @@ class ComboBuilder:
         # Validate via Rogue BB endpoint. Mock mode (no Rogue client) skips
         # validation and just trusts the combo — fine for local dev.
         #
-        # If a 3-leg combo is rejected ("uncorrelated"), retry with the first
-        # 2 legs before giving up. The market-coverage expansion increased
-        # rejection rate because (e.g.) corners-over + goals-over + match-
-        # winner-affected sometimes flags as conflicting; the underlying
-        # 2-leg variant almost always passes.
+        # If the full N-leg combo is rejected ("uncorrelated"), walk down
+        # one leg at a time (N → N-1 → ... → MIN_BB_LEGS) peeling the last
+        # leg off each pass. The theme author ordered by must-haves first,
+        # so dropping from the end preserves the narrative core. Previous
+        # behaviour jumped straight from N to 2 which lost signal —
+        # PR #33 review feedback point 4 (2026-04-23).
         total_odds: Optional[float] = None
         price_source: Optional[str] = None
         virtual_selection: Optional[str] = None
@@ -416,9 +429,10 @@ class ComboBuilder:
             valid = False
             reason = ""
             odds = None
-            attempts: list[list[str]] = [selection_ids]
-            if len(selection_ids) >= 3:
-                attempts.append(selection_ids[:2])
+            attempts: list[list[str]] = []
+            n = len(selection_ids)
+            for size in range(n, MIN_BB_LEGS - 1, -1):
+                attempts.append(selection_ids[:size])
             for idx, attempt in enumerate(attempts):
                 try:
                     resp = await self._rogue.betbuilder_match(attempt)
@@ -437,8 +451,8 @@ class ComboBuilder:
                         legs = legs[: len(attempt)]
                         selection_ids = attempt
                         logger.info(
-                            "ComboBuilder: 3-leg rejected, fell back to 2-leg (news=%s)",
-                            news.id,
+                            "ComboBuilder: %d-leg rejected, fell back to %d-leg (news=%s)",
+                            n, len(attempt), news.id,
                         )
                     break
                 logger.info(

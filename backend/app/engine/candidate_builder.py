@@ -217,8 +217,11 @@ _INJURY_ROUTES: dict[str, list[InjuryLeg]] = {
     # Defensive mid => game opens up, chaos signals.
     "defensive_mid":  [("corners_ou", "over"), ("cards_ou", "over"),
                        ("over_under", "over")],
-    # Generic midfielder — ambiguous, weak signal. Don't force a market.
-    "midfielder":     [],
+    # No generic "midfielder" bucket — the scout is forced to pick
+    # attacking_mid or defensive_mid (or fall through to "unknown"). Old
+    # cached rows with "midfielder" are folded to "unknown" at the
+    # news_ingester parse layer and fall through to the legacy priority
+    # list here (routes.get(pos, []) returns empty → no forced routing).
 }
 
 
@@ -267,7 +270,7 @@ def _dominant_out_position(
     tie_break = {
         "striker": 0, "winger": 1, "attacking_mid": 2,
         "goalkeeper": 3, "centre_back": 4, "fullback": 5,
-        "defensive_mid": 6, "midfielder": 7,
+        "defensive_mid": 6,
     }
     return sorted(
         counts.items(), key=lambda kv: (-kv[1], tie_break.get(kv[0], 99))

@@ -80,9 +80,12 @@ class NewsItem(BaseModel):
     # Structured position data for INJURY / TEAM_NEWS items. Each entry:
     #   {"player_name": str, "team": str,
     #    "position_guess": "striker"|"winger"|"attacking_mid"|
-    #                      "defensive_mid"|"midfielder"|"centre_back"|
-    #                      "fullback"|"goalkeeper"|"unknown",
+    #                      "defensive_mid"|"centre_back"|"fullback"|
+    #                      "goalkeeper"|"unknown",
     #    "is_out_confirmed": bool}
+    # (Legacy: the enum also historically included "midfielder"; the
+    # news_ingester parse layer folds that value to "unknown" so old
+    # cached rows still deserialize cleanly.)
     # Populated by the scout (news_ingester) when the story names a player
     # who is out / suspended / doubtful. Consumed by:
     #   - candidate_builder INJURY routing (position → market selection)
