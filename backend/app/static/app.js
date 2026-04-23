@@ -168,6 +168,17 @@ const PULSE = (() => {
     const multiLegs = Array.isArray(card.legs) ? card.legs : [];
     const isMultiLeg = multiLegs.length > 1;
     const isBB = isMultiLeg && betType === 'bet_builder';
+    // Cross-event storyline combos carry a storyline_id stamped by the
+    // backend publisher. When present, we swap the "Bet Builder" / "Combo"
+    // label for "Weekend Storyline" so users see the card is a themed
+    // cross-event narrative, not a per-fixture bet builder.
+    const isStoryline = Boolean(card.storyline_id) && isMultiLeg;
+    const multiLegLabel = isStoryline
+      ? 'Weekend Storyline'
+      : (betType === 'bet_builder' ? 'Bet Builder' : 'Combo');
+    const multiLegCTA = isStoryline
+      ? 'Add Storyline'
+      : (betType === 'bet_builder' ? 'Add Bet Builder' : 'Add Combo');
     const totalOdds = isMultiLeg
       ? (typeof card.total_odds === 'number'
           ? card.total_odds
@@ -213,7 +224,7 @@ const PULSE = (() => {
             <div class="pulse-pick pulse-pick--stack">
               <div class="pick-meta">
                 <div class="pick-label">
-                  Pulse ${betType === 'bet_builder' ? 'Bet Builder' : 'Combo'} · ${multiLegs.length} legs
+                  Pulse ${multiLegLabel} · ${multiLegs.length} legs
                 </div>
                 <div class="leg-stack">
                   ${multiLegs.map(l => `
@@ -248,7 +259,7 @@ const PULSE = (() => {
 
           <button class="cta-button" type="button" data-card-id="${escape(card.id || '')}">
             <span class="cta-left">
-              ${isMultiLeg ? (betType === 'bet_builder' ? 'Add Bet Builder' : 'Add Combo') : 'Tap to bet'}
+              ${isMultiLeg ? multiLegCTA : 'Tap to bet'}
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
             </span>
             ${hasTotal

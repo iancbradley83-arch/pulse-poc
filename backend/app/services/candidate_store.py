@@ -20,6 +20,9 @@ from app.models.news import (
     CandidateStatus,
     HookType,
     NewsItem,
+    StorylineItem,
+    StorylineParticipant,
+    StorylineType,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,7 +76,13 @@ CREATE TABLE IF NOT EXISTS candidates (
     -- so the SSEPricingManager can re-quote the BB on leg ticks without
     -- rebuilding the piped id from leg ids.
     virtual_selection TEXT,
-    FOREIGN KEY (news_item_id) REFERENCES news_items(id)
+    -- Cross-event storyline FK — set when CrossEventBuilder produced this
+    -- candidate from a StorylineItem (Golden Boot race, etc.). NULL for
+    -- single-event cards and per-fixture bet builders. Publisher swaps
+    -- the "Bet Builder" badge for "Weekend Storyline" when present.
+    storyline_id TEXT,
+    FOREIGN KEY (news_item_id) REFERENCES news_items(id),
+    FOREIGN KEY (storyline_id) REFERENCES storyline_items(id)
 );
 CREATE INDEX IF NOT EXISTS idx_candidates_created_at ON candidates(created_at);
 CREATE INDEX IF NOT EXISTS idx_candidates_hook_type ON candidates(hook_type);
@@ -87,6 +96,27 @@ CREATE TABLE IF NOT EXISTS ingest_cache (
     payload_json TEXT NOT NULL,
     PRIMARY KEY (fixture_id, cache_key)
 );
+
+-- Cross-event storyline items. Each row is one detected narrative that
+-- spans multiple fixtures in the same matchweek (Golden Boot race,
+-- relegation battle, Europe chase). Persisted additively so the admin
+-- table + debug endpoints can inspect what the scout found even if the
+-- downstream combo build failed. Candidates link back via
+-- `candidates.storyline_id`.
+CREATE TABLE IF NOT EXISTS storyline_items (
+    id TEXT PRIMARY KEY,
+    storyline_type TEXT NOT NULL,             -- StorylineType enum value
+    title TEXT,                               -- e.g. the authored headline
+    summary TEXT,                             -- detector's headline_hint / one-liner
+    participating_fixture_ids_json TEXT,      -- JSON array of Rogue event ids
+    participating_players_json TEXT,          -- JSON array of {player_name, team_name, fixture_id, extra}
+    generated_at REAL NOT NULL,
+    expires_at REAL,                          -- 0 / NULL = no expiry
+    status TEXT NOT NULL DEFAULT 'active'     -- 'active' | 'expired' | 'skipped'
+);
+CREATE INDEX IF NOT EXISTS idx_storyline_items_generated_at ON storyline_items(generated_at);
+CREATE INDEX IF NOT EXISTS idx_storyline_items_status ON storyline_items(status);
+CREATE INDEX IF NOT EXISTS idx_storyline_items_type ON storyline_items(storyline_type);
 
 -- Human labels on candidates for the learning loop. One row per review
 -- event (a card reviewed N times stores N rows so we can track flips).
@@ -115,10 +145,11 @@ class CandidateStore:
         async with aiosqlite.connect(self._db_path) as db:
             # Schema migrations — additive only, idempotent. The candidates
             # table grew over multiple PRs:
-            #   - PR #8 added total_odds + price_source
-            #   - PR #16 (this) adds virtual_selection
+            #   - PR #8  added total_odds + price_source
+            #   - PR #16 added virtual_selection
+            #   - PR #32 (this) adds storyline_id for cross-event combos
             # We use ALTER TABLE ADD COLUMN (preserves existing rows) when
-            # only the newest column is missing, and fall back to a
+            # only the newest columns are missing, and fall back to a
             # drop-and-recreate when the table predates total_odds.
             async with db.execute("PRAGMA table_info(candidates)") as cur:
                 cols = {row[1] for row in await cur.fetchall()}
@@ -131,13 +162,22 @@ class CandidateStore:
                     )
                     await db.execute("DROP TABLE candidates")
                     await db.commit()
-                # Mid (post-PR-#8, pre-PR-#16) schema: ALTER ADD COLUMN
-                elif "virtual_selection" not in cols:
-                    logger.info(
-                        "[CandidateStore] Migrating candidates: ADD COLUMN virtual_selection"
-                    )
-                    await db.execute("ALTER TABLE candidates ADD COLUMN virtual_selection TEXT")
-                    await db.commit()
+                else:
+                    # Run each additive ALTER independently — order matters
+                    # only for first-run installs, but every column is
+                    # idempotent on re-run.
+                    if "virtual_selection" not in cols:
+                        logger.info(
+                            "[CandidateStore] Migrating candidates: ADD COLUMN virtual_selection"
+                        )
+                        await db.execute("ALTER TABLE candidates ADD COLUMN virtual_selection TEXT")
+                        await db.commit()
+                    if "storyline_id" not in cols:
+                        logger.info(
+                            "[CandidateStore] Migrating candidates: ADD COLUMN storyline_id"
+                        )
+                        await db.execute("ALTER TABLE candidates ADD COLUMN storyline_id TEXT")
+                        await db.commit()
 
             # news_items migration: injury_details_json added 2026-04-23 for
             # position-aware INJURY routing. Additive ALTER; no data loss.
@@ -151,6 +191,7 @@ class CandidateStore:
                     "ALTER TABLE news_items ADD COLUMN injury_details_json TEXT"
                 )
                 await db.commit()
+
 
             await db.executescript(_SCHEMA)
             await db.commit()
@@ -198,8 +239,8 @@ class CandidateStore:
                     bet_type, game_id, market_ids_json, selection_ids_json,
                     score, threshold_passed, reason, status, narrative,
                     supporting_stats_json, total_odds, price_source,
-                    virtual_selection
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    virtual_selection, storyline_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -333,6 +374,84 @@ class CandidateStore:
                 rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    # ── Storyline items ──
+
+    async def store_storyline(
+        self,
+        storyline: StorylineItem,
+        *,
+        title: Optional[str] = None,
+        expires_at: Optional[float] = None,
+        status: str = "active",
+    ) -> None:
+        """Persist a detected cross-event storyline.
+
+        `title` overrides the headline_hint when provided (e.g. the
+        CombinedNarrativeAuthor's synthesised headline); otherwise we
+        fall back to the detector hint. Idempotent via INSERT OR REPLACE
+        on id.
+        """
+        fixture_ids = [p.fixture_id for p in storyline.participants if p.fixture_id]
+        players = [
+            {
+                "player_name": p.player_name,
+                "team_name": p.team_name,
+                "fixture_id": p.fixture_id,
+                "extra": p.extra,
+            }
+            for p in storyline.participants
+        ]
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO storyline_items (
+                    id, storyline_type, title, summary,
+                    participating_fixture_ids_json,
+                    participating_players_json,
+                    generated_at, expires_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    storyline.id,
+                    storyline.storyline_type.value,
+                    (title or storyline.headline_hint or "").strip(),
+                    storyline.headline_hint or "",
+                    json.dumps(fixture_ids),
+                    json.dumps(players),
+                    storyline.detected_at,
+                    expires_at,
+                    status,
+                ),
+            )
+            await db.commit()
+
+    async def get_storylines(
+        self,
+        *,
+        limit: int = 100,
+        status: Optional[str] = None,
+        storyline_type: Optional[str] = None,
+    ) -> list[StorylineItem]:
+        """Read back persisted storylines (newest first)."""
+        where: list[str] = []
+        args: list[Any] = []
+        if status:
+            where.append("status = ?")
+            args.append(status)
+        if storyline_type:
+            where.append("storyline_type = ?")
+            args.append(storyline_type)
+        sql = "SELECT * FROM storyline_items"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY generated_at DESC LIMIT ?"
+        args.append(limit)
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, args) as cur:
+                rows = await cur.fetchall()
+        return [_row_to_storyline(r) for r in rows]
+
     # ── Ingest cache ──
 
     async def get_cached_ingest(
@@ -439,6 +558,7 @@ def _candidate_to_row(c: CandidateCard) -> tuple:
         c.total_odds,
         c.price_source,
         c.virtual_selection,
+        c.storyline_id,
     )
 
 
@@ -469,6 +589,30 @@ def _row_to_candidate(row: aiosqlite.Row) -> CandidateCard:
         total_odds=_get("total_odds"),
         price_source=_get("price_source"),
         virtual_selection=_get("virtual_selection"),
+        storyline_id=_get("storyline_id"),
+    )
+
+
+def _row_to_storyline(row: aiosqlite.Row) -> StorylineItem:
+    raw_players = _safe_json_list(row["participating_players_json"])
+    participants: list[StorylineParticipant] = []
+    for p in raw_players:
+        if not isinstance(p, dict):
+            continue
+        participants.append(StorylineParticipant(
+            player_name=str(p.get("player_name") or ""),
+            team_name=str(p.get("team_name") or ""),
+            fixture_id=str(p.get("fixture_id") or ""),
+            extra=str(p.get("extra") or ""),
+        ))
+    return StorylineItem(
+        id=row["id"],
+        storyline_type=_safe_enum(
+            StorylineType, row["storyline_type"], StorylineType.GOLDEN_BOOT,
+        ),
+        headline_hint=row["summary"] or "",
+        participants=participants,
+        detected_at=row["generated_at"] or 0.0,
     )
 
 

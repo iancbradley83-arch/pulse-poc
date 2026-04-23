@@ -210,6 +210,11 @@ class Card(BaseModel):
     # SSE live-pricing — Rogue VirtualSelection id for BBs (re-fed into
     # /v1/betting/calculateBets when a leg ticks). None for singles/combos.
     virtual_selection: Optional[str] = None
+    # Cross-event storyline marker. Set when this card was produced from
+    # a persisted StorylineItem (Golden Boot race, etc.). Frontend swaps
+    # the "Bet Builder" / "Combo" label for "Weekend Storyline" when this
+    # is non-null.
+    storyline_id: Optional[str] = None
     # Suspension state — set true when the SSE feed reports the event or any
     # leg market suspends. Frontend grays the CTA.
     suspended: bool = False

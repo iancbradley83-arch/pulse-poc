@@ -170,3 +170,10 @@ class CandidateCard(BaseModel):
     # the SSEPricingManager can re-quote on leg ticks without rebuilding the
     # piped id from leg ids each time.
     virtual_selection: Optional[str] = None
+
+    # Cross-event storyline link. Set when this candidate was produced by
+    # CrossEventBuilder from a StorylineItem (Golden Boot race, relegation
+    # battle, etc.). Points at `storyline_items.id`. None for single-event
+    # cards and per-fixture bet builders. Publisher uses this to swap the
+    # "Bet Builder" badge for "Weekend Storyline" on the feed card.
+    storyline_id: Optional[str] = None

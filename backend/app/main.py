@@ -851,6 +851,10 @@ async def _run_candidate_engine(
             # so the headline on the CandidateCard is the storyline headline
             # (not the detector's hint). Needs legs resolved from catalog.
             from app.models.schemas import CardLeg as _CL
+            # Collect (candidate, storyline, final_title) triples so we can
+            # persist the storyline with the authored title — not the raw
+            # detector hint — alongside the candidate row it backs.
+            to_persist: list[tuple] = []
             for cand in storyline_candidates:
                 story = getattr(cand, "_storyline", None)
                 if story is None:
@@ -874,14 +878,17 @@ async def _run_candidate_engine(
                     storyline=story, legs=legs_for_copy,
                     total_odds=cand.total_odds,
                 )
+                final_title = story.headline_hint or ""
                 if written and written.get("headline"):
                     # Store the synthesised headline + angle in `narrative`
                     # joined by a separator the publisher will split on.
                     cand.narrative = f"{written['headline']}\n{written.get('angle', '')}"
+                    final_title = written["headline"]
                     logger.info(
                         "[PULSE] Storyline copy: %s | %s",
                         written["headline"], written.get("angle", "")[:80],
                     )
+                to_persist.append((cand, story, final_title))
                 # Strip the transient attribute before save
                 try:
                     delattr(cand, "_storyline")
@@ -889,10 +896,23 @@ async def _run_candidate_engine(
                     pass
 
             if storyline_candidates:
+                # Persist StorylineItems FIRST so the candidate rows' FK
+                # (storyline_id → storyline_items.id) resolves on save.
+                for _cand, _story, _title in to_persist:
+                    try:
+                        await candidate_store.store_storyline(
+                            _story, title=_title, status="active",
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[PULSE] store_storyline failed for %s: %s",
+                            _story.id, exc,
+                        )
                 await candidate_store.save_candidates(storyline_candidates)
                 logger.info(
-                    "[PULSE] Cross-event storyline combos emitted: %d",
-                    len(storyline_candidates),
+                    "[PULSE] Cross-event storyline combos emitted: %d "
+                    "(storylines persisted: %d)",
+                    len(storyline_candidates), len(to_persist),
                 )
             else:
                 logger.info("[PULSE] Cross-event storylines: 0 combos built this cycle")
@@ -1269,6 +1289,10 @@ async def _run_candidate_engine(
                 card.total_odds = None
             card.bet_type = "combo"
             card.virtual_selection = None
+            # Storyline marker drives the "Weekend Storyline" badge swap
+            # on the frontend. Only set on cross-event combos produced
+            # by CrossEventBuilder.
+            card.storyline_id = cand.storyline_id
         elif is_bb:
             card.legs = legs
             # Show the real correlated price when ComboBuilder fetched one

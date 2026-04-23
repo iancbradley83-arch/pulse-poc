@@ -32,11 +32,14 @@ from app.services.market_catalog import MarketCatalog
 logger = logging.getLogger(__name__)
 
 
-# Minimum / maximum legs in a cross-event combo. 3 is the floor for a
-# "story across games" to feel coherent; 5 is the ceiling past which
-# correlation + combo-bonus math get noisy.
-MIN_COMBO_LEGS = 3
-MAX_COMBO_LEGS = 5
+# Minimum / maximum legs in a cross-event combo. Leg count is driven by
+# narrative fit (how many chasers are actually playing this matchweek),
+# not a fixed constant — if 5 Golden Boot contenders are in action, emit
+# 5 legs; if only 2 are playing, emit 2. 2 is the floor for anything to
+# feel like a "combo" at all; 6 is the ceiling past which the odds get
+# absurd and the story dilutes.
+MIN_COMBO_LEGS = 2
+MAX_COMBO_LEGS = 6
 
 
 def _lower_name(name: str) -> str:
@@ -173,6 +176,12 @@ class CrossEventBuilder:
         # cross-event combos; renderer uses `legs` + `selection_ids`.
         primary_game_id = legs[0][0].game_id if legs else ""
 
+        # Mutate the storyline in place so `resolved_participants` (with
+        # fixture_ids populated) is what the caller persists to the
+        # storyline_items table. The original `storyline.participants` has
+        # empty fixture_ids since the detector only knows player + team.
+        storyline.participants = resolved_participants
+
         cand = CandidateCard(
             news_item_id=None,                       # no single news item owns this
             hook_type=HookType.OTHER,                # storyline-driven, not hook-driven
@@ -188,6 +197,7 @@ class CrossEventBuilder:
             total_odds=naive_total,
             price_source="naive",                    # overwritten by calculate_bets sweep
             virtual_selection=None,
+            storyline_id=storyline.id,               # FK to storyline_items row
         )
         logger.info(
             "CrossEventBuilder: emitted COMBO candidate %s with %d legs "
