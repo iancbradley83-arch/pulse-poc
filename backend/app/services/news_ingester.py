@@ -86,6 +86,27 @@ manager_quote, tactical, preview, article, other. Each news item is ONE hook.
 Used by downstream entity resolution. Include both short and full forms
 ("Saka", "Bukayo Saka", "Arsenal").
 
+**Injury details (for injury / team_news items only)** — when a player is
+OUT, SUSPENDED, DOUBTFUL, or has just RETURNED from injury, populate
+`injury_details` with one entry per named player. Fields:
+  - `player_name`: full name as it would appear on a team sheet
+  - `team`: which of the two fixture teams they play for
+  - `position_guess`: one of "striker", "winger", "attacking_mid",
+    "defensive_mid", "centre_back", "fullback", "goalkeeper",
+    "unknown". Guess from the story ("their striker X", "centre-back
+    Y torn his ACL"); when the story doesn't say and you can't infer
+    confidently from general knowledge, use "unknown". For midfielders
+    you MUST pick either "attacking_mid" (number 10, creative / box-to-
+    box / winger-ish) or "defensive_mid" (6, holder, destroyer). If
+    you truly can't tell from context or general knowledge, use
+    "unknown" — there is no generic "midfielder" bucket.
+  - `is_out_confirmed`: true for confirmed OUT / SUSPENDED / RULED OUT,
+    false for DOUBTFUL / ASSESSMENT / RETURN (i.e. the player might
+    still play).
+This field is only required when the hook names a specific player who
+is unavailable. For generic team news ("squad rotation expected") leave
+the list empty.
+
 **What to skip** — generic season-summary content, fixture previews with no
 new information, promotional "best bets" listicles, anything older than 48
 hours that isn't still breaking today.
@@ -143,6 +164,38 @@ def _submit_tool_schema() -> dict[str, Any]:
                                     "Concrete team / player / coach names mentioned. "
                                     "Used by entity resolution downstream."
                                 ),
+                            },
+                            "injury_details": {
+                                "type": "array",
+                                "description": (
+                                    "Only populate for injury / team_news items "
+                                    "that name a specific player who is out, "
+                                    "suspended, doubtful, or returning. Empty "
+                                    "list otherwise."
+                                ),
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "player_name": {"type": "string"},
+                                        "team": {"type": "string"},
+                                        "position_guess": {
+                                            "type": "string",
+                                            "enum": [
+                                                "striker", "winger",
+                                                "attacking_mid",
+                                                "defensive_mid",
+                                                "centre_back", "fullback",
+                                                "goalkeeper", "unknown",
+                                            ],
+                                        },
+                                        "is_out_confirmed": {"type": "boolean"},
+                                    },
+                                    "required": [
+                                        "player_name", "team",
+                                        "position_guess", "is_out_confirmed",
+                                    ],
+                                    "additionalProperties": False,
+                                },
                             },
                         },
                         "required": ["headline", "summary", "hook_type", "mentions"],
@@ -319,6 +372,26 @@ def _raw_to_news(row: dict[str, Any]) -> NewsItem:
     if not isinstance(mentions, list):
         mentions = []
 
+    injury_raw = row.get("injury_details") or []
+    injury_details: list[dict] = []
+    if isinstance(injury_raw, list):
+        for entry in injury_raw:
+            if not isinstance(entry, dict):
+                continue
+            pos = str(entry.get("position_guess") or "unknown").lower()
+            # Legacy compat: PR #33 v1 cached rows can still contain a bare
+            # "midfielder" bucket. That value is no longer part of the enum
+            # and no longer has a route, so fold it down to "unknown" and
+            # let the downstream router fall through.
+            if pos == "midfielder":
+                pos = "unknown"
+            injury_details.append({
+                "player_name": _clean_copy(entry.get("player_name")),
+                "team": _clean_copy(entry.get("team")),
+                "position_guess": pos,
+                "is_out_confirmed": bool(entry.get("is_out_confirmed")),
+            })
+
     return NewsItem(
         source="llm_web_search",
         source_url=str(row.get("source_url") or "").strip(),
@@ -328,4 +401,5 @@ def _raw_to_news(row: dict[str, Any]) -> NewsItem:
         hook_type=hook,
         published_at=str(row.get("published_at") or "").strip(),
         mentions=[_clean_copy(m) for m in mentions if _clean_copy(m)],
+        injury_details=injury_details,
     )

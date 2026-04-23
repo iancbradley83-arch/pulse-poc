@@ -92,6 +92,17 @@ class MockNewsIngester:
                 hook = HookType(story.get("hook_type", "other"))
             except ValueError:
                 hook = HookType.OTHER
+            injury_details: list[dict] = []
+            raw_inj = story.get("injury_details") or []
+            if isinstance(raw_inj, list):
+                for entry in raw_inj:
+                    if isinstance(entry, dict):
+                        injury_details.append({
+                            "player_name": str(entry.get("player_name") or ""),
+                            "team": str(entry.get("team") or ""),
+                            "position_guess": str(entry.get("position_guess") or "unknown").lower(),
+                            "is_out_confirmed": bool(entry.get("is_out_confirmed")),
+                        })
             items.append(NewsItem(
                 source="mock",
                 source_name=story.get("source_name", ""),
@@ -100,6 +111,7 @@ class MockNewsIngester:
                 summary=story.get("summary", ""),
                 hook_type=hook,
                 mentions=[str(m) for m in story.get("mentions", [])],
+                injury_details=injury_details,
             ))
 
         await self._store.save_news_items(items)
