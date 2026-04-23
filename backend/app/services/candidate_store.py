@@ -149,6 +149,19 @@ CREATE TABLE IF NOT EXISTS card_reactions (
 CREATE INDEX IF NOT EXISTS idx_reactions_card ON card_reactions(card_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_reactions_anon_card
     ON card_reactions(anon_id, card_id);
+
+-- Stage 5 CTA click-through tracking. One row per click (unlike reactions
+-- which upsert) — the same anon tapping the same card twice means two
+-- distinct deep-link opens, and we want to see the rate of that vs
+-- single-click abandonment. Additive migration.
+CREATE TABLE IF NOT EXISTS card_clicks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id TEXT NOT NULL,
+    anon_id TEXT,                  -- may be NULL for sendBeacon before cookie lands
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clicks_card ON card_clicks(card_id);
+CREATE INDEX IF NOT EXISTS idx_clicks_created ON card_clicks(created_at);
 """
 
 
@@ -566,6 +579,33 @@ class CandidateStore:
             ) as cur:
                 row = await cur.fetchone()
         return row[0] if row else None
+
+    # ── Card clicks (Stage 5 CTA deep-link) ──
+
+    async def save_click(
+        self, *, card_id: str, anon_id: "str | None",
+    ) -> None:
+        """Record a single CTA click. Multiple clicks per (card, anon) are
+        kept — each is one distinct deep-link open, useful for seeing
+        abandonment vs repeat-tap patterns."""
+        import time as _t
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO card_clicks (card_id, anon_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (card_id, anon_id or None, _t.time()),
+            )
+            await db.commit()
+
+    async def click_totals(self) -> dict[str, int]:
+        """Total clicks per card_id. Returned as {card_id: count} dict."""
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT card_id, COUNT(*) AS n FROM card_clicks GROUP BY card_id"
+            ) as cur:
+                rows = await cur.fetchall()
+        return {r["card_id"]: int(r["n"]) for r in rows}
 
     async def reaction_aggregates(self) -> list[dict[str, Any]]:
         """Aggregate reactions by (fixture, hook_type, bet_type, storyline).

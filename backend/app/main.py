@@ -72,6 +72,83 @@ from app.api.reactions import create_reactions_routes
 logger = logging.getLogger("pulse")
 DATA_DIR = Path(__file__).parent / "data"
 
+
+# ── Stage 5 deep-link helper ────────────────────────────────────────────
+# Build the operator's bet-slip URL from the env template appropriate for
+# the card's bet_type. Called at every `add_prematch_card` site so the
+# frontend just reads `card.deep_link`. When the kill switch
+# PULSE_DEEPLINK_ENABLED is false, returns None → CTA stays dead.
+def _build_deep_link(card: Card) -> "str | None":
+    from app.config import (
+        PULSE_DEEPLINK_ENABLED,
+        PULSE_DEEPLINK_TEMPLATE_SINGLE,
+        PULSE_DEEPLINK_TEMPLATE_BB,
+        PULSE_DEEPLINK_TEMPLATE_COMBO,
+    )
+    from urllib.parse import quote as _quote
+    if not PULSE_DEEPLINK_ENABLED:
+        return None
+    bet_type = (card.bet_type or "single").lower()
+    try:
+        if bet_type == "bet_builder":
+            # BBs prefer the virtual-selection id (0VS<piped>) because
+            # kmianko's iframe treats it atomically and restores the full
+            # leg stack. Fall back to the first selection_id when the
+            # candidate pre-dates PR #16 (virtual_selection column).
+            vs = card.virtual_selection or ""
+            if not vs:
+                ids = [l.selection_id for l in (card.legs or []) if l and l.selection_id]
+                if not ids:
+                    return None
+                vs = ids[0]
+            return PULSE_DEEPLINK_TEMPLATE_BB.format(
+                virtual_selection=_quote(vs, safe=""),
+                # Templates may or may not reference selection_ids — the
+                # format call tolerates extra keys.
+                selection_ids=_quote(",".join(
+                    [l.selection_id for l in (card.legs or []) if l and l.selection_id]
+                ), safe=","),
+            )
+        if bet_type == "combo":
+            # Cross-event combos: kmianko accepts one selectionId at load
+            # time, so we deep-link to the first leg and let the user add
+            # the rest manually. See config.py for the known-limitation
+            # note. When the operator ships server-minted `bscode` slip
+            # codes we'll swap this for a multi-leg template.
+            ids = [l.selection_id for l in (card.legs or []) if l and l.selection_id]
+            if not ids:
+                return None
+            return PULSE_DEEPLINK_TEMPLATE_COMBO.format(
+                selection_ids=_quote(ids[0], safe=""),
+                virtual_selection="",
+            )
+        # Singles: first selection on the card's market. Some assembled
+        # cards lose market.selections during the goalscorer trim; fall
+        # back to nothing in that case rather than link to an unrelated
+        # market.
+        sel_id = None
+        if card.market and card.market.selections:
+            sel_id = card.market.selections[0].selection_id
+        if not sel_id:
+            return None
+        return PULSE_DEEPLINK_TEMPLATE_SINGLE.format(
+            selection_ids=_quote(sel_id, safe=""),
+            virtual_selection="",
+        )
+    except Exception as exc:
+        # Never block a card from rendering over a format error. Log once;
+        # the CTA just falls back to dead.
+        logger.debug("[PULSE] deep_link build failed (%s) for card=%s", exc, card.id)
+        return None
+
+
+def _attach_deep_link(card: Card) -> Card:
+    """Populate card.deep_link in place (idempotent) and return the card.
+    Called from every add_prematch_card site. Safe to call twice."""
+    if card.deep_link is None:
+        card.deep_link = _build_deep_link(card)
+    return card
+
 # ── Initialize services ──
 catalog = MarketCatalog()
 feed = FeedManager()
@@ -87,6 +164,11 @@ simulator = GameSimulator(
     matcher=matcher, scorer=scorer, narrator=narrator,
     assembler=assembler,
 )
+
+# Stage 5 — deep-link CTA. Every card the live feed ingests gets a
+# pre-built operator URL stamped on it (see `_attach_deep_link` above).
+# Staging feeds created during reruns install the same decorator below.
+feed.set_decorator(_attach_deep_link)
 
 # ── Create app ──
 # Production hardening: Railway sets RAILWAY_ENVIRONMENT automatically.
@@ -509,6 +591,7 @@ async def _do_ondemand_rerun():
     t0 = time.time()
     try:
         staging = FeedManager()
+        staging.set_decorator(_attach_deep_link)
         await _load_rogue_prematch(target_feed=staging, is_rerun=True)
         new_cards = list(staging.prematch_cards)
         if not new_cards:
@@ -766,6 +849,7 @@ async def _scheduled_rerun_loop():
         # Build into a fresh staging FeedManager — atomic swap at end means
         # the visible feed never goes empty.
         staging = FeedManager()
+        staging.set_decorator(_attach_deep_link)
         try:
             await _load_rogue_prematch(target_feed=staging, is_rerun=True)
         except Exception as exc:
