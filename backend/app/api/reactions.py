@@ -126,13 +126,21 @@ def create_reactions_routes(
                 """
             ) as cur:
                 click_rows = await cur.fetchall()
+        orphan_clicks = 0
         for cr in click_rows:
             key = (cr["fixture"], cr["hook_type"], cr["bet_type"], cr["storyline"])
-            cohort_clicks[key] = int(cr["n"] or 0)
-        # Also count orphan clicks (featured BBs / any click on cards
-        # that never landed in the candidates table) so the summary
-        # bar isn't short a few entries.
-        orphan_clicks = sum(click_totals.values()) - sum(cohort_clicks.values())
+            n = int(cr["n"] or 0)
+            # The LEFT JOIN pulls NULL for every column when the click's
+            # card_id doesn't match any candidate row (featured BBs, which
+            # bypass the candidate store by design). Those collapse into
+            # one (None, None, None, None) GROUP BY bucket — route them
+            # to the orphan counter so they show in the summary bar
+            # instead of being silently attached to a ghost cohort that
+            # will never appear in `rows`.
+            if key == (None, None, None, None):
+                orphan_clicks += n
+            else:
+                cohort_clicks[key] = n
         for r in rows:
             key = (r.get("fixture"), r.get("hook_type"), r.get("bet_type"), r.get("storyline"))
             r["clicks"] = cohort_clicks.get(key, 0)
