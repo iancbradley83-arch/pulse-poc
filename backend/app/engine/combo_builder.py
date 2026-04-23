@@ -27,7 +27,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal, Optional
 
-from app.engine.candidate_builder import _match_player_selection
+from app.engine.candidate_builder import (
+    _affected_side_for_news,
+    _dominant_out_position,
+    _match_player_selection,
+)
 from app.models.news import BetType, CandidateCard, CandidateStatus, HookType, NewsItem
 from app.models.schemas import Game, Market, MarketSelection
 from app.services.market_catalog import MarketCatalog
@@ -62,14 +66,18 @@ ThemeLeg = tuple[str, str]
 # selection); legs beyond that are dropped. So order matters — put the most
 # narratively-aligned legs first.
 HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
-    # Injury to anyone on the affected side tends to dull the game. Back the
-    # opponent (DNB is safer than 1X2 and strictly dominates it; don't stack
-    # both), expect goals to dry up, fewer corners.
+    # Injury THEME — position-aware routing (2026-04-23). When the news
+    # carries injury_details with a known position, _injury_theme_for()
+    # rewrites this list into a position-specific stack (striker out =>
+    # unders + BTTS NO; defender out => overs + BTTS YES; etc). The entries
+    # below are the fallback used when position is unknown — deliberately
+    # removed DNB-opponent because backing a heavy fav with no edge was
+    # the exact 1-2/5 pathology. Default to under goals + no BTTS + fewer
+    # corners — a softer "injury dulls the game" read.
     HookType.INJURY: [
-        ("draw_no_bet", "opponent"),
         ("over_under",  "under"),
-        ("corners_ou",  "under"),
         ("btts",        "btts_no"),
+        ("corners_ou",  "under"),
     ],
     # Team news (return from suspension, fit XI, etc.) — lean into the
     # affected side attacking better. Goalscorer-by-mentioned-player is
@@ -119,6 +127,75 @@ HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
 # Cap how many legs end up in any one BB. More legs => Rogue rejects more
 # combos as uncorrelated. 3 is the sweet spot from prior PRs.
 MAX_BB_LEGS = 3
+
+
+# Position-aware INJURY theme. Mirrors _INJURY_ROUTES in candidate_builder
+# but expressed as ComboBuilder ThemeLegs so we reuse the existing leg
+# resolver. Each list has at least 3 candidates so the MAX_BB_LEGS cap
+# leaves room to fall through if one market is missing.
+_INJURY_POSITION_THEMES: dict[str, list[ThemeLeg]] = {
+    # Attacker out on affected side => game dries up.
+    "striker": [
+        ("over_under", "under"),
+        ("btts",       "btts_no"),
+        ("corners_ou", "under"),
+    ],
+    "winger": [
+        ("over_under", "under"),
+        ("btts",       "btts_no"),
+        ("corners_ou", "under"),
+    ],
+    "attacking_mid": [
+        ("over_under", "under"),
+        ("btts",       "btts_no"),
+        ("corners_ou", "under"),
+    ],
+    # Defender out => goals should open up both ways.
+    "centre_back": [
+        ("over_under", "over"),
+        ("btts",       "btts_yes"),
+        ("corners_ou", "over"),
+    ],
+    "fullback": [
+        ("over_under", "over"),
+        ("btts",       "btts_yes"),
+        ("corners_ou", "over"),
+    ],
+    "goalkeeper": [
+        ("over_under", "over"),
+        ("btts",       "btts_yes"),
+        ("cards_ou",   "over"),
+    ],
+    # Defensive mid => chaos signals; game opens up.
+    "defensive_mid": [
+        ("corners_ou", "over"),
+        ("cards_ou",   "over"),
+        ("over_under", "over"),
+    ],
+}
+
+
+def _injury_theme_for(news: NewsItem, game: Game) -> Optional[list[ThemeLeg]]:
+    """If `news` is an INJURY item with actionable position data, return a
+    position-aware theme list. Else None — caller uses HOOK_THEMES[INJURY]."""
+    if news.hook_type != HookType.INJURY:
+        return None
+    side = _affected_side_for_news(news, game)
+    if side is None:
+        return None
+    affected_team_name = (
+        game.home_team.name if side == "home" else game.away_team.name
+    )
+    pos = _dominant_out_position(news.injury_details, affected_team_name)
+    if pos is None:
+        return None
+    theme = _INJURY_POSITION_THEMES.get(pos)
+    if theme:
+        logger.info(
+            "ComboBuilder: INJURY theme position=%s (game=%s, news=%s)",
+            pos, game.id, news.id,
+        )
+    return theme
 
 
 def _affected_side(
@@ -281,7 +358,14 @@ class ComboBuilder:
 
     async def build(self, news: NewsItem, game: Game) -> Optional[CandidateCard]:
         """Build a Bet Builder candidate from a news item + its resolved fixture."""
-        theme = HOOK_THEMES.get(news.hook_type)
+        # Position-aware INJURY theme overrides HOOK_THEMES[INJURY] when the
+        # news carries structured injury_details (2026-04-23). Falls through
+        # to the generic INJURY theme otherwise.
+        position_theme = _injury_theme_for(news, game)
+        if position_theme is not None:
+            theme = position_theme
+        else:
+            theme = HOOK_THEMES.get(news.hook_type)
         if theme is None:
             return None
         affected = _affected_side(news, game)

@@ -692,6 +692,32 @@ async def _scheduled_rerun_loop():
         )
 
 
+def _label_contains_excluded_player(label: str, excluded: set) -> bool:
+    """True if the goalscorer selection label names a player in `excluded`.
+
+    `excluded` is a set of normalized (lowercase, de-accented) player names
+    provided by the publisher. Uses the same tokenization as the player-match
+    path so "Lejeune" in the exclusion set catches "Jaime Lejeune" selections.
+    """
+    if not excluded:
+        return False
+    from app.engine.candidate_builder import _name_tokens
+    sel_tokens = set(_name_tokens(label or ""))
+    if not sel_tokens:
+        return False
+    for excl_name in excluded:
+        excl_tokens = set(_name_tokens(excl_name))
+        if not excl_tokens:
+            continue
+        # Require the excluded name's LAST token (usually surname) to appear
+        # in the selection's tokens — avoids "Jaime" matching "Jaime Lejeune"
+        # when the excluded player is "Jaime Rodriguez".
+        excl_last = list(_name_tokens(excl_name))[-1] if _name_tokens(excl_name) else None
+        if excl_last and excl_last in sel_tokens:
+            return True
+    return False
+
+
 async def _run_candidate_engine(
     games_by_id: dict[str, Game],
     *,
@@ -742,7 +768,9 @@ async def _run_candidate_engine(
         logger.info("[PULSE] Candidate engine using mock news (no ANTHROPIC_API_KEY)")
 
     resolver = NewsEntityResolver(games_by_id)
-    builder = CandidateBuilder(catalog)
+    # Pass games to CandidateBuilder so INJURY routing can look up the
+    # affected side and do position-aware market selection (2026-04-23).
+    builder = CandidateBuilder(catalog, games_by_id)
     scorer = NewsScorer()
     policy = PolicyLayer(publish_threshold=PULSE_PUBLISH_THRESHOLD)
     # Bet Builder generator — only active when we have a Rogue client.
@@ -819,6 +847,45 @@ async def _run_candidate_engine(
         market = catalog.get(market_id) if market_id else None
         if market is None:
             continue
+        news = await candidate_store.get_news_item(cand.news_item_id) if cand.news_item_id else None
+
+        # Build the exclusion set for Goalscorer trims (2026-04-23).
+        # ANY news item for this fixture that flags a player as out /
+        # suspended contributes to the exclusion list. We gather across
+        # fixture-scoped news (not just the current candidate's) because
+        # card 9 on 2026-04-23 ("Lejeune watching from the stands" +
+        # Lejeune @ 5.20 goalscorer) fired when the goalscorer story
+        # and the injury story had different news_item_ids.
+        excluded_player_names: set = set()
+        is_goalscorer_market = (market.market_type == "goalscorer")
+        has_goalscorer_leg = any(
+            (catalog.get(mid) and catalog.get(mid).market_type == "goalscorer")
+            for mid in cand.market_ids
+        )
+        if is_goalscorer_market or has_goalscorer_leg:
+            from app.engine.candidate_builder import _normalize_name as _norm_name
+            fixture_news: list = []
+            if news is not None:
+                fixture_news.append(news)
+            # Pull every other news item resolved to this fixture. Small N
+            # per fixture (per-fixture cap means ~3 candidates).
+            for other in published:
+                if other.game_id != cand.game_id or other.news_item_id == cand.news_item_id:
+                    continue
+                if other.news_item_id:
+                    other_news = await candidate_store.get_news_item(other.news_item_id)
+                    if other_news is not None:
+                        fixture_news.append(other_news)
+            for n in fixture_news:
+                for d in (n.injury_details or []):
+                    if not isinstance(d, dict):
+                        continue
+                    if not d.get("is_out_confirmed"):
+                        continue
+                    pname = _norm_name(str(d.get("player_name") or ""))
+                    if pname:
+                        excluded_player_names.add(pname)
+
         # Render-time goalscorer trim. Catalogue keeps every player so the
         # engine can match by name; the publisher narrows to either the
         # matched player (when CandidateBuilder hinted via selection_ids)
@@ -831,13 +898,20 @@ async def _run_candidate_engine(
                 if matched is not None:
                     market = market.model_copy(update={"selections": [matched]})
             else:
-                market = market.model_copy(update={"selections": list(market.selections[:GOALSCORER_DEFAULT_TOP_N])})
-        news = await candidate_store.get_news_item(cand.news_item_id) if cand.news_item_id else None
+                from app.engine.candidate_builder import _normalize_name as _norm_name
+                # Filter out any selection whose label matches an excluded
+                # (out / suspended) player before taking the top-N.
+                filtered = [
+                    s for s in market.selections
+                    if not _label_contains_excluded_player(s.label, excluded_player_names)
+                ]
+                market = market.model_copy(update={"selections": list(filtered[:GOALSCORER_DEFAULT_TOP_N])})
 
         # Resolve leg markets for Bet Builder candidates.
         is_bb = cand.bet_type == _BetType.BET_BUILDER and len(cand.selection_ids) >= 2
         legs: list[_CardLeg] = []
         total_odds: "float | None" = None
+        bb_excluded = False
         if is_bb:
             for mid, sid in zip(cand.market_ids, cand.selection_ids):
                 leg_market = catalog.get(mid)
@@ -846,6 +920,21 @@ async def _run_candidate_engine(
                 leg_sel = next((s for s in leg_market.selections if s.selection_id == sid), None)
                 if leg_sel is None:
                     continue
+                # Exclude BBs whose Goalscorer leg resolves to an
+                # out/suspended player (catches the PR #20 carry-through
+                # where a Lejeune-injury news item and a Lejeune-scorer
+                # BB shipped together).
+                if (
+                    leg_market.market_type == "goalscorer"
+                    and _label_contains_excluded_player(leg_sel.label, excluded_player_names)
+                ):
+                    logger.info(
+                        "[PULSE] BB rejected — goalscorer leg player %r is on "
+                        "the out/suspended list for game %s",
+                        leg_sel.label, cand.game_id,
+                    )
+                    bb_excluded = True
+                    break
                 try:
                     leg_odds = float(leg_sel.odds)
                 except Exception:
@@ -856,6 +945,19 @@ async def _run_candidate_engine(
                     odds=leg_odds,
                     selection_id=sid,
                 ))
+            if bb_excluded:
+                # BB carried an out-player goalscorer leg — drop the card
+                # entirely. Better to publish nothing than a self-contradicting
+                # pick. Persist the rejection for the admin table.
+                cand.status = _CandidateStatus.REJECTED
+                cand.threshold_passed = False
+                cand.reason = (cand.reason + " | gate: goalscorer leg is excluded player").strip(" |")
+                gated_updates.append(cand)
+                gate_rejected += 1
+                gate_reject_reasons["excluded_goalscorer_player"] = (
+                    gate_reject_reasons.get("excluded_goalscorer_player", 0) + 1
+                )
+                continue
             if legs:
                 # Prefer the price ComboBuilder stored on the candidate (real
                 # correlated BB price from Kmianko, or naive product as a
@@ -900,6 +1002,24 @@ async def _run_candidate_engine(
         # they hit the public feed. Rejected candidates stay in the store
         # with status=rejected + reason so the /admin table can surface
         # them for tuning.
+        # For the self-consistency gate we need the primary selection (the
+        # one whose outcome_type the card ultimately backs). Singles: first
+        # selection on the trimmed market. BBs: first leg whose selection
+        # resolves on the primary market (legs[0] is market_result-ish when
+        # present because of theme ordering).
+        primary_selection = None
+        if not is_bb and market.selections:
+            primary_selection = market.selections[0]
+        elif is_bb and legs:
+            # Resolve first leg's selection back to the catalogue so we
+            # have outcome_type (CardLeg doesn't carry it).
+            first_leg = legs[0]
+            leg_market = catalog.get(cand.market_ids[0]) if cand.market_ids else None
+            if leg_market is not None:
+                primary_selection = next(
+                    (s for s in leg_market.selections if s.selection_id == first_leg.selection_id),
+                    None,
+                )
         passes, gate_reason = _apply_gates(
             cand,
             headline=final_headline or "",
@@ -907,6 +1027,7 @@ async def _run_candidate_engine(
             game=game,
             legs=legs if is_bb else None,
             total_odds=total_odds if is_bb else None,
+            primary_selection=primary_selection,
         )
         if not passes:
             gate_rejected += 1

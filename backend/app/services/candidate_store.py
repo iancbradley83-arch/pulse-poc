@@ -38,7 +38,11 @@ CREATE TABLE IF NOT EXISTS news_items (
     ingested_at REAL,
     mentions_json TEXT,
     fixture_ids_json TEXT,
-    team_ids_json TEXT
+    team_ids_json TEXT,
+    -- Optional structured position data for INJURY / TEAM_NEWS items.
+    -- JSON-encoded list[dict] — see NewsItem.injury_details for the shape.
+    -- Added 2026-04-23 for position-aware INJURY routing.
+    injury_details_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_news_ingested_at ON news_items(ingested_at);
 
@@ -134,6 +138,20 @@ class CandidateStore:
                     )
                     await db.execute("ALTER TABLE candidates ADD COLUMN virtual_selection TEXT")
                     await db.commit()
+
+            # news_items migration: injury_details_json added 2026-04-23 for
+            # position-aware INJURY routing. Additive ALTER; no data loss.
+            async with db.execute("PRAGMA table_info(news_items)") as cur:
+                news_cols = {row[1] for row in await cur.fetchall()}
+            if news_cols and "injury_details_json" not in news_cols:
+                logger.info(
+                    "[CandidateStore] Migrating news_items: ADD COLUMN injury_details_json"
+                )
+                await db.execute(
+                    "ALTER TABLE news_items ADD COLUMN injury_details_json TEXT"
+                )
+                await db.commit()
+
             await db.executescript(_SCHEMA)
             await db.commit()
 
@@ -149,8 +167,9 @@ class CandidateStore:
                 INSERT OR REPLACE INTO news_items (
                     id, source, source_url, source_name, headline, summary,
                     hook_type, published_at, ingested_at,
-                    mentions_json, fixture_ids_json, team_ids_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mentions_json, fixture_ids_json, team_ids_json,
+                    injury_details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -371,10 +390,18 @@ def _news_to_row(item: NewsItem) -> tuple:
         json.dumps(item.mentions),
         json.dumps(item.fixture_ids),
         json.dumps(item.team_ids),
+        json.dumps(item.injury_details),
     )
 
 
 def _row_to_news(row: aiosqlite.Row) -> NewsItem:
+    # Guarded read — injury_details_json was added 2026-04-23 and may not
+    # exist in an in-flight migration window.
+    def _get(col, default=None):
+        try:
+            return row[col]
+        except (IndexError, KeyError):
+            return default
     return NewsItem(
         id=row["id"],
         source=row["source"] or "",
@@ -388,6 +415,7 @@ def _row_to_news(row: aiosqlite.Row) -> NewsItem:
         mentions=_safe_json_list(row["mentions_json"]),
         fixture_ids=_safe_json_list(row["fixture_ids_json"]),
         team_ids=_safe_json_list(row["team_ids_json"]),
+        injury_details=_safe_json_list(_get("injury_details_json")),
     )
 
 

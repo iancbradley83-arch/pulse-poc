@@ -31,6 +31,33 @@ from app.models.news import (
 )
 from app.models.schemas import CardLeg, Game, MarketSelection
 
+
+# Words that, when adjacent to a team name, indicate the narrative is
+# framing that team as WEAK / IN CRISIS / GUTTED. Used by the
+# self-consistency gate (2026-04-23) to reject cards whose pick backs a
+# team the headline describes as collapsing.
+_NEGATIVE_FRAMING_WORDS = [
+    "crumble", "crumbles", "crumbling",
+    "collapse", "collapses", "collapsing",
+    "exposed", "exposing",
+    "gutted", "gutting",
+    "torn apart", "ripped apart",
+    "acl", "torn acl",
+    "crisis", "in crisis",
+    "destroyed", "destroying",
+    "battered", "battering",
+    "decimated",
+    "leaking", "leaky",
+    "meltdown",
+    # Player-absence phrasing that still frames the team as weakened
+    "gutted without",
+    "suspended", "suspension",
+    "ruled out",
+    "sidelined",
+    "injury crisis",
+    "defensive crisis",
+]
+
 logger = logging.getLogger(__name__)
 
 # ── Heuristic thresholds (tunable via admin review once we have labels) ──
@@ -145,6 +172,96 @@ def check_bet_builder(
     return None
 
 
+def _backed_team_name(
+    primary_selection: Optional[MarketSelection],
+    legs: Optional[list[CardLeg]],
+    game: Game,
+) -> Optional[str]:
+    """Return the name of the team the card's PRIMARY pick backs, or None
+    if the selection isn't a home/away pick (Over/Under, BTTS, etc.).
+
+    For BBs, the "primary" is the first leg whose outcome_type is home/away —
+    that's the market-result-flavoured leg which fails self-consistency
+    loudest. (An Over 2.5 leg alongside a 1X2 pick is fine on its own, but
+    if the 1X2 backs the collapsing team, the card is broken.)
+    """
+    candidates: list[Optional[str]] = []
+    if primary_selection is not None:
+        candidates.append((primary_selection.outcome_type or "").lower())
+    if legs:
+        for leg in legs:
+            # CardLeg doesn't carry outcome_type directly — the label is the
+            # only hint. We fall back to team-name presence in the leg label
+            # below if the selection isn't reachable.
+            lbl = (leg.label or "").lower()
+            # Home-named label
+            if game.home_team.name and game.home_team.name.lower() == lbl.strip():
+                candidates.append("home")
+            elif game.away_team.name and game.away_team.name.lower() == lbl.strip():
+                candidates.append("away")
+    for outcome in candidates:
+        if outcome == "home":
+            return game.home_team.name
+        if outcome == "away":
+            return game.away_team.name
+    return None
+
+
+def check_self_consistency(
+    headline: str,
+    angle: str,
+    game: Game,
+    primary_selection: Optional[MarketSelection],
+    legs: Optional[list[CardLeg]] = None,
+) -> Optional[str]:
+    """Reject cards whose narrative SUBJECT is the same team the pick backs.
+
+    Pathology this blocks (from 2026-04-23 live review):
+      - Headline: "Oviedo's defence collapsing"
+      - Pick:     DNB -> Oviedo
+    The pick contradicts the story — we'd be backing the team the story
+    says is broken. Deterministic check: if the backed team's name appears
+    in the copy adjacent to a negative-framing word, fail.
+
+    Fail-closed. Leaves a TODO below for an LLM-based check that can catch
+    subtler contradictions this regex misses.
+    """
+    # TODO: stage an LLM-based self-consistency check once we have a budget
+    # for per-candidate calls. The regex catches the loudest mismatches but
+    # misses paraphrases ("shorn of their backline", "without their spine").
+    backed = _backed_team_name(primary_selection, legs, game)
+    if not backed:
+        return None
+    blob = f"{headline or ''} || {angle or ''}".lower()
+    backed_low = backed.lower()
+    if backed_low not in blob:
+        return None
+    # Check whether the backed team appears adjacent to a negative-framing
+    # word. "Adjacent" window kept small (25 chars) to avoid flagging
+    # cases where the negative framing belongs to the OTHER team
+    # ("Madrid in crisis, Oviedo pounce"). Fail-closed bias still favors
+    # rejecting ambiguous wording.
+    WINDOW = 25
+    for word in _NEGATIVE_FRAMING_WORDS:
+        if word not in blob:
+            continue
+        # find all occurrences of the team name
+        start = 0
+        while True:
+            idx = blob.find(backed_low, start)
+            if idx == -1:
+                break
+            window_start = max(0, idx - WINDOW)
+            window_end = min(len(blob), idx + len(backed_low) + WINDOW)
+            if word in blob[window_start:window_end]:
+                return (
+                    f"self-consistency: pick backs {backed} but narrative "
+                    f"frames {backed} as {word!r}"
+                )
+            start = idx + len(backed_low)
+    return None
+
+
 def check_fixture_attribution(
     headline: str,
     angle: str,
@@ -176,6 +293,7 @@ def apply_gates(
     game: Optional[Game],
     legs: Optional[list[CardLeg]] = None,
     total_odds: Optional[float] = None,
+    primary_selection: Optional[MarketSelection] = None,
 ) -> tuple[bool, Optional[str]]:
     """Evaluate all gates. Returns (passes, reason).
 
@@ -202,6 +320,15 @@ def apply_gates(
     # Fixture attribution (guards against generic rewrites)
     if game is not None:
         reason = check_fixture_attribution(headline, angle, game)
+        if reason:
+            return False, reason
+
+    # Self-consistency (added 2026-04-23) — don't let a card back team X
+    # while the headline describes team X as collapsing / gutted / in crisis.
+    if game is not None:
+        reason = check_self_consistency(
+            headline, angle, game, primary_selection, legs,
+        )
         if reason:
             return False, reason
 
