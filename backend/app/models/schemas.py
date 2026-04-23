@@ -224,3 +224,10 @@ class Card(BaseModel):
     # field). None => CTA renders dead (e.g. cross-event combo on an operator
     # whose slip URL can't encode multi-event selections).
     deep_link: Optional[str] = None
+    # Stage 5b — server-minted bscode. 6-char code from kmianko's
+    # share-betslip endpoint; when present, `deep_link` is the bscode
+    # variant which restores the full slip (single / BB / combo) verbatim.
+    # None when the minter is disabled, selection_ids is empty, or the
+    # mint call failed — in that case `deep_link` falls back to the PR #36
+    # selectionId URL. Exposed so admin tooling can inspect.
+    bscode: Optional[str] = None

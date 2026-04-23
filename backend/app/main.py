@@ -55,6 +55,7 @@ from app.services.sse_pricing import SSEPricingManager
 from app.services.candidate_store import CandidateStore
 from app.services.mock_news_ingester import MockNewsIngester
 from app.services.candidate_engine import CandidateEngine
+from app.services.kmianko_slip_minter import KmiankoSlipMinter
 from app.engine.event_detector import EventDetector
 from app.engine.entity_resolver import EntityResolver
 from app.engine.market_matcher import MarketMatcher
@@ -84,10 +85,25 @@ def _build_deep_link(card: Card) -> "str | None":
         PULSE_DEEPLINK_TEMPLATE_SINGLE,
         PULSE_DEEPLINK_TEMPLATE_BB,
         PULSE_DEEPLINK_TEMPLATE_COMBO,
+        PULSE_DEEPLINK_TEMPLATE_BSCODE,
+        PULSE_OPERATOR_WRAPPER_URL,
     )
     from urllib.parse import quote as _quote
     if not PULSE_DEEPLINK_ENABLED:
         return None
+    # Stage 5b: when we have a server-minted bscode, every bet type uses
+    # the same wrapper URL — kmianko restores the full slip from the code
+    # alone. Fall through to the PR #36 selectionId URLs when bscode is
+    # missing (minter disabled / mint failed / no selection_ids).
+    if card.bscode:
+        try:
+            return PULSE_DEEPLINK_TEMPLATE_BSCODE.format(
+                wrapper=PULSE_OPERATOR_WRAPPER_URL,
+                bscode=_quote(card.bscode, safe=""),
+            )
+        except Exception as exc:
+            logger.debug("[PULSE] bscode deep_link build failed (%s) for card=%s", exc, card.id)
+            # fall through to PR #36 URL
     bet_type = (card.bet_type or "single").lower()
     try:
         if bet_type == "bet_builder":
@@ -148,6 +164,75 @@ def _attach_deep_link(card: Card) -> Card:
     if card.deep_link is None:
         card.deep_link = _build_deep_link(card)
     return card
+
+
+# ── Stage 5b — kmianko bscode minter ────────────────────────────────────
+# Shared async instance. Tokens + minted codes cached in-memory; a
+# semaphore caps concurrency so a 30-fixture publish burst doesn't hammer
+# Kmianko. Kill switch: PULSE_KMIANKO_BSCODE_ENABLED=false.
+from app.config import (
+    PULSE_KMIANKO_BSCODE_ENABLED,
+    PULSE_KMIANKO_BASE_URL,
+    PULSE_KMIANKO_SPBKV3_PATH,
+)
+
+kmianko_slip_minter = KmiankoSlipMinter(
+    base_url=PULSE_KMIANKO_BASE_URL,
+    spbkv3_path=PULSE_KMIANKO_SPBKV3_PATH,
+)
+
+
+def _selections_for_mint(card: Card) -> list[str]:
+    """Build the payload list for Kmianko's /share-betslip body.
+
+    - BetBuilder: one element — the piped `0VS<leg>|<leg>|…` virtual
+      selection id. Kmianko treats that atomically and restores the full
+      BB slip. Falls back to individual leg ids when virtual_selection
+      is missing (pre-PR-#16 cards, or featured BBs without a vid).
+    - Combo / cross-event: every leg selection id as a separate element.
+    - Single: the one selection id from `market.selections[0]`.
+    """
+    bet_type = (card.bet_type or "single").lower()
+    if bet_type == "bet_builder":
+        if card.virtual_selection:
+            return [card.virtual_selection]
+        return [l.selection_id for l in (card.legs or []) if l and l.selection_id]
+    if bet_type == "combo":
+        return [l.selection_id for l in (card.legs or []) if l and l.selection_id]
+    # single
+    if card.market and card.market.selections:
+        sid = card.market.selections[0].selection_id
+        if sid:
+            return [sid]
+    return []
+
+
+async def _mint_and_stamp(card: Card) -> None:
+    """Mint a bscode for this card's selections and stamp it on the Card
+    + its deep_link. Safe to call multiple times; cached server-side.
+
+    Failures are swallowed — when `card.bscode` stays None, the decorator
+    falls back to PR #36's selectionId deep-link. Publishing must never
+    block on a mint failure (principle: operator URL is best-effort).
+    """
+    if not PULSE_KMIANKO_BSCODE_ENABLED:
+        return
+    if card.bscode:
+        return
+    sel_ids = _selections_for_mint(card)
+    if not sel_ids:
+        return
+    try:
+        code = await kmianko_slip_minter.mint(sel_ids)
+    except Exception as exc:
+        logger.warning("[PULSE] kmianko mint raised (ignored): %s", exc)
+        return
+    if code:
+        card.bscode = code
+        # Force rebuild so bscode variant wins over any prior selectionId URL.
+        card.deep_link = None
+        _attach_deep_link(card)
+
 
 # ── Initialize services ──
 catalog = MarketCatalog()
@@ -751,6 +836,9 @@ async def _load_rogue_prematch(
         # day and we still need cards on the feed).
         if os.getenv("PULSE_BASELINE_FALLBACK", "false").lower() == "true":
             cards = build_prematch_cards(games, catalog, assembler)
+            # Mint bscodes before publishing so the feed decorator sees them.
+            for card in cards:
+                await _mint_and_stamp(card)
             for card in cards:
                 target_feed.add_prematch_card(card)
             logger.info("[PULSE] Baseline pre-match cards added: %d (PULSE_BASELINE_FALLBACK=true)", len(cards))
@@ -789,6 +877,11 @@ async def _load_rogue_prematch(
                 featured_cards = await fetch_and_build_featured_bb_cards(
                     client, simulator._games, max_count=featured_max,
                 )
+                # Mint bscodes for featured BBs so the CTA restores the
+                # full slip (piped 0VS virtual selection). Mint failures
+                # leave card.bscode=None → selectionId fallback.
+                for c in featured_cards:
+                    await _mint_and_stamp(c)
                 for c in featured_cards:
                     target_feed.add_prematch_card(c)
                 logger.info(
@@ -1149,6 +1242,7 @@ async def _run_candidate_engine(
     gate_rejected = 0
     gate_reject_reasons: dict[str, int] = {}
     gated_updates: list = []
+    bscode_updates: list = []  # candidates that got a fresh bscode this cycle
     for cand in published:
         game = games_by_id.get(cand.game_id)
         # Cross-event combos use game_id as a "primary fixture" pointer only;
@@ -1488,6 +1582,19 @@ async def _run_candidate_engine(
                 card.total_odds = None
             card.bet_type = "bet_builder"
             card.virtual_selection = cand.virtual_selection
+        # Stage 5b — reuse a previously-minted bscode if the candidate
+        # already carries one (we persist it to the store so reruns don't
+        # re-mint), otherwise mint fresh. Both code paths end with
+        # card.bscode set (or None → selectionId fallback).
+        if cand.bscode:
+            card.bscode = cand.bscode
+            card.deep_link = None  # force rebuild to the bscode URL
+            _attach_deep_link(card)
+        else:
+            await _mint_and_stamp(card)
+            if card.bscode:
+                cand.bscode = card.bscode
+                bscode_updates.append(cand)
         target_feed.add_prematch_card(card)
 
     if rewriter is not None:
@@ -1499,6 +1606,18 @@ async def _run_candidate_engine(
         await candidate_store.save_candidates(gated_updates)
         logger.info("[PULSE] Quality gates rejected %d candidates — reasons: %s",
                     gate_rejected, gate_reject_reasons)
+    if bscode_updates:
+        # Persist freshly-minted bscodes so the next rerun reads them from
+        # the store instead of re-minting (mint is idempotent per
+        # selection-set, but avoiding the POST is cheaper and politer to
+        # Kmianko). INSERT OR REPLACE upserts — safe to rewrite same rows.
+        try:
+            await candidate_store.save_candidates(bscode_updates)
+            logger.info("[PULSE] Persisted %d freshly-minted bscodes", len(bscode_updates))
+        except Exception as exc:
+            # Persistence is best-effort — a failed save just means we
+            # re-mint next cycle.
+            logger.warning("[PULSE] Failed to persist bscodes: %s", exc)
 
 
 async def _load_mock_prematch():
