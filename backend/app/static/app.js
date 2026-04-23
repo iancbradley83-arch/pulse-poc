@@ -396,6 +396,11 @@ const PULSE = (() => {
     feed.setAttribute('aria-busy', 'false');
     endEl.hidden = false;
 
+    // Inject 👎/👍 public reaction buttons on every card. The module
+    // self-disables if the /api/cards/{id}/reactions endpoint 404s
+    // (PULSE_REACTIONS_ENABLED=false kill switch on the server).
+    if (window.PulseReactions) window.PulseReactions.wireAll(feed);
+
     // Wire engagement buttons
     feed.querySelectorAll('.engagement button').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -612,6 +617,8 @@ const PULSE = (() => {
       const newArticle = fresh.firstElementChild;
       if (newArticle) {
         article.replaceWith(newArticle);
+        // Re-inject the reactions widget on the replaced card.
+        if (window.PulseReactions) window.PulseReactions.injectInto(newArticle);
         // Brief flash so the user notices the price changed.
         newArticle.classList.add('price-updated');
         setTimeout(() => newArticle.classList.remove('price-updated'), 1500);

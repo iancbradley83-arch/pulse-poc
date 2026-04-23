@@ -67,6 +67,7 @@ from app.engine.combo_builder import ComboBuilder
 from app.engine.news_scorer import NewsScorer, PolicyLayer
 from app.api.routes import create_routes
 from app.api.admin import create_admin_routes
+from app.api.reactions import create_reactions_routes
 
 logger = logging.getLogger("pulse")
 DATA_DIR = Path(__file__).parent / "data"
@@ -195,6 +196,93 @@ class SecurityHeadersMiddleware:
 
 app.add_middleware(SecurityHeadersMiddleware)
 
+
+class AnonCookieMiddleware:
+    """Ensure every HTTP response carries a stable `pulse_anon_id` cookie.
+
+    First-party, HttpOnly, Secure, SameSite=Lax, 1-year expiry. Generated
+    server-side via `secrets.token_urlsafe(16)` on first visit. Used by
+    the public reactions router to key thumbs-up/down per viewer without
+    any login or fingerprinting. Pure ASGI for the same reason the
+    SecurityHeadersMiddleware is — avoids the BaseHTTPMiddleware anyio
+    bridge latency hit under SSE load.
+    """
+
+    _COOKIE_NAME = "pulse_anon_id"
+    _MAX_AGE = 365 * 24 * 60 * 60  # 1 year in seconds
+
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    def _parse_cookie(raw: bytes, name: str) -> "str | None":
+        if not raw:
+            return None
+        for part in raw.decode("latin-1").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v or None
+        return None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Pull the existing cookie (if any) from request headers.
+        existing: "str | None" = None
+        for name, value in scope.get("headers", []):
+            if name == b"cookie":
+                existing = self._parse_cookie(value, self._COOKIE_NAME)
+                break
+
+        # If missing, mint one now and inject into request scope so downstream
+        # handlers (e.g. /api/cards/{id}/react) see it on the SAME request —
+        # not just on the next round-trip.
+        new_id: "str | None" = None
+        if not existing:
+            import secrets as _secrets
+            new_id = _secrets.token_urlsafe(16)
+            headers = list(scope.get("headers", []))
+            # Remove any existing (malformed) Cookie header, then append ours.
+            headers = [(n, v) for n, v in headers if n != b"cookie"]
+            cookie_val = f"{self._COOKIE_NAME}={new_id}".encode("latin-1")
+            # If there were other cookies we stripped, lose them — this path
+            # only runs when the header was missing or didn't contain our
+            # cookie. Keep Starlette's Cookie dependency happy by preserving
+            # other cookies we may have dropped above.
+            for n, v in scope.get("headers", []):
+                if n == b"cookie":
+                    # rebuild: original cookies + our new one
+                    combined = v + b"; " + cookie_val
+                    headers.append((b"cookie", combined))
+                    break
+            else:
+                headers.append((b"cookie", cookie_val))
+            scope = dict(scope)
+            scope["headers"] = headers
+
+        set_cookie_value: "bytes | None" = None
+        if new_id:
+            # Secure flag on in prod (HTTPS guaranteed behind Railway edge).
+            # In local dev we drop Secure so the cookie sticks over http.
+            secure_attr = "; Secure" if _IS_PROD else ""
+            set_cookie_value = (
+                f"{self._COOKIE_NAME}={new_id}; "
+                f"Max-Age={self._MAX_AGE}; Path=/; HttpOnly{secure_attr}; SameSite=Lax"
+            ).encode("latin-1")
+
+        async def send_wrapper(message):
+            if set_cookie_value is not None and message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                headers.append((b"set-cookie", set_cookie_value))
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.add_middleware(AnonCookieMiddleware)
+
 # Rate limiting: per-IP defaults applied to every route. slowapi uses
 # request.client.host as the key — behind Railway's edge that's the
 # proxy IP, so effective per-client limiting requires a custom key_func
@@ -225,6 +313,8 @@ router = create_routes(catalog, feed, simulator)
 app.include_router(router)
 admin_router = create_admin_routes(candidate_store, catalog, simulator)
 app.include_router(admin_router)
+reactions_router = create_reactions_routes(candidate_store, feed, limiter)
+app.include_router(reactions_router)
 
 # ── Static files ──
 STATIC_DIR = Path(__file__).parent / "static"
@@ -364,6 +454,13 @@ async def generate_prematch_cards():
       - "rogue": real pre-match soccer fixtures pulled from the Rogue API.
     """
     global _rerun_task, _sse_rogue_client, _sse_manager
+    # Ensure the SQLite schema is in place before any request path touches
+    # it. The reactions endpoints can be hit before `_run_candidate_engine`
+    # (which also calls init) runs — and in mock mode it never runs at all.
+    try:
+        await candidate_store.init()
+    except Exception as exc:
+        logger.exception("[PULSE] candidate_store.init failed at startup: %s", exc)
     if PULSE_DATA_SOURCE == "rogue":
         await _load_rogue_prematch()
         # Kick off the periodic rerun loop AFTER initial load completes.
