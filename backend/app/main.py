@@ -789,13 +789,142 @@ async def _run_candidate_engine(
     )
     logger.info("[PULSE] Candidate engine counts: %s", counts)
 
+    # ── Cross-event storyline combos (spike, replaces Stage 3d) ──
+    # Runs ONCE per cycle after the per-fixture news engine. Asks the LLM to
+    # detect a storyline pattern across the upcoming matchweek (Golden Boot
+    # race in v1), binds named players to real fixtures + goalscorer legs,
+    # emits BetType.COMBO candidates with populated selection_ids. Pricing
+    # happens in the same post-engine calculate_bets sweep below.
+    if (
+        rogue_client is not None
+        and ANTHROPIC_API_KEY
+        and os.getenv("PULSE_STORYLINE_COMBOS_ENABLED", "true").lower() == "true"
+    ):
+        try:
+            from anthropic import AsyncAnthropic as _AsyncAnth
+            from app.engine.storyline_detector import StorylineDetector
+            from app.engine.cross_event_builder import CrossEventBuilder
+            from app.engine.combined_narrative_author import CombinedNarrativeAuthor
+            from app.models.news import (
+                CandidateStatus as _CStatus,
+                StorylineType as _SType,
+            )
+            _anth = _AsyncAnth(api_key=ANTHROPIC_API_KEY)
+            detector = StorylineDetector(_anth, model=os.getenv("PULSE_STORYLINE_MODEL", "claude-sonnet-4-6"))
+            xbuilder = CrossEventBuilder(catalog)
+            author = CombinedNarrativeAuthor(_anth, model=os.getenv("PULSE_STORYLINE_MODEL", "claude-sonnet-4-6"))
+
+            try:
+                story_cap = int(os.getenv("PULSE_STORYLINE_COMBOS_MAX", "3"))
+            except ValueError:
+                story_cap = 3
+
+            storyline_candidates: list = []
+            for st in (_SType.GOLDEN_BOOT,):   # v1: only one type wired
+                if len(storyline_candidates) >= story_cap:
+                    break
+                try:
+                    stories = await detector.detect(st, games_by_id)
+                except Exception as exc:
+                    logger.warning("[PULSE] StorylineDetector %s errored: %s", st.value, exc)
+                    stories = []
+                for story in stories:
+                    if len(storyline_candidates) >= story_cap:
+                        break
+                    cand = xbuilder.build(story, games_by_id)
+                    if cand is None:
+                        continue
+                    # Storyline combos are hand-curated patterns — they skip
+                    # the news scorer + policy layer. Mark them published so
+                    # the render loop picks them up.
+                    cand.score = 0.85
+                    cand.reason = f"cross-event storyline: {story.storyline_type.value}"
+                    cand.threshold_passed = True
+                    cand.status = _CStatus.PUBLISHED
+                    # Stash the storyline in-memory via the candidate's
+                    # narrative field for the author step below; author will
+                    # overwrite with fresh headline + angle.
+                    cand._storyline = story  # type: ignore[attr-defined] — transient
+                    storyline_candidates.append(cand)
+
+            # Author synthesised copy for each storyline combo BEFORE save,
+            # so the headline on the CandidateCard is the storyline headline
+            # (not the detector's hint). Needs legs resolved from catalog.
+            from app.models.schemas import CardLeg as _CL
+            # Collect (candidate, storyline, final_title) triples so we can
+            # persist the storyline with the authored title — not the raw
+            # detector hint — alongside the candidate row it backs.
+            to_persist: list[tuple] = []
+            for cand in storyline_candidates:
+                story = getattr(cand, "_storyline", None)
+                if story is None:
+                    continue
+                legs_for_copy: list = []
+                for mid, sid in zip(cand.market_ids, cand.selection_ids):
+                    m = catalog.get(mid)
+                    if m is None:
+                        continue
+                    sel = next((s for s in m.selections if s.selection_id == sid), None)
+                    if sel is None:
+                        continue
+                    try:
+                        o = float(sel.odds)
+                    except Exception:
+                        o = 0.0
+                    legs_for_copy.append(_CL(
+                        label=sel.label, market_label=m.label, odds=o, selection_id=sid,
+                    ))
+                written = await author.author(
+                    storyline=story, legs=legs_for_copy,
+                    total_odds=cand.total_odds,
+                )
+                final_title = story.headline_hint or ""
+                if written and written.get("headline"):
+                    # Store the synthesised headline + angle in `narrative`
+                    # joined by a separator the publisher will split on.
+                    cand.narrative = f"{written['headline']}\n{written.get('angle', '')}"
+                    final_title = written["headline"]
+                    logger.info(
+                        "[PULSE] Storyline copy: %s | %s",
+                        written["headline"], written.get("angle", "")[:80],
+                    )
+                to_persist.append((cand, story, final_title))
+                # Strip the transient attribute before save
+                try:
+                    delattr(cand, "_storyline")
+                except Exception:
+                    pass
+
+            if storyline_candidates:
+                # Persist StorylineItems FIRST so the candidate rows' FK
+                # (storyline_id → storyline_items.id) resolves on save.
+                for _cand, _story, _title in to_persist:
+                    try:
+                        await candidate_store.store_storyline(
+                            _story, title=_title, status="active",
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[PULSE] store_storyline failed for %s: %s",
+                            _story.id, exc,
+                        )
+                await candidate_store.save_candidates(storyline_candidates)
+                logger.info(
+                    "[PULSE] Cross-event storyline combos emitted: %d "
+                    "(storylines persisted: %d)",
+                    len(storyline_candidates), len(to_persist),
+                )
+            else:
+                logger.info("[PULSE] Cross-event storylines: 0 combos built this cycle")
+        except Exception as exc:
+            logger.exception("[PULSE] Cross-event storyline step failed: %s", exc)
+
     # Cross-event combo pricing — when (in a future stage) the engine starts
     # emitting BetType.COMBO candidates, fetch the operator-boosted price via
-    # Rogue's calculate_bets endpoint. Today this is a no-op because nothing
-    # produces COMBO candidates yet; the wiring is here so Stage 3d
-    # ("Goalscorers of the Day" cross-event accumulators) gets real prices
-    # the moment it ships. Combo math = `Bets[Type=='Combo'].TrueOdds`, which
-    # already includes the operator's `ComboBonus.Percent` boost.
+    # Rogue's calculate_bets endpoint. The storyline combos above produce
+    # exactly these; this sweep stamps real prices on them. Combo math =
+    # `Bets[Type=='Combo'].TrueOdds`, which already includes the operator's
+    # `ComboBonus.Percent` boost.
     if rogue_client is not None:
         from app.models.news import BetType as _BTypeForCombo
         all_pending = await candidate_store.list_candidates(limit=500)
@@ -841,11 +970,16 @@ async def _run_candidate_engine(
     gated_updates: list = []
     for cand in published:
         game = games_by_id.get(cand.game_id)
-        if game is None:
+        # Cross-event combos use game_id as a "primary fixture" pointer only;
+        # if it happens to be missing from the current catalogue we still
+        # want to render the card from its legs. For singles / BBs the game
+        # is required.
+        is_cross_event_combo = (cand.bet_type == _BetType.COMBO and len(cand.selection_ids) >= 2)
+        if game is None and not is_cross_event_combo:
             continue
         market_id = cand.market_ids[0] if cand.market_ids else None
         market = catalog.get(market_id) if market_id else None
-        if market is None:
+        if market is None and not is_cross_event_combo:
             continue
         news = await candidate_store.get_news_item(cand.news_item_id) if cand.news_item_id else None
 
@@ -891,7 +1025,7 @@ async def _run_candidate_engine(
         # matched player (when CandidateBuilder hinted via selection_ids)
         # or the top-N favourites. Skip for BB legs — those resolve via
         # selection_ids per leg below.
-        if cand.bet_type == _BetType.SINGLE and market.market_type == "goalscorer":
+        if cand.bet_type == _BetType.SINGLE and market is not None and market.market_type == "goalscorer":
             wanted_sid = cand.selection_ids[0] if cand.selection_ids else None
             if wanted_sid:
                 matched = next((s for s in market.selections if s.selection_id == wanted_sid), None)
@@ -907,8 +1041,11 @@ async def _run_candidate_engine(
                 ]
                 market = market.model_copy(update={"selections": list(filtered[:GOALSCORER_DEFAULT_TOP_N])})
 
-        # Resolve leg markets for Bet Builder candidates.
+        # Resolve leg markets for Bet Builder AND cross-event combo candidates.
+        # Both carry `selection_ids` + `market_ids` per leg; only difference is
+        # how the frontend badges them (bet_type = "bet_builder" vs "combo").
         is_bb = cand.bet_type == _BetType.BET_BUILDER and len(cand.selection_ids) >= 2
+        is_combo = cand.bet_type == _BetType.COMBO and len(cand.selection_ids) >= 2
         legs: list[_CardLeg] = []
         total_odds: "float | None" = None
         bb_excluded = False
@@ -918,10 +1055,10 @@ async def _run_candidate_engine(
         # we can't find a non-excluded player in the top 3, the market
         # itself is probably a bad fit. PR #33 feedback point 3 (2026-04-23).
         _MAX_SCORER_SUBS = 3
-        if is_bb:
+        if is_bb or is_combo:
             # Mutable copy so we can rewrite the selection id when we swap
-            # a Goalscorer leg's player. Downstream persistence + pricing
-            # reads back from this list via candidate/card state.
+            # a Goalscorer leg's player (BB path only). Cross-event combos
+            # iterate without substitution.
             cand_selection_ids = list(cand.selection_ids)
             cand_market_ids = list(cand.market_ids)
             for leg_idx, (mid, sid) in enumerate(zip(cand_market_ids, cand_selection_ids)):
@@ -940,7 +1077,8 @@ async def _run_candidate_engine(
                 # player who isn't on the exclusion list. Cap at
                 # _MAX_SCORER_SUBS substitutions before dropping the BB.
                 if (
-                    leg_market.market_type == "goalscorer"
+                    is_bb
+                    and leg_market.market_type == "goalscorer"
                     and _label_contains_excluded_player(leg_sel.label, excluded_player_names)
                 ):
                     substitute = None
@@ -1028,9 +1166,17 @@ async def _run_candidate_engine(
 
         # Journalist voice pass — replace the scout's raw headline + summary
         # with card-ready copy. Falls back to scout output on failure.
-        final_headline = news.headline if news else (cand.narrative or "")
-        final_angle = news.summary if news else (cand.narrative or "")
-        if rewriter is not None and news is not None:
+        # Cross-event storyline combos skip the rewriter entirely — their
+        # narrative was authored fresh by CombinedNarrativeAuthor upstream
+        # and lives in cand.narrative as "headline\nangle".
+        if is_cross_event_combo:
+            parts = (cand.narrative or "").split("\n", 1)
+            final_headline = parts[0].strip() if parts else (cand.narrative or "")
+            final_angle = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            final_headline = news.headline if news else (cand.narrative or "")
+            final_angle = news.summary if news else (cand.narrative or "")
+        if rewriter is not None and news is not None and not is_cross_event_combo:
             # Pass total_odds to the rewriter ONLY when we have a real price
             # from Rogue's calculate_bets (rogue_calculate_bets) or — for
             # back-compat with anything still in the candidate store — the
@@ -1053,34 +1199,38 @@ async def _run_candidate_engine(
         # Quality gate — fail-closed rules that drop bad candidates before
         # they hit the public feed. Rejected candidates stay in the store
         # with status=rejected + reason so the /admin table can surface
-        # them for tuning.
-        # For the self-consistency gate we need the primary selection (the
-        # one whose outcome_type the card ultimately backs). Singles: first
-        # selection on the trimmed market. BBs: first leg whose selection
-        # resolves on the primary market (legs[0] is market_result-ish when
-        # present because of theme ordering).
-        primary_selection = None
-        if not is_bb and market.selections:
-            primary_selection = market.selections[0]
-        elif is_bb and legs:
-            # Resolve first leg's selection back to the catalogue so we
-            # have outcome_type (CardLeg doesn't carry it).
-            first_leg = legs[0]
-            leg_market = catalog.get(cand.market_ids[0]) if cand.market_ids else None
-            if leg_market is not None:
-                primary_selection = next(
-                    (s for s in leg_market.selections if s.selection_id == first_leg.selection_id),
-                    None,
-                )
-        passes, gate_reason = _apply_gates(
-            cand,
-            headline=final_headline or "",
-            angle=final_angle or "",
-            game=game,
-            legs=legs if is_bb else None,
-            total_odds=total_odds if is_bb else None,
-            primary_selection=primary_selection,
-        )
+        # them for tuning. Cross-event combos skip the gate: the
+        # fixture-attribution check assumes one fixture per card, and the
+        # storyline author's output has already been prompt-constrained
+        # (no "back the X" / "lock" etc).
+        if is_cross_event_combo:
+            passes, gate_reason = True, None
+        else:
+            # For the self-consistency gate we need the primary selection
+            # (the one whose outcome_type the card ultimately backs).
+            # Singles: first selection on the trimmed market. BBs: first
+            # leg whose selection resolves on the primary market (legs[0]
+            # is market_result-ish when present because of theme ordering).
+            primary_selection = None
+            if not is_bb and market.selections:
+                primary_selection = market.selections[0]
+            elif is_bb and legs:
+                first_leg = legs[0]
+                leg_market = catalog.get(cand.market_ids[0]) if cand.market_ids else None
+                if leg_market is not None:
+                    primary_selection = next(
+                        (s for s in leg_market.selections if s.selection_id == first_leg.selection_id),
+                        None,
+                    )
+            passes, gate_reason = _apply_gates(
+                cand,
+                headline=final_headline or "",
+                angle=final_angle or "",
+                game=game,
+                legs=legs if is_bb else None,
+                total_odds=total_odds if is_bb else None,
+                primary_selection=primary_selection,
+            )
         if not passes:
             gate_rejected += 1
             gate_reject_reasons[gate_reason or "unknown"] = gate_reject_reasons.get(gate_reason or "unknown", 0) + 1
@@ -1096,8 +1246,30 @@ async def _run_candidate_engine(
             "tactical": BadgeType.TRENDING, "preview": BadgeType.TRENDING,
             "article": BadgeType.NEWS,
         }.get(cand.hook_type.value, BadgeType.TRENDING)
+        if is_cross_event_combo:
+            badge = BadgeType.TRENDING
+        # Ensure we have representative game + market args for the assembler.
+        # For cross-event combos, both are nominal (renderer uses `legs`), so
+        # fall through to the first leg's fixture/market if the candidate's
+        # own game_id / market_id didn't resolve.
+        assembler_game = game
+        assembler_market = market
+        if is_cross_event_combo and legs:
+            first_leg_sid = legs[0].selection_id
+            for mid in cand.market_ids:
+                m_for_leg = catalog.get(mid)
+                if m_for_leg is None:
+                    continue
+                if any(s.selection_id == first_leg_sid for s in m_for_leg.selections):
+                    assembler_market = assembler_market or m_for_leg
+                    assembler_game = assembler_game or games_by_id.get(m_for_leg.game_id)
+                    break
+        if assembler_game is None or assembler_market is None:
+            # Shouldn't happen, but don't crash the whole publish loop if it does.
+            logger.warning("[PULSE] publish: could not resolve game/market for cand=%s, skipping", cand.id)
+            continue
         card = assembler.assemble_prematch(
-            game=game, market=market, narrative=final_angle or "",
+            game=assembler_game, market=assembler_market, narrative=final_angle or "",
             badge=badge, relevance=cand.score, stats=[], tweets=[],
         )
         card.hook_type = cand.hook_type.value
@@ -1106,7 +1278,22 @@ async def _run_candidate_engine(
         ingested = news.ingested_at if news else cand.created_at
         if ingested:
             card.ago_minutes = max(0, int((_time.time() - ingested) / 60))
-        if is_bb:
+        if is_combo:
+            card.legs = legs
+            # Combo total from calculate_bets (Bets[Type='Combo'].TrueOdds).
+            # Naive products are fine to show for cross-event combos (no
+            # correlation to worry about) but keep gated behind price_source.
+            if cand.price_source == "rogue_calculate_bets":
+                card.total_odds = total_odds
+            else:
+                card.total_odds = None
+            card.bet_type = "combo"
+            card.virtual_selection = None
+            # Storyline marker drives the "Weekend Storyline" badge swap
+            # on the frontend. Only set on cross-event combos produced
+            # by CrossEventBuilder.
+            card.storyline_id = cand.storyline_id
+        elif is_bb:
             card.legs = legs
             # Show the real correlated price when ComboBuilder fetched one
             # via Rogue calculate_bets. Hide it when we only have the naive
