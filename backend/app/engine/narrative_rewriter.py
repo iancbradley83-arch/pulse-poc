@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from anthropic import AsyncAnthropic
 
+from app.engine._price_scrub import strip_prices
 from app.models.news import CandidateCard, NewsItem
 from app.models.schemas import CardLeg, Game, Market
 
@@ -89,19 +90,30 @@ FORBIDDEN PHRASES (never use — automatic fail)
     "back the X", "we like the X", "go with X", "smart money on X",
     "lock", "banker", "free pick", "this one's calling", "good value here"
 
+PRICE / ODDS RULE — HARD BAN
+  Do NOT include any numeric odds, multipliers, or price references in the
+  headline or angle. Describe the story and the markets in WORDS only. The
+  UI renders every leg's price separately and re-quotes live; embedding a
+  number in your copy makes the text drift against the displayed price.
+  Never write:
+    "at N.NN", "pays N.NN", "odds of N.NN", "stacks at N.NN",
+    "stacked at N.NN", "priced at N.NN", "N.NN decimal", "N-to-N",
+    "@ N.NN", "— N.NN", "in total pays N.NN"
+  DO keep real-world numerics unrelated to price: goal counts ("14 goals
+  this season"), scorelines ("2-1 loss"), streaks ("four wins in five"),
+  thresholds ("3+ goals", "Over 2.5"), minutes ("85th minute"), league
+  positions ("17th").
+
 BET BUILDER MODE
 
 When the input includes a `legs` block, the card is a multi-leg Bet Builder.
 Treat all legs as one package and write an angle that justifies the STACK,
-not any individual leg. If a `total_odds` line is present in the input, that
-is the operator's real correlated BB price and you MAY quote it (e.g. "all
-of it pays 6.36"). When `total_odds` is absent, do NOT invent or estimate
-one — say something like "stacked in the slip". Individual leg odds are
-fine to reference if one sharpens the line. Keep to the same 25-word
-ceiling.
+not any individual leg. Describe the markets in WORDS — do not quote the
+stack's price or any individual leg's price. The UI shows every price
+separately; the narrative is there to frame the story, not re-state the
+odds. Keep to the same 25-word ceiling.
 
-  BB RAW → {injury to Palmer, legs=[Brighton win 2.50, Under 2.5 Goals 1.98,
-           BTTS No 2.10]}
+  BB RAW → {injury to Palmer, legs=[Brighton win, Under 2.5 Goals, BTTS No]}
   REWRITE →
     headline: Palmer out — Brighton tighten the grip on the whole evening
     angle: No creativity, no goals; Brighton + Under + BTTS No turns the whole
@@ -115,17 +127,16 @@ specific player is the angle". The headline MUST contain the player's name
 (or their surname). Generic headlines that omit the player name are wrong.
 
   PLAYER BB RAW → {team_news, lead_player: "Frenkie de Jong",
-                   legs=[Goalscorer · Frenkie de Jong @ 5.50,
-                         FT 1X2 · Barcelona @ 1.45,
-                         Total Goals O/U · Over 2.5 @ 1.80]}
+                   legs=[Goalscorer · Frenkie de Jong,
+                         FT 1X2 · Barcelona,
+                         Total Goals O/U · Over 2.5]}
   REWRITE →
     headline: De Jong returns — Barcelona's engine room fires up
     angle: De Jong back from suspension; Barcelona to win + Over 2.5 + the man
     himself to find the net.
 
   PLAYER BB RAW → {transfer, lead_player: "Cole Palmer",
-                   legs=[Goalscorer · Cole Palmer @ 2.40,
-                         FT 1X2 · Chelsea @ 1.85]}
+                   legs=[Goalscorer · Cole Palmer, FT 1X2 · Chelsea]}
   REWRITE →
     headline: Palmer leads the line — Chelsea ride him to the win
     angle: New role, same edge; Palmer to score and Chelsea to win, stacked
@@ -293,8 +304,8 @@ class NarrativeRewriter:
         for block in resp.content:
             if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "submit_rewrite":
                 inp = block.input if isinstance(block.input, dict) else {}
-                headline = _clean(inp.get("headline"))
-                angle = _clean(inp.get("angle"))
+                headline = strip_prices(_clean(inp.get("headline")))
+                angle = strip_prices(_clean(inp.get("angle")))
                 if headline:
                     return {"headline": headline, "angle": angle}
         return None

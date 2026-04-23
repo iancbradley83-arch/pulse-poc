@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from anthropic import AsyncAnthropic
 
+from app.engine._price_scrub import strip_prices
 from app.models.news import HookType, NewsItem
 from app.services.candidate_store import CandidateStore
 
@@ -128,6 +129,16 @@ quoted passages — strip those out when paraphrasing. If you cannot write the
 line without using such markup, drop the item entirely. Do not include
 `<cite>`, `<ref>`, `<sup>`, square-bracket citation numbers, or any other
 tracking syntax in your output.
+
+**PRICE / ODDS RULE — HARD BAN** — do NOT include any numeric odds,
+multipliers, or price references in the `headline` or `summary`. Describe
+the story and the markets in WORDS only. Never write: "at N.NN", "pays
+N.NN", "odds of N.NN", "stacks at N.NN", "stacked at N.NN", "@ N.NN",
+"— N.NN", "in total pays N.NN", "N.NN decimal", "N-to-N". The downstream
+UI re-quotes live prices and embedded numbers drift against the display.
+Keep non-price numerics (goal counts, league positions, scorelines,
+streaks, thresholds like "Over 2.5" or "3+ goals") — those sharpen the
+line and will survive the scrub.
 
 You are writing editorial copy that will be displayed as the hero headline
 on a card. Punchy matters more than complete."""
@@ -396,8 +407,8 @@ def _raw_to_news(row: dict[str, Any]) -> NewsItem:
         source="llm_web_search",
         source_url=str(row.get("source_url") or "").strip(),
         source_name=_clean_copy(row.get("source_name")),
-        headline=_clean_copy(row.get("headline")),
-        summary=_clean_copy(row.get("summary")),
+        headline=strip_prices(_clean_copy(row.get("headline"))),
+        summary=strip_prices(_clean_copy(row.get("summary"))),
         hook_type=hook,
         published_at=str(row.get("published_at") or "").strip(),
         mentions=[_clean_copy(m) for m in mentions if _clean_copy(m)],

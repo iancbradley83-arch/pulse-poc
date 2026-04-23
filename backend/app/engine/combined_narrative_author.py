@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from anthropic import AsyncAnthropic
 
+from app.engine._price_scrub import strip_prices
 from app.models.news import StorylineItem
 from app.models.schemas import CardLeg
 
@@ -56,10 +57,16 @@ HEADLINE (6-10 words, hard ceiling)
 ANGLE (ONE sentence, <= 25 words)
   - Connect the fixtures under one storyline
   - Reference the stakes or the shared pattern
-  - If total_odds is provided and > 1.0, you MAY reference it naturally
-    ("stacked at 18.40", "all three at 22.5")
   - Do NOT say "back", "pick", "lock", "free bet"
   - Do NOT say "per sources", "it was announced", "could potentially"
+
+PRICE / ODDS RULE — HARD BAN
+  Do NOT include any numeric odds, multipliers, or price references in
+  the headline or angle. Describe the story and the markets in WORDS
+  only. Never write: "at N.NN", "pays N.NN", "odds of N.NN", "stacks at
+  N.NN", "stacked at N.NN", "@ N.NN", "— N.NN", "in total pays N.NN",
+  "N.NN decimal", "N-to-N". Keep non-price numerics (goal counts, league
+  positions, scorelines, streaks) — those sharpen the line.
 
 CALIBRATION EXAMPLES
 
@@ -67,19 +74,17 @@ CALIBRATION EXAMPLES
          participants=[Haaland / Man City / 23 goals,
                        Watkins / Aston Villa / 19 goals,
                        Isak / Newcastle / 18 goals]
-         total_odds=18.40
   OUTPUT:
     headline: Golden Boot weekend — three strikers, one race
     angle: Haaland clear, Watkins and Isak three back with games in hand;
-    all three find the net at 18.40.
+    all three to find the net on the same weekend.
 
   INPUT: type=relegation
          participants=[Luton / 17th, Burnley / 18th, Sheff Utd / 20th]
-         total_odds=6.75
   OUTPUT:
     headline: Three at the bottom, all playing for survival
-    angle: Luton, Burnley and the Blades are one bad afternoon from
-    gone — their opponents to win at 6.75 says the wave breaks on them.
+    angle: Luton, Burnley and the Blades are one bad afternoon from gone
+    — their opponents to win says the wave breaks on them.
 
 OUTPUT
   Call `submit_storyline_copy` exactly once with { headline, angle }.
@@ -158,8 +163,8 @@ class CombinedNarrativeAuthor:
         for block in resp.content:
             if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "submit_storyline_copy":
                 inp = block.input if isinstance(block.input, dict) else {}
-                headline = _clean(inp.get("headline"))
-                angle = _clean(inp.get("angle"))
+                headline = strip_prices(_clean(inp.get("headline")))
+                angle = strip_prices(_clean(inp.get("angle")))
                 if headline:
                     return {"headline": headline, "angle": angle}
         return None
