@@ -94,6 +94,45 @@ class NewsItem(BaseModel):
     injury_details: list[dict] = Field(default_factory=list)
 
 
+class StorylineType(str, Enum):
+    """Cross-event narrative patterns — the "story across multiple fixtures".
+
+    Only GOLDEN_BOOT is wired in v1. The others are reserved for incremental
+    PRs so the enum can stay stable across database migrations.
+    """
+    GOLDEN_BOOT = "golden_boot"              # top-scorer race (anytime-scorer legs)
+    RELEGATION = "relegation"                # bottom-of-table sides all playing
+    EUROPE_CHASE = "europe_chase"            # 4th/5th/Europa spot fight
+    MANAGER_PRESSURE = "manager_pressure"    # 2-3 managers one loss from sack
+    DEBUT_RETURN = "debut_return"            # newly-signed / returning stars
+
+
+class StorylineParticipant(BaseModel):
+    """One "actor" inside a storyline — a player or a team that has a leg
+    in the eventual cross-event combo.
+
+    For GOLDEN_BOOT: `player_name` is the striker's name used to match the
+    anytime-goalscorer selection in that fixture's Goalscorer market.
+    For RELEGATION / EUROPE_CHASE: `team_name` anchors the leg and
+    `player_name` is left empty.
+    """
+    player_name: str = ""                    # "Erling Haaland"
+    team_name: str = ""                      # "Manchester City"
+    fixture_id: str = ""                     # Rogue event id (resolved downstream)
+    extra: str = ""                          # "23 goals", "19th in the table" — free text
+
+
+class StorylineItem(BaseModel):
+    """A detected cross-event pattern. In-memory only for v1 — not
+    persisted. Consumed by CrossEventBuilder within a single engine cycle.
+    """
+    id: str = Field(default_factory=lambda: f"story_{uuid.uuid4().hex[:10]}")
+    storyline_type: StorylineType
+    headline_hint: str = ""                  # one-line summary the detector produced
+    participants: list[StorylineParticipant] = Field(default_factory=list)
+    detected_at: float = Field(default_factory=time.time)
+
+
 class CandidateCard(BaseModel):
     id: str = Field(default_factory=lambda: f"cand_{uuid.uuid4().hex[:12]}")
     created_at: float = Field(default_factory=time.time)
