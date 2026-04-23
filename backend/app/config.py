@@ -111,3 +111,39 @@ PULSE_DEEPLINK_TEMPLATE_COMBO = os.getenv(
     # Cross-event combo / storyline: first leg only (see caveat above).
     "https://www.apuestatotal.com/apuestas-deportivas?fpath=%2Fes-pe%2Fspbkv3%3FselectionId%3D{selection_ids}",
 )
+
+# ── Stage 5b — server-minted bscode deep links ─────────────────────────
+# PR #36's `?selectionId=...` URL only restores one leg; the operator's
+# actual mechanism is a 6-char `bscode` minted server-side via kmianko's
+# share-betslip endpoint, which restores the full BB / combo / single
+# slip verbatim. We fetch anonymous JWTs from the spbkv3 HTML (no login),
+# POST the selection list to /api/betslip/betslip/share-betslip, and
+# swap the deep-link URL shape to carry the returned code inside fpath.
+#
+# Kill-switch: set PULSE_KMIANKO_BSCODE_ENABLED=false to revert to the
+# PR #36 selectionId URLs without a redeploy. Mint failures always fall
+# back to the selectionId URL too.
+PULSE_KMIANKO_BSCODE_ENABLED = os.getenv(
+    "PULSE_KMIANKO_BSCODE_ENABLED", "true",
+).lower() == "true"
+PULSE_KMIANKO_BASE_URL = os.getenv(
+    "PULSE_KMIANKO_BASE_URL", "https://prod20392.kmianko.com",
+)
+PULSE_KMIANKO_SPBKV3_PATH = os.getenv(
+    "PULSE_KMIANKO_SPBKV3_PATH", "/es-pe/spbkv3",
+)
+# The outer `apuestatotal.com` wrapper — same base for all bet types.
+# `{bscode}` is URL-substituted into the fpath-encoded iframe path.
+PULSE_OPERATOR_WRAPPER_URL = os.getenv(
+    "PULSE_OPERATOR_WRAPPER_URL",
+    "https://www.apuestatotal.com/apuestas-deportivas",
+)
+# Final shape:
+#   {wrapper}?fpath=%2Fes-pe%2Fspbkv3%3Fbscode%3D{bscode}
+# Single template — bscode is bet-type-agnostic because kmianko restores
+# the full slip (single, BB, combo) from the code alone.
+PULSE_DEEPLINK_TEMPLATE_BSCODE = os.getenv(
+    "PULSE_DEEPLINK_TEMPLATE_BSCODE",
+    # Default composes wrapper + iframe path + bscode query param.
+    "{wrapper}?fpath=%2Fes-pe%2Fspbkv3%3Fbscode%3D{bscode}",
+)

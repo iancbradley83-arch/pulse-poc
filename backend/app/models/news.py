@@ -177,3 +177,10 @@ class CandidateCard(BaseModel):
     # cards and per-fixture bet builders. Publisher uses this to swap the
     # "Bet Builder" badge for "Weekend Storyline" on the feed card.
     storyline_id: Optional[str] = None
+
+    # Stage 5b — server-minted bscode from kmianko's share-betslip
+    # endpoint. 6-char code persisted so we don't re-mint on every
+    # publish cycle for the same selection set. None when minter is
+    # disabled or the mint call failed (caller falls back to the PR #36
+    # selectionId URL).
+    bscode: Optional[str] = None

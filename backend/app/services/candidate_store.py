@@ -81,6 +81,11 @@ CREATE TABLE IF NOT EXISTS candidates (
     -- single-event cards and per-fixture bet builders. Publisher swaps
     -- the "Bet Builder" badge for "Weekend Storyline" when present.
     storyline_id TEXT,
+    -- Stage 5b — server-minted bscode (6-char code) from kmianko's
+    -- share-betslip endpoint. Persisted so we don't re-mint the same
+    -- selection set across publish cycles. NULL when minter disabled
+    -- or mint failed; publisher falls back to PR #36 selectionId URL.
+    bscode TEXT,
     FOREIGN KEY (news_item_id) REFERENCES news_items(id),
     FOREIGN KEY (storyline_id) REFERENCES storyline_items(id)
 );
@@ -207,6 +212,12 @@ class CandidateStore:
                         )
                         await db.execute("ALTER TABLE candidates ADD COLUMN storyline_id TEXT")
                         await db.commit()
+                    if "bscode" not in cols:
+                        logger.info(
+                            "[CandidateStore] Migrating candidates: ADD COLUMN bscode"
+                        )
+                        await db.execute("ALTER TABLE candidates ADD COLUMN bscode TEXT")
+                        await db.commit()
 
             # news_items migration: injury_details_json added 2026-04-23 for
             # position-aware INJURY routing. Additive ALTER; no data loss.
@@ -268,8 +279,8 @@ class CandidateStore:
                     bet_type, game_id, market_ids_json, selection_ids_json,
                     score, threshold_passed, reason, status, narrative,
                     supporting_stats_json, total_odds, price_source,
-                    virtual_selection, storyline_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    virtual_selection, storyline_id, bscode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -715,6 +726,7 @@ def _candidate_to_row(c: CandidateCard) -> tuple:
         c.price_source,
         c.virtual_selection,
         c.storyline_id,
+        c.bscode,
     )
 
 
@@ -746,6 +758,7 @@ def _row_to_candidate(row: aiosqlite.Row) -> CandidateCard:
         price_source=_get("price_source"),
         virtual_selection=_get("virtual_selection"),
         storyline_id=_get("storyline_id"),
+        bscode=_get("bscode"),
     )
 
 
