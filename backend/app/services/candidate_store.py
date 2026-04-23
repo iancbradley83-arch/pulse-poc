@@ -133,6 +133,22 @@ CREATE TABLE IF NOT EXISTS candidate_reviews (
 CREATE INDEX IF NOT EXISTS idx_reviews_candidate ON candidate_reviews(candidate_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_verdict ON candidate_reviews(verdict);
 CREATE INDEX IF NOT EXISTS idx_reviews_created ON candidate_reviews(created_at);
+
+-- Public thumbs-up / thumbs-down reactions on feed cards. Anonymous
+-- viewers keyed by the `pulse_anon_id` cookie (set by middleware in
+-- main.py). One reaction per (card_id, anon_id) — the UNIQUE index
+-- enforces it and a second vote upserts via INSERT .. ON CONFLICT.
+-- Additive migration: new table only, no changes to existing tables.
+CREATE TABLE IF NOT EXISTS card_reactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id TEXT NOT NULL,
+    anon_id TEXT NOT NULL,
+    reaction TEXT NOT NULL CHECK (reaction IN ('up', 'down')),
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reactions_card ON card_reactions(card_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reactions_anon_card
+    ON card_reactions(anon_id, card_id);
 """
 
 
@@ -491,6 +507,106 @@ class CandidateStore:
                 (fixture_id, cache_key, _t.time(), json.dumps(payload)),
             )
             await db.commit()
+
+    # ── Card reactions (public thumbs-up/down) ──
+
+    async def save_reaction(
+        self, *, card_id: str, anon_id: str, reaction: str,
+    ) -> dict[str, int]:
+        """Upsert the caller's reaction for this card and return fresh totals.
+
+        `reaction` must be 'up' or 'down' (pydantic validates upstream; the
+        DB CHECK constraint is a second fence). Same (anon_id, card_id)
+        voting again flips the stored reaction — enforced via the UNIQUE
+        index + `ON CONFLICT DO UPDATE`.
+        """
+        import time as _t
+        if reaction not in ("up", "down"):
+            raise ValueError(f"reaction must be 'up'|'down', got {reaction!r}")
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO card_reactions (card_id, anon_id, reaction, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(anon_id, card_id) DO UPDATE SET
+                    reaction = excluded.reaction,
+                    created_at = excluded.created_at
+                """,
+                (card_id, anon_id, reaction, _t.time()),
+            )
+            await db.commit()
+        return await self.reaction_totals(card_id)
+
+    async def reaction_totals(self, card_id: str) -> dict[str, int]:
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT reaction, COUNT(*) AS n
+                FROM card_reactions
+                WHERE card_id = ?
+                GROUP BY reaction
+                """,
+                (card_id,),
+            ) as cur:
+                rows = await cur.fetchall()
+        counts = {r["reaction"]: int(r["n"]) for r in rows}
+        return {"up": counts.get("up", 0), "down": counts.get("down", 0)}
+
+    async def reaction_for_anon(
+        self, card_id: str, anon_id: str,
+    ) -> Optional[str]:
+        """The caller's own stored reaction for this card, or None."""
+        if not anon_id:
+            return None
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
+                "SELECT reaction FROM card_reactions WHERE card_id = ? AND anon_id = ?",
+                (card_id, anon_id),
+            ) as cur:
+                row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def reaction_aggregates(self) -> list[dict[str, Any]]:
+        """Aggregate reactions by (fixture, hook_type, bet_type, storyline).
+
+        Joins card_reactions → candidates on card_id. Cards that never landed
+        in the candidates table (e.g. featured BBs which bypass the store)
+        won't appear here — that's fine for v1; the interesting signal is on
+        engine-produced cards anyway. Sorted by total desc.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT
+                    c.game_id        AS fixture,
+                    c.hook_type      AS hook_type,
+                    c.bet_type       AS bet_type,
+                    c.storyline_id   AS storyline,
+                    SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END) AS up,
+                    SUM(CASE WHEN r.reaction = 'down' THEN 1 ELSE 0 END) AS down
+                FROM card_reactions r
+                LEFT JOIN candidates c ON c.id = r.card_id
+                GROUP BY c.game_id, c.hook_type, c.bet_type, c.storyline_id
+                ORDER BY (
+                    SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END)
+                  + SUM(CASE WHEN r.reaction = 'down' THEN 1 ELSE 0 END)
+                ) DESC
+                """,
+            ) as cur:
+                rows = await cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "fixture": r["fixture"],
+                "hook_type": r["hook_type"],
+                "bet_type": r["bet_type"],
+                "storyline": r["storyline"],
+                "up": int(r["up"] or 0),
+                "down": int(r["down"] or 0),
+            })
+        return out
 
 
 # ── Row <-> model helpers ──

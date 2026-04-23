@@ -697,3 +697,60 @@ body.embed #app { max-width: 100%; margin: 0; padding-bottom: 0; }
   flex-shrink: 0;
 }
 .pulse-toast__copy:hover { color: #e5e9f2; border-color: #7cf06f; }
+
+/* ─────────────────────────────────────────────────────────────
+ *  CARD REACTIONS — public 👎 / 👍 at the bottom-right of each card.
+ *  Subtle neutral styling until hover / active so they don't compete
+ *  with the CTA. Active state adopts the hook color for consistency.
+ * ───────────────────────────────────────────────────────────── */
+.card-react {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.06);
+}
+.card-react__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  color: #8b93a7;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, transform 80ms ease;
+  -webkit-tap-highlight-color: transparent;
+}
+.card-react__btn:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: #e5e9f2;
+  border-color: rgba(255, 255, 255, 0.18);
+}
+.card-react__btn:active { transform: scale(0.96); }
+.card-react__btn.is-active {
+  color: #0a0a0f;
+  background: var(--hook-color, #e5e9f2);
+  border-color: var(--hook-color, #e5e9f2);
+  font-weight: 600;
+}
+.card-react__icon {
+  display: inline-block;
+  font-size: 13px;
+  line-height: 1;
+  filter: saturate(0.85);
+}
+.card-react__btn.is-active .card-react__icon { filter: none; }
+.card-react__count {
+  font-variant-numeric: tabular-nums;
+  min-width: 10px;
+  text-align: right;
+  opacity: 0.85;
+}
+
