@@ -61,6 +61,39 @@ _HOOK_WEIGHT: dict[HookType, float] = {
 }
 
 
+# Per-hook BB-vs-single preference. Values:
+#   "bb"     — when both BB and single candidates exist for the same
+#              news_item_id, keep the BB (multi-leg stack is the right
+#              framing for rich news items with multiple angles).
+#   "single" — keep the single (the story is a specific market thesis;
+#              a 3-leg BB on this hook type feels forced).
+#   "both"   — emit both; downstream ranker picks which to surface. Safe
+#              default for hook types we haven't opinionated on yet.
+#
+# Tunable live via PULSE_HOOK_BET_TYPE_PREFERENCE_JSON env var — see
+# `PolicyLayer.from_env_override`. Change the dict below to move the
+# default baseline, or flip the env var for an A/B without redeploy.
+HOOK_BET_TYPE_PREFERENCE: dict[HookType, str] = {
+    # Rich narrative hooks → BB is the right frame (many legs come from
+    # one story: injury to striker → over_under + both-teams-to-score +
+    # opponent scorer).
+    HookType.INJURY: "bb",
+    HookType.TEAM_NEWS: "bb",
+    HookType.TRANSFER: "bb",
+    # Specific thesis hooks → single is the right frame (park-the-bus
+    # → Under goals, pre-match quote → 1st-half 1X2). Forcing a BB on
+    # these dilutes the angle.
+    HookType.TACTICAL: "single",
+    HookType.MANAGER_QUOTE: "single",
+    HookType.PREVIEW: "single",
+    HookType.ARTICLE: "single",
+    HookType.OTHER: "single",
+    # Still deciding — emit both and let the ranker choose.
+    HookType.PRICE_MOVE: "both",
+    HookType.LIVE_MOMENT: "both",
+}
+
+
 class NewsScorer:
     def score(
         self,
@@ -132,56 +165,107 @@ class PolicyLayer:
         *,
         publish_threshold: float,
         per_fixture_cap: int = 3,
+        hook_bet_type_preference: Optional[dict[HookType, str]] = None,
     ):
         self._threshold = publish_threshold
         self._per_fixture_cap = per_fixture_cap
+        # Copy so tests / env-overrides can't mutate the module default.
+        self._hook_pref: dict[HookType, str] = dict(
+            hook_bet_type_preference
+            if hook_bet_type_preference is not None
+            else HOOK_BET_TYPE_PREFERENCE
+        )
+
+    def _preferred_bet_type(self, hook: HookType) -> str:
+        """Return 'bb' / 'single' / 'both' for this hook. Default 'both'."""
+        return self._hook_pref.get(hook, "both")
 
     def apply(self, candidates: list[CandidateCard], *, headlines_by_id: Optional[dict[str, str]] = None) -> list[CandidateCard]:
-        # 0. One candidate per news_item_id globally. Prefer validated Bet
-        #    Builders over singles from the same news item (BB is the richer
-        #    product — same story, more interesting bet). Among BBs or among
-        #    singles, pick highest score.
-        def better(a: CandidateCard, b: CandidateCard) -> CandidateCard:
+        # 0. Per-news-item collapse driven by per-hook preference. BB, single,
+        #    or both can survive depending on hook_type. Within a shape (two
+        #    BBs or two singles for the same news id) higher score wins.
+        def better_same_shape(a: CandidateCard, b: CandidateCard) -> CandidateCard:
+            """Fallback resolver for content-dedupe when hook preference
+            doesn't nominate a single winner."""
             a_bb = a.bet_type == BetType.BET_BUILDER
             b_bb = b.bet_type == BetType.BET_BUILDER
             if a_bb != b_bb:
+                # If we've gotten here with a tie vote, fall back to the old
+                # BB-wins heuristic so the existing behaviour is preserved.
                 return a if a_bb else b
             return a if a.score >= b.score else b
 
-        by_news: dict[str, CandidateCard] = {}
+        # Bucket by (news_item_id, bet_type_shape). "both" hooks keep one per
+        # shape; "bb" / "single" hooks collapse via _pick_per_news.
+        by_news_shape: dict[tuple[str, str], CandidateCard] = {}
         no_news: list[CandidateCard] = []
         for c in candidates:
             if not c.news_item_id:
                 no_news.append(c)
                 continue
-            prev = by_news.get(c.news_item_id)
-            by_news[c.news_item_id] = c if prev is None else better(prev, c)
-        candidates = list(by_news.values()) + no_news
+            shape = "bb" if c.bet_type == BetType.BET_BUILDER else "single"
+            key = (c.news_item_id, shape)
+            prev = by_news_shape.get(key)
+            if prev is None:
+                by_news_shape[key] = c
+            else:
+                # Same shape, same news — higher score wins.
+                by_news_shape[key] = prev if prev.score >= c.score else c
+
+        # Now apply per-hook preference: for each news_item_id, decide which
+        # shape(s) to emit.
+        per_news: dict[str, list[CandidateCard]] = {}
+        for (nid, _shape), c in by_news_shape.items():
+            per_news.setdefault(nid, []).append(c)
+
+        resolved: list[CandidateCard] = []
+        for nid, cands in per_news.items():
+            if len(cands) == 1:
+                resolved.append(cands[0])
+                continue
+            # 2 candidates, different shapes (BB + single).
+            a, b = cands[0], cands[1]
+            pref = self._preferred_bet_type(a.hook_type)
+            a_bb = a.bet_type == BetType.BET_BUILDER
+            if pref == "bb":
+                resolved.append(a if a_bb else b)
+            elif pref == "single":
+                resolved.append(b if a_bb else a)
+            else:  # "both" — emit both shapes
+                resolved.extend(cands)
+
+        candidates = resolved + no_news
 
         # 0b. Content dedupe by normalized headline. The scout runs once per
         #     fixture and can independently surface the same real-world story
         #     for several fixtures (different news_item_ids, same headline).
-        #     Collapse to one candidate per headline — BB wins, then score.
+        #     Collapse to one candidate per headline per shape (so a "both"
+        #     hook's BB and single stay alongside each other).
         if headlines_by_id:
             def _norm_head(s: str) -> str:
                 return " ".join((s or "").lower().split())
 
-            by_head: dict[str, CandidateCard] = {}
+            by_head_shape: dict[tuple[str, str], CandidateCard] = {}
             untitled: list[CandidateCard] = []
             for c in candidates:
                 head = headlines_by_id.get(c.news_item_id or "") if c.news_item_id else None
-                key = _norm_head(head) if head else None
-                if not key:
+                key_h = _norm_head(head) if head else None
+                if not key_h:
                     untitled.append(c)
                     continue
-                prev = by_head.get(key)
-                by_head[key] = c if prev is None else better(prev, c)
-            candidates = list(by_head.values()) + untitled
+                shape = "bb" if c.bet_type == BetType.BET_BUILDER else "single"
+                k = (key_h, shape)
+                prev = by_head_shape.get(k)
+                by_head_shape[k] = c if prev is None else better_same_shape(prev, c)
+            candidates = list(by_head_shape.values()) + untitled
 
-        # 1. Best-per-(fixture, hook_type) dedupe
-        best: dict[tuple[str, HookType], CandidateCard] = {}
+        # 1. Best-per-(fixture, hook_type, shape) dedupe. Keying on shape too
+        #    so a "both" hook keeps its BB alongside its single — they're
+        #    different products and the ranker should see them both.
+        best: dict[tuple[str, HookType, str], CandidateCard] = {}
         for c in candidates:
-            key = (c.game_id, c.hook_type)
+            shape = "bb" if c.bet_type == BetType.BET_BUILDER else "single"
+            key = (c.game_id, c.hook_type, shape)
             existing = best.get(key)
             if existing is None or c.score > existing.score:
                 best[key] = c

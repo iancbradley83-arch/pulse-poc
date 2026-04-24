@@ -28,12 +28,14 @@ from app.config import (
     ANTHROPIC_API_KEY,
     PULSE_DATA_SOURCE,
     PULSE_DB_PATH,
+    PULSE_HOOK_BET_TYPE_PREFERENCE_JSON,
     PULSE_NEWS_CACHE_TTL_HOURS,
     PULSE_NEWS_INGEST_ENABLED,
     PULSE_NEWS_MAX_FIXTURES,
     PULSE_NEWS_MAX_SEARCHES,
     PULSE_NEWS_MODEL,
     PULSE_PUBLISH_THRESHOLD,
+    PULSE_STORYLINE_MIN_PARTICIPANTS,
     ROGUE_BASE_URL,
     ROGUE_CATALOGUE_DAYS_AHEAD,
     ROGUE_CATALOGUE_MAX_EVENTS,
@@ -1081,7 +1083,25 @@ async def _run_candidate_engine(
     # affected side and do position-aware market selection (2026-04-23).
     builder = CandidateBuilder(catalog, games_by_id)
     scorer = NewsScorer()
-    policy = PolicyLayer(publish_threshold=PULSE_PUBLISH_THRESHOLD)
+    # Merge env-var override onto the module default HOOK_BET_TYPE_PREFERENCE.
+    # Keys come in as strings (hook_type enum values); convert to HookType.
+    from app.engine.news_scorer import HOOK_BET_TYPE_PREFERENCE
+    from app.models.news import HookType as _HookType
+    _merged_pref = dict(HOOK_BET_TYPE_PREFERENCE)
+    for k_str, v in PULSE_HOOK_BET_TYPE_PREFERENCE_JSON.items():
+        try:
+            _merged_pref[_HookType(k_str)] = v
+        except ValueError:
+            logger.warning("[PULSE] ignoring unknown hook_type in override: %s", k_str)
+    if PULSE_HOOK_BET_TYPE_PREFERENCE_JSON:
+        logger.info(
+            "[PULSE] Hook-bet-type preference override applied: %s",
+            PULSE_HOOK_BET_TYPE_PREFERENCE_JSON,
+        )
+    policy = PolicyLayer(
+        publish_threshold=PULSE_PUBLISH_THRESHOLD,
+        hook_bet_type_preference=_merged_pref,
+    )
     # Bet Builder generator — only active when we have a Rogue client.
     # The same client provides real correlated BB pricing via the Betting
     # API (calculate_bets). Mock mode (no Rogue client) skips BBs entirely.
@@ -1119,7 +1139,11 @@ async def _run_candidate_engine(
                 StorylineType as _SType,
             )
             _anth = _AsyncAnth(api_key=ANTHROPIC_API_KEY)
-            detector = StorylineDetector(_anth, model=os.getenv("PULSE_STORYLINE_MODEL", "claude-sonnet-4-6"))
+            detector = StorylineDetector(
+                _anth,
+                model=os.getenv("PULSE_STORYLINE_MODEL", "claude-sonnet-4-6"),
+                min_participants=PULSE_STORYLINE_MIN_PARTICIPANTS,
+            )
             xbuilder = CrossEventBuilder(catalog)
             author = CombinedNarrativeAuthor(_anth, model=os.getenv("PULSE_STORYLINE_MODEL", "claude-sonnet-4-6"))
 
