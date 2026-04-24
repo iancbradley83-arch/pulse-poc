@@ -472,6 +472,25 @@ class CandidateStore:
             await db.commit()
             return cur.rowcount or 0
 
+    async def expire_published_for_fixtures(self, fixture_ids: list[str]) -> int:
+        """Mark published candidates belonging to the given fixtures as EXPIRED.
+
+        Scoped variant of `expire_published_candidates`: a tier-scoped
+        re-scout re-expires only its own fixtures so other tiers' live
+        cards stay visible.
+        """
+        if not fixture_ids:
+            return 0
+        placeholders = ",".join("?" for _ in fixture_ids)
+        async with self._connect() as db:
+            cur = await db.execute(
+                f"UPDATE candidates SET status = 'expired' "
+                f"WHERE status = 'published' AND game_id IN ({placeholders})",
+                fixture_ids,
+            )
+            await db.commit()
+            return cur.rowcount or 0
+
     async def latest_verdict_by_candidate(self) -> dict[str, str]:
         """Return {candidate_id: latest_verdict} for fast render in the admin table."""
         async with self._connect() as db:

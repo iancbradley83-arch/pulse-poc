@@ -191,6 +191,12 @@ class Card(BaseModel):
     relevance_score: float = 0.0
     created_at: float = Field(default_factory=time.time)
     ttl_seconds: int = 600  # 10 min default, shorter for live
+    # Stamp set when the card is first published to the live feed. Used by
+    # the tiered-freshness TTL sweep (PULSE_CARD_TTL_SECONDS) and the
+    # frontend "NEW" marker / relative-time label. `created_at` isn't
+    # enough because cached scout cycles re-use Card objects minted in a
+    # prior cycle — published_at is cycle-scoped.
+    published_at: Optional[float] = None
 
     # Stage 2 design handoff — populated for news-driven cards so the Hero
     # variant can render source / recency / hook styling without joining back

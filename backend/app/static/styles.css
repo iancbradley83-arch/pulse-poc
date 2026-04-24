@@ -88,6 +88,46 @@ button { font: inherit; cursor: pointer; }
   100% { box-shadow: 0 0 0 0 transparent; }
 }
 .card-hero.price-updated { animation: priceFlash 1.5s ease-out; }
+
+/* ── staggered-publish new-card pulse ── */
+/* Brief 2s glow + 3s border emphasis when a card first lands via
+   `card_added` WS event. Keeps the social-feed "something just arrived"
+   signal without stealing attention from the whole list. */
+@keyframes newCardPulse {
+  0%   { box-shadow: 0 0 0 0 var(--hook-color, var(--accent)); }
+  25%  { box-shadow: 0 0 0 6px var(--hook-color-20, rgba(124,92,255,0.28)); }
+  75%  { box-shadow: 0 0 0 3px var(--hook-color-20, rgba(124,92,255,0.18)); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+@keyframes newCardIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.card-hero.card-hero--new {
+  animation:
+    newCardIn 320ms ease-out,
+    newCardPulse 2.4s ease-out;
+  border-color: var(--hook-color, var(--accent));
+}
+
+/* Fade-out before DOM removal when a TTL sweep drops a card. */
+@keyframes cardFadeOut {
+  to { opacity: 0; transform: translateY(-4px); }
+}
+.card-hero.fading-out {
+  animation: cardFadeOut 400ms ease-in forwards;
+  pointer-events: none;
+}
+
+/* Relative-time label — small muted pill near the card head. Positioned
+   next to the existing .recency so the two live alongside the hook pill. */
+time.card-timestamp {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+  letter-spacing: 0.02em;
+}
 /* Suspended state — gray and disable the CTA when the operator suspends a
    leg or event mid-feed. */
 .card-hero.card-suspended { opacity: 0.55; }

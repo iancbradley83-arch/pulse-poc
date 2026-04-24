@@ -204,6 +204,44 @@ PULSE_DEEPLINK_TEMPLATE_BSCODE = os.getenv(
     "{wrapper}?fpath=%2Fes-pe%2Fspbkv3%3Fbscode%3D{bscode}",
 )
 
+# ── Tiered freshness / staggered publish ───────────────────────────────
+# Social-feed cadence: instead of one 4h atomic cycle, run tier-specific
+# loops that re-scout fixtures by kickoff proximity. Cards stream in one
+# at a time (see PULSE_STAGGERED_PUBLISH_ENABLED below) so the feed feels
+# alive across the hour.
+#
+# Tiers: HOT (<6h to kickoff, every 60 min) / WARM (6-24h, every 2h) /
+# COOL (24-72h, every 6h) / COLD (>72h, every 12h).
+#
+# Kill switch: set PULSE_TIERED_FRESHNESS_ENABLED=false to revert to the
+# single-cycle PULSE_RERUN_INTERVAL_SECONDS path.
+PULSE_TIERED_FRESHNESS_ENABLED = os.getenv(
+    "PULSE_TIERED_FRESHNESS_ENABLED", "true",
+).lower() == "true"
+PULSE_TIER_HOT_MIN_SECONDS = int(os.getenv("PULSE_TIER_HOT_MIN_SECONDS", "3600"))
+PULSE_TIER_WARM_MIN_SECONDS = int(os.getenv("PULSE_TIER_WARM_MIN_SECONDS", "7200"))
+PULSE_TIER_COOL_MIN_SECONDS = int(os.getenv("PULSE_TIER_COOL_MIN_SECONDS", "21600"))
+PULSE_TIER_COLD_MIN_SECONDS = int(os.getenv("PULSE_TIER_COLD_MIN_SECONDS", "43200"))
+PULSE_TIER_HOT_MAX_FIXTURES = int(os.getenv("PULSE_TIER_HOT_MAX_FIXTURES", "5"))
+PULSE_TIER_WARM_MAX_FIXTURES = int(os.getenv("PULSE_TIER_WARM_MAX_FIXTURES", "8"))
+PULSE_TIER_COOL_MAX_FIXTURES = int(os.getenv("PULSE_TIER_COOL_MAX_FIXTURES", "6"))
+PULSE_TIER_COLD_MAX_FIXTURES = int(os.getenv("PULSE_TIER_COLD_MAX_FIXTURES", "4"))
+
+# Staggered publish: each candidate is broadcast as it passes gates, not in
+# an atomic batch swap. Disable with false to revert to batch behaviour
+# (useful if the per-card broadcast firehose is overwhelming clients).
+PULSE_STAGGERED_PUBLISH_ENABLED = os.getenv(
+    "PULSE_STAGGERED_PUBLISH_ENABLED", "true",
+).lower() == "true"
+
+# Card TTL — each published card falls off the feed (and is broadcast as
+# removed) after this many seconds. Default 6h matches the news cache TTL
+# so we don't show cards that pre-date the scout's cached info.
+PULSE_CARD_TTL_SECONDS = int(os.getenv("PULSE_CARD_TTL_SECONDS", "21600"))
+
+# How often the TTL sweep runs (checking for expired cards).
+PULSE_CARD_TTL_SWEEP_SECONDS = int(os.getenv("PULSE_CARD_TTL_SWEEP_SECONDS", "60"))
+
 # Default TRUE: emit the direct kmianko URL instead of the apuestatotal.com
 # wrapper. Discovered post-PR #37 that the outer wrapper is a Next.js SPA
 # that builds the kmianko iframe client-side — its fpath decoder strips or
