@@ -141,6 +141,53 @@ PULSE_STORYLINE_EUROPE_CHASE_ENABLED = os.getenv(
     "PULSE_STORYLINE_EUROPE_CHASE_ENABLED", "true",
 ).lower() == "true"
 
+# ── Storyline standings verification ───────────────────────────────────
+# Before a team is emitted as a RELEGATION / EUROPE_CHASE participant,
+# the detector hits web_search via a second Haiku call to confirm the
+# team's actual league_position (+ points_from_safety / _european_spot
+# / form_last_5). Participants that don't meet the positional threshold
+# are dropped. If fewer than 2 valid participants survive, the whole
+# storyline is skipped — better to ship 0 relegation cards than 1 with a
+# mid-table team miscast as fighting the drop.
+#
+# Kill switch: set PULSE_STORYLINE_STANDINGS_VERIFY_ENABLED=false to
+# revert to pre-verification behaviour without a redeploy. Only flip if
+# the verification step is mis-identifying participants en masse — the
+# whole PR exists to avoid "fellow-relegated" type credibility hits.
+PULSE_STORYLINE_STANDINGS_VERIFY_ENABLED = os.getenv(
+    "PULSE_STORYLINE_STANDINGS_VERIFY_ENABLED", "true",
+).lower() == "true"
+
+# RELEGATION threshold: team qualifies if league_position >=
+# (league_size - PULSE_STORYLINE_RELEGATION_MAX_POSITION) (i.e. bottom-N
+# of its league — default 6) OR points_from_safety <=
+# PULSE_STORYLINE_RELEGATION_MAX_POINTS_FROM_SAFETY (default 6).
+PULSE_STORYLINE_RELEGATION_MAX_POSITION = int(
+    os.getenv("PULSE_STORYLINE_RELEGATION_MAX_POSITION", "6")
+)
+PULSE_STORYLINE_RELEGATION_MAX_POINTS_FROM_SAFETY = int(
+    os.getenv("PULSE_STORYLINE_RELEGATION_MAX_POINTS_FROM_SAFETY", "6")
+)
+
+# EUROPE_CHASE threshold: team qualifies if league_position in
+# [MIN_POSITION, MAX_POSITION] (default 3..7) OR
+# points_from_european_spot <= MAX_POINTS (default 5).
+PULSE_STORYLINE_EUROPE_CHASE_MIN_POSITION = int(
+    os.getenv("PULSE_STORYLINE_EUROPE_CHASE_MIN_POSITION", "3")
+)
+PULSE_STORYLINE_EUROPE_CHASE_MAX_POSITION = int(
+    os.getenv("PULSE_STORYLINE_EUROPE_CHASE_MAX_POSITION", "7")
+)
+PULSE_STORYLINE_EUROPE_CHASE_MAX_POINTS_FROM_SPOT = int(
+    os.getenv("PULSE_STORYLINE_EUROPE_CHASE_MAX_POINTS_FROM_SPOT", "5")
+)
+
+# Model used by the standings-verification Haiku call. Haiku 4.5 is the
+# sweet spot — cheap, has web_search, doesn't over-think the JSON shape.
+PULSE_STORYLINE_VERIFY_MODEL = os.getenv(
+    "PULSE_STORYLINE_VERIFY_MODEL", "claude-haiku-4-5",
+)
+
 # ── Stage 5 — deep-link CTA ────────────────────────────────────────────
 # The card's "Tap to bet" / "Add Bet Builder" CTA opens this URL (target=
 # _blank) with the card's Rogue selection_ids pre-loaded on the operator's
