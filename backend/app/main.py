@@ -1047,9 +1047,28 @@ async def _run_candidate_engine(
             )
             # Copywriter pass — rewrites scout output into journalist voice
             # before the card hits the feed. Sonnet by default; override via env.
-            rewriter = NarrativeRewriter(anth, model=os.getenv("PULSE_REWRITER_MODEL", "claude-sonnet-4-6"))
-            logger.info("[PULSE] Candidate engine: scout=%s, rewriter=%s",
-                        PULSE_NEWS_MODEL, os.getenv("PULSE_REWRITER_MODEL", "claude-sonnet-4-6"))
+            # U3: memoise rewrites by input-hash so unchanged candidates on
+            # reruns don't re-pay Sonnet. Kill-switch + TTL env-controlled.
+            _cache_enabled = os.getenv("PULSE_REWRITE_CACHE_ENABLED", "true").lower() == "true"
+            try:
+                _cache_ttl = float(os.getenv("PULSE_REWRITE_CACHE_TTL_SECONDS", "86400"))
+            except ValueError:
+                _cache_ttl = 86400.0
+            rewriter = NarrativeRewriter(
+                anth,
+                model=os.getenv("PULSE_REWRITER_MODEL", "claude-sonnet-4-6"),
+                store=candidate_store,
+                cache_enabled=_cache_enabled,
+                cache_ttl_seconds=_cache_ttl,
+            )
+            rewriter.reset_cache_counters()
+            logger.info(
+                "[PULSE] Candidate engine: scout=%s, rewriter=%s, rewrite_cache=%s (ttl=%.0fs)",
+                PULSE_NEWS_MODEL,
+                os.getenv("PULSE_REWRITER_MODEL", "claude-sonnet-4-6"),
+                "on" if _cache_enabled else "off",
+                _cache_ttl,
+            )
         except Exception as exc:
             logger.warning("[PULSE] LLM ingester unavailable (%s) — using mock", exc)
             ingester = MockNewsIngester(candidate_store)
@@ -1616,6 +1635,14 @@ async def _run_candidate_engine(
     if rewriter is not None:
         logger.info("[PULSE] NarrativeRewriter: %d hits, %d misses (fell back to scout copy)",
                     rewrite_hit, rewrite_miss)
+        # U3 cache summary — separate from the rewrite_hit/miss counters
+        # above (which track whether a Sonnet response was successfully
+        # applied). cache_hits here = rewrites served from SQLite without
+        # calling Sonnet at all.
+        logger.info(
+            "[PULSE] rewrite cache: %d hits, %d misses this cycle",
+            rewriter.cache_hits, rewriter.cache_misses,
+        )
     if gate_rejected:
         # Persist the REJECTED status change so the admin table reflects
         # what got blocked and why.
