@@ -85,12 +85,18 @@ HOOK_BET_TYPE_PREFERENCE: dict[HookType, str] = {
     # (player goals + team outcome + BTTS). A single here usually lacks
     # a specific thesis.
     HookType.TRANSFER: "bb",
-    # Specific thesis hooks → single is the right frame (park-the-bus
-    # → Under goals, pre-match quote → 1st-half 1X2). Forcing a BB on
-    # these dilutes the angle.
-    HookType.TACTICAL: "single",
-    HookType.MANAGER_QUOTE: "single",
-    HookType.PREVIEW: "single",
+    # 2026-04-24 mix-balance PR: upgrade TACTICAL / MANAGER_QUOTE /
+    # PREVIEW from "single" to "both". User feedback post-volume-up was
+    # "mix is single-heavy, want more BB / more combos". The hook themes
+    # in combo_builder.py were simultaneously enriched to 3-4 legs for
+    # these hooks so the BB side isn't just a two-leg throwaway — it
+    # carries a real thesis (TACTICAL = corners+cards+overs+btts;
+    # MANAGER_QUOTE = scorer + 1st-half + FT; PREVIEW = pick + overs +
+    # BTTS). `both` means downstream keeps the single AND the BB; ranker
+    # quotas decide which surface.
+    HookType.TACTICAL: "both",
+    HookType.MANAGER_QUOTE: "both",
+    HookType.PREVIEW: "both",
     HookType.ARTICLE: "single",
     HookType.OTHER: "single",
     # Still deciding — emit both and let the ranker choose.

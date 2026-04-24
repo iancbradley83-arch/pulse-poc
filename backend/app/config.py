@@ -62,7 +62,13 @@ PULSE_PUBLISH_THRESHOLD = float(os.getenv("PULSE_PUBLISH_THRESHOLD", "0.55"))
 # Phase 3 (later): admin UI sliders + click-tracking learning loop adjusts
 # weights nightly based on which bet_types get CTA-clicked through.
 def _parse_mix(s: str) -> dict[str, int]:
-    out = {"singles": 40, "bb": 30, "combos": 30}
+    # Defaults shifted 2026-04-24 from 40/30/30 to 30/40/30 per user
+    # feedback — the feed was single-heavy after the volume-up PR. BB
+    # supply doubled (TACTICAL / MANAGER_QUOTE / PREVIEW went to "both"
+    # and BB themes got enriched to 3-4 legs), so there's real BB stock
+    # to promote; the ranker now has authority to prefer BB over single
+    # when both are queued for the same news.
+    out = {"singles": 30, "bb": 40, "combos": 30}
     for part in (s or "").split(","):
         if "=" not in part: continue
         k, v = part.split("=", 1)
@@ -70,7 +76,7 @@ def _parse_mix(s: str) -> dict[str, int]:
         except ValueError: pass
     return out
 
-PULSE_BET_TYPE_MIX = _parse_mix(os.getenv("PULSE_BET_TYPE_MIX", "singles=40,bb=30,combos=30"))
+PULSE_BET_TYPE_MIX = _parse_mix(os.getenv("PULSE_BET_TYPE_MIX", "singles=30,bb=40,combos=30"))
 
 # Hook-variety guard (post-mix-quota rank pass). When true, the feed ranker
 # walks the ordered list and, if two consecutive cards share hook_type
@@ -187,6 +193,18 @@ PULSE_STORYLINE_EUROPE_CHASE_MAX_POINTS_FROM_SPOT = int(
 PULSE_STORYLINE_VERIFY_MODEL = os.getenv(
     "PULSE_STORYLINE_VERIFY_MODEL", "claude-haiku-4-5",
 )
+
+# Borderline-participant tolerance (2026-04-24 mix-balance PR). When
+# the standings-verify pass drops enough participants that only 2
+# survive, check any dropped candidate whose row is within 1 position
+# OR within 2 points of the threshold (relegation points_from_safety /
+# europe_chase points_from_european_spot) and re-include it as a
+# borderline participant. Gets storyline combos from 2 legs to 3 legs
+# more often while keeping the hard-verified gate intact for first-pass
+# cuts. Kill-switch: set false to revert to strict verification.
+PULSE_STORYLINE_BORDERLINE_TOLERANCE_ENABLED = os.getenv(
+    "PULSE_STORYLINE_BORDERLINE_TOLERANCE_ENABLED", "true",
+).lower() == "true"
 
 # ── Stage 5 — deep-link CTA ────────────────────────────────────────────
 # The card's "Tap to bet" / "Add Bet Builder" CTA opens this URL (target=
