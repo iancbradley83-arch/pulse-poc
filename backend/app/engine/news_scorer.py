@@ -74,11 +74,16 @@ _HOOK_WEIGHT: dict[HookType, float] = {
 # `PolicyLayer.from_env_override`. Change the dict below to move the
 # default baseline, or flip the env var for an A/B without redeploy.
 HOOK_BET_TYPE_PREFERENCE: dict[HookType, str] = {
-    # Rich narrative hooks → BB is the right frame (many legs come from
-    # one story: injury to striker → over_under + both-teams-to-score +
-    # opponent scorer).
-    HookType.INJURY: "bb",
-    HookType.TEAM_NEWS: "bb",
+    # High-conviction hooks → emit BOTH a BB and a single so the ranker
+    # has real supply to pull from (2026-04-24 volume-up PR). INJURY /
+    # TEAM_NEWS typically produce a clean single-market angle (opponent
+    # DNB / over-under shift) AND a rich BB stack, and both framings are
+    # legitimate for the same story. Downstream feed_ranker mixes them.
+    HookType.INJURY: "both",
+    HookType.TEAM_NEWS: "both",
+    # TRANSFER stays BB-only: transfer news is inherently multi-market
+    # (player goals + team outcome + BTTS). A single here usually lacks
+    # a specific thesis.
     HookType.TRANSFER: "bb",
     # Specific thesis hooks → single is the right frame (park-the-bus
     # → Under goals, pre-match quote → 1st-half 1X2). Forcing a BB on
