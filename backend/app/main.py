@@ -662,8 +662,14 @@ async def generate_prematch_cards():
             for _tier in _TIER_ORDER:
                 _tier_tasks.append(_asyncio.create_task(_tier_loop(_tier)))
             _tier_tasks.append(_asyncio.create_task(_card_ttl_sweep_loop()))
+            # PR #53: release-buffer scheduler — enforces hook-variety
+            # across adjacent WS `card_added` broadcasts. Runs even when
+            # the buffer is disabled (noop); cheap timer.
+            global _release_task
+            _release_task = _asyncio.create_task(_release_loop())
+            _tier_tasks.append(_release_task)
             logger.info(
-                "[PULSE] Tiered freshness active — %d tier loops + TTL sweep",
+                "[PULSE] Tiered freshness active — %d tier loops + TTL sweep + release buffer",
                 len(_TIER_ORDER),
             )
         else:
@@ -798,9 +804,27 @@ async def admin_rerun():
                     *[_run_tier_once(t) for t in _TIER_ORDER],
                     return_exceptions=True,
                 )
+                # Preserve per-tier dict so the status endpoint can surface
+                # scouted / skipped_fresh / candidates / cost_estimate_usd
+                # fields for each tier (volume-up PR observability).
+                tier_results: dict[str, object] = {}
+                for t, r in zip(_TIER_ORDER, results):
+                    if isinstance(r, dict):
+                        tier_results[t] = r
+                    elif isinstance(r, BaseException):
+                        tier_results[t] = {"ok": False, "error": str(r)}
+                    else:
+                        tier_results[t] = {"ok": False, "raw": str(r)}
+                totals = {
+                    "scouted": sum(int(v.get("scouted", 0) or 0) for v in tier_results.values() if isinstance(v, dict)),
+                    "skipped_fresh": sum(int(v.get("skipped_fresh", 0) or 0) for v in tier_results.values() if isinstance(v, dict)),
+                    "candidates": sum(int(v.get("candidates", 0) or 0) for v in tier_results.values() if isinstance(v, dict)),
+                    "cost_estimate_usd": round(sum(float(v.get("cost_estimate_usd", 0) or 0) for v in tier_results.values() if isinstance(v, dict)), 3),
+                }
                 _ondemand_rerun_last_result = {
                     "ok": True,
-                    "tiers": {t: str(r) for t, r in zip(_TIER_ORDER, results)},
+                    "tiers": tier_results,
+                    "totals": totals,
                     "elapsed_s": round(time.time() - t0, 1),
                     "finished_at": time.time(),
                 }
@@ -1108,14 +1132,16 @@ def _classify_tier(game: Game, *, now: float) -> str:
 
 _TIER_CONFIG = {
     # (cadence_seconds, max_fixtures) pulled from env at read time so the
-    # values reflect any runtime override.
+    # values reflect any runtime override. Defaults here mirror
+    # app.config (volume-up PR #53 defaults: HOT 30min/10 fixtures,
+    # WARM 1h/10 fixtures). Change both sites together.
     _TIER_HOT: lambda: (
-        int(os.getenv("PULSE_TIER_HOT_MIN_SECONDS", "3600")),
-        int(os.getenv("PULSE_TIER_HOT_MAX_FIXTURES", "5")),
+        int(os.getenv("PULSE_TIER_HOT_MIN_SECONDS", "1800")),
+        int(os.getenv("PULSE_TIER_HOT_MAX_FIXTURES", "10")),
     ),
     _TIER_WARM: lambda: (
-        int(os.getenv("PULSE_TIER_WARM_MIN_SECONDS", "7200")),
-        int(os.getenv("PULSE_TIER_WARM_MAX_FIXTURES", "8")),
+        int(os.getenv("PULSE_TIER_WARM_MIN_SECONDS", "3600")),
+        int(os.getenv("PULSE_TIER_WARM_MAX_FIXTURES", "10")),
     ),
     _TIER_COOL: lambda: (
         int(os.getenv("PULSE_TIER_COOL_MIN_SECONDS", "21600")),
@@ -1126,6 +1152,131 @@ _TIER_CONFIG = {
         int(os.getenv("PULSE_TIER_COLD_MAX_FIXTURES", "4")),
     ),
 }
+
+# ── Hook-diversity release buffer ──────────────────────────────────────
+# PR #53: instead of broadcasting each new card over WS immediately, push
+# it into a buffer. A single release scheduler wakes every ~20s, picks
+# the next-best card whose hook_type differs from the last 2 published,
+# and broadcasts. If none match → release the oldest anyway (no
+# starvation). Makes the stream order stay varied, not just the snapshot
+# (per project_pulse_social_feed.md rule 7). Disable by setting
+# PULSE_PUBLISH_BUFFER_SECONDS=0 — broadcasts then fire immediately.
+_publish_buffer: list[tuple[float, "Card"]] = []  # (pushed_at_ts, card)
+_publish_buffer_lock = None  # asyncio.Lock, lazy init
+_last_broadcast_hooks: list[str] = []  # most-recent-last, cap at 2
+_release_task = None
+
+
+def _buffer_enabled() -> bool:
+    try:
+        from app.config import PULSE_PUBLISH_BUFFER_SECONDS as _BUF
+        return int(_BUF) > 0
+    except Exception:
+        return False
+
+
+async def _enqueue_release(card: "Card") -> None:
+    """Push a card into the release buffer (PR #53).
+
+    If the buffer is disabled, broadcast immediately (pre-PR #53 shape).
+    If enabled, the release scheduler picks up the card within a few
+    seconds and broadcasts when the hook-diversity rule allows.
+    """
+    import time as _t
+    import asyncio as _a
+    if not _buffer_enabled():
+        try:
+            await feed.broadcast_card_added(card)
+        except Exception as exc:
+            logger.warning("[PULSE] broadcast_card_added errored: %s", exc)
+        return
+    global _publish_buffer_lock
+    if _publish_buffer_lock is None:
+        _publish_buffer_lock = _a.Lock()
+    async with _publish_buffer_lock:
+        _publish_buffer.append((_t.time(), card))
+
+
+async def _release_loop() -> None:
+    """Single scheduler that drains the buffer in hook-diverse order.
+
+    Wakes every 20s by default. For each tick:
+      1. Drop cards whose hook_type hasn't been broadcast in the last 2.
+         If none, take the OLDEST card (no starvation; age beats variety).
+      2. Broadcast, update last_broadcast_hooks (cap 2).
+      3. If buffer still holds cards whose wait exceeds
+         PULSE_PUBLISH_BUFFER_SECONDS, release them too (up to 3 per tick
+         to avoid a thundering-herd if the engine dumped 20 cards in).
+    """
+    import asyncio as _a
+    import time as _t
+    global _publish_buffer_lock
+    if _publish_buffer_lock is None:
+        _publish_buffer_lock = _a.Lock()
+    tick_s = 20
+    logger.info("[PULSE] release-buffer loop active (tick=%ds)", tick_s)
+    while True:
+        try:
+            await _a.sleep(tick_s)
+        except _a.CancelledError:
+            return
+        try:
+            from app.config import PULSE_PUBLISH_BUFFER_SECONDS as _BUF_S
+            buf_s = int(_BUF_S)
+        except Exception:
+            buf_s = 60
+        if buf_s <= 0:
+            continue  # live-disabled; drain nothing, broadcasts went direct
+        now = _t.time()
+        to_release: list["Card"] = []
+        async with _publish_buffer_lock:
+            if not _publish_buffer:
+                continue
+            # Pick up to 3 cards per tick.
+            for _ in range(3):
+                if not _publish_buffer:
+                    break
+                idx = None
+                # Prefer a card whose hook differs from the last 2 broadcast.
+                for i, (_ts, c) in enumerate(_publish_buffer):
+                    hook = getattr(c, "hook_type", None) or ""
+                    if hook not in _last_broadcast_hooks:
+                        idx = i
+                        break
+                # If every buffered card's hook is in the recent window,
+                # fall back to whichever has been waiting longest (the
+                # head of the buffer, since we append in arrival order).
+                # Also: any card older than PULSE_PUBLISH_BUFFER_SECONDS
+                # has to go out regardless — no starvation.
+                if idx is None:
+                    # Forced release only if a card has aged past the
+                    # buffer ceiling. Otherwise wait another tick.
+                    aged = [
+                        (i, c) for i, (ts, c) in enumerate(_publish_buffer)
+                        if (now - ts) >= buf_s
+                    ]
+                    if not aged:
+                        break
+                    idx = aged[0][0]
+                _ts, c = _publish_buffer.pop(idx)
+                to_release.append(c)
+                hook = getattr(c, "hook_type", None) or ""
+                _last_broadcast_hooks.append(hook)
+                if len(_last_broadcast_hooks) > 2:
+                    del _last_broadcast_hooks[0]
+        # Broadcast outside the lock so a slow WS client can't block
+        # further enqueues.
+        for c in to_release:
+            try:
+                await feed.broadcast_card_added(c)
+                logger.info(
+                    "[PULSE] release-buffer broadcast card=%s hook=%s (recent=%s)",
+                    c.id, getattr(c, "hook_type", None),
+                    list(_last_broadcast_hooks),
+                )
+            except Exception as exc:
+                logger.warning("[PULSE] release-buffer broadcast errored: %s", exc)
+
 
 # Per-tier reentry guard so a long-running cycle can't overlap itself.
 _tier_inflight: dict[str, bool] = {t: False for t in _TIER_ORDER}
@@ -1181,10 +1332,48 @@ async def _run_tier_once(tier: str) -> dict:
             "[tier:%s] cycle start — %d fixtures (cap=%d)",
             tier, len(fixture_ids), max_fixtures,
         )
-        # Expire prior published candidates for ONLY these fixtures so
-        # other tiers' live cards stay in place.
+        # Boot-freshness skip (2026-04-24 volume-up PR). For each fixture
+        # in this tier, check the DB for the freshest news_items.ingested_at.
+        # If newer than this tier's cadence, skip the scout for that
+        # fixture — candidates + prices still rebuild from cached news
+        # (no LLM cost) via calculate_bets + rewriter cache downstream.
+        # Fixtures with no news yet scout normally.
+        from app.config import PULSE_BOOT_FRESHNESS_SKIP_ENABLED as _FRESH_SKIP
+        tier_cadence_s, _ = _TIER_CONFIG[tier]()
+        skipped_fresh_ids: list[str] = []
+        if _FRESH_SKIP:
+            still_scout: dict[str, Game] = {}
+            for gid, g in tier_games.items():
+                try:
+                    latest = await candidate_store.latest_news_ingested_at(gid)
+                except Exception as exc:
+                    logger.warning(
+                        "[tier:%s] freshness probe failed for %s: %s",
+                        tier, gid, exc,
+                    )
+                    latest = None
+                if latest is not None and (now - latest) < tier_cadence_s:
+                    age_min = (now - latest) / 60.0
+                    logger.info(
+                        "[tier:%s] fixture %s skipped — news fresh (%.0fm ago)",
+                        tier, gid, age_min,
+                    )
+                    skipped_fresh_ids.append(gid)
+                else:
+                    still_scout[gid] = g
+            scouted_games = still_scout
+        else:
+            scouted_games = dict(tier_games)
+        scouted_ids = list(scouted_games.keys())
+        logger.info(
+            "[tier:%s] freshness filter — %d to scout, %d skipped_fresh",
+            tier, len(scouted_ids), len(skipped_fresh_ids),
+        )
+        # Expire prior published candidates for ONLY the fixtures we're
+        # actually scouting this tick. Skipped-fresh fixtures keep their
+        # existing cards in place (same news → same cards, no churn).
         try:
-            n_expired = await candidate_store.expire_published_for_fixtures(fixture_ids)
+            n_expired = await candidate_store.expire_published_for_fixtures(scouted_ids)
             logger.info("[tier:%s] expired %d prior published candidates", tier, n_expired)
         except Exception as exc:
             logger.warning("[tier:%s] expire_for_fixtures failed: %s", tier, exc)
@@ -1195,7 +1384,7 @@ async def _run_tier_once(tier: str) -> dict:
         # per fixture, let the engine publish fresh cards on top, then
         # sweep any pre-cycle ids that weren't re-emitted (deferred-
         # replace, zero-gap).
-        fixture_set = set(fixture_ids)
+        fixture_set = set(scouted_ids)
         pre_cycle_ids_by_game: dict[str, list[str]] = {}
         for c in list(feed.prematch_cards):
             gid = getattr(getattr(c, "game", None), "id", None)
@@ -1212,22 +1401,30 @@ async def _run_tier_once(tier: str) -> dict:
             )
         try:
             # Per-card broadcast hook. Only fires when staggered publish
-            # is on (kill-switch PULSE_STAGGERED_PUBLISH_ENABLED).
+            # is on (kill-switch PULSE_STAGGERED_PUBLISH_ENABLED). Uses
+            # the release-buffer enqueue so the WS broadcast order stays
+            # hook-diverse (PR #53). If PULSE_PUBLISH_BUFFER_SECONDS=0,
+            # the enqueue path broadcasts immediately.
             from app.config import PULSE_STAGGERED_PUBLISH_ENABLED
             async def _on_card(card: Card) -> None:
                 newly_emitted_ids.add(card.id)
                 if not PULSE_STAGGERED_PUBLISH_ENABLED:
                     return
                 try:
-                    await feed.broadcast_card_added(card)
+                    await _enqueue_release(card)
                 except Exception as exc:
-                    logger.warning("[tier:%s] broadcast_card_added errored: %s", tier, exc)
+                    logger.warning("[tier:%s] enqueue_release errored: %s", tier, exc)
             if not PULSE_NEWS_INGEST_ENABLED:
                 logger.info("[tier:%s] skipped — PULSE_NEWS_INGEST_ENABLED=false", tier)
+            elif not scouted_games:
+                logger.info(
+                    "[tier:%s] all %d fixtures skipped_fresh — engine bypassed",
+                    tier, len(skipped_fresh_ids),
+                )
             else:
                 async with _engine_mutex:
                     await _run_candidate_engine(
-                        tier_games,
+                        scouted_games,
                         rogue_client=client,
                         target_feed=feed,
                         max_fixtures=max_fixtures,
@@ -1260,8 +1457,29 @@ async def _run_tier_once(tier: str) -> dict:
         if swept:
             logger.info("[tier:%s] swept %d replaced/orphaned cards", tier, swept)
         elapsed = _time.time() - t0
+        # Rough per-fixture cost estimate: Haiku scout w/ web_search runs
+        # ~$0.01/fixture at PULSE_NEWS_MAX_SEARCHES=5. Skipped-fresh
+        # fixtures cost ~$0 (rebuild from cached news, no LLM). Real
+        # telemetry would come from Anthropic's usage API; this is a
+        # directional dashboard value, not billable.
+        est_cost = round(len(scouted_ids) * 0.01, 3)
+        scouted_count = len(scouted_ids)
+        skipped_count = len(skipped_fresh_ids)
+        candidates_emitted = len(newly_emitted_ids)
+        logger.info(
+            "[tier:%s] cycle: scouted=%d skipped_fresh=%d candidates=%d cost_estimate=$%.2f",
+            tier, scouted_count, skipped_count, candidates_emitted, est_cost,
+        )
         logger.info("[tier:%s] cycle finish in %.1fs", tier, elapsed)
-        return {"ok": True, "fixtures": len(fixture_ids), "elapsed_s": round(elapsed, 1)}
+        return {
+            "ok": True,
+            "fixtures": len(fixture_ids),
+            "scouted": scouted_count,
+            "skipped_fresh": skipped_count,
+            "candidates": candidates_emitted,
+            "cost_estimate_usd": est_cost,
+            "elapsed_s": round(elapsed, 1),
+        }
     except Exception as exc:
         logger.exception("[tier:%s] cycle errored: %s", tier, exc)
         return {"ok": False, "error": str(exc)}
@@ -1447,8 +1665,10 @@ async def _run_candidate_engine(
             "[PULSE] Hook-bet-type preference override applied: %s",
             PULSE_HOOK_BET_TYPE_PREFERENCE_JSON,
         )
+    from app.config import PULSE_NEWS_CANDIDATES_PER_FIXTURE_MAX
     policy = PolicyLayer(
         publish_threshold=PULSE_PUBLISH_THRESHOLD,
+        per_fixture_cap=PULSE_NEWS_CANDIDATES_PER_FIXTURE_MAX,
         hook_bet_type_preference=_merged_pref,
     )
     # Bet Builder generator — only active when we have a Rogue client.
@@ -1498,9 +1718,9 @@ async def _run_candidate_engine(
             author = CombinedNarrativeAuthor(_anth, model=os.getenv("PULSE_STORYLINE_MODEL", "claude-sonnet-4-6"))
 
             try:
-                story_cap = int(os.getenv("PULSE_STORYLINE_COMBOS_MAX", "3"))
+                story_cap = int(os.getenv("PULSE_STORYLINE_COMBOS_MAX", "5"))
             except ValueError:
-                story_cap = 3
+                story_cap = 5
 
             # Enabled types — each with its own kill switch so ops can
             # disable a misbehaving detector without a redeploy. Insertion

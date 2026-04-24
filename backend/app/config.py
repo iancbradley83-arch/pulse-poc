@@ -280,14 +280,51 @@ PULSE_DEEPLINK_TEMPLATE_BSCODE = os.getenv(
 PULSE_TIERED_FRESHNESS_ENABLED = os.getenv(
     "PULSE_TIERED_FRESHNESS_ENABLED", "true",
 ).lower() == "true"
-PULSE_TIER_HOT_MIN_SECONDS = int(os.getenv("PULSE_TIER_HOT_MIN_SECONDS", "3600"))
-PULSE_TIER_WARM_MIN_SECONDS = int(os.getenv("PULSE_TIER_WARM_MIN_SECONDS", "7200"))
+# Volume-up defaults (2026-04-24, PR #53): HOT cadence halved to 30 min,
+# HOT/WARM fixture caps raised to 10 so the social feed sustains the
+# locked 20-30 cards/hour target. Boot-freshness skip (below) keeps cost
+# in check by cache-hitting fixtures whose news is still fresh.
+PULSE_TIER_HOT_MIN_SECONDS = int(os.getenv("PULSE_TIER_HOT_MIN_SECONDS", "1800"))
+PULSE_TIER_WARM_MIN_SECONDS = int(os.getenv("PULSE_TIER_WARM_MIN_SECONDS", "3600"))
 PULSE_TIER_COOL_MIN_SECONDS = int(os.getenv("PULSE_TIER_COOL_MIN_SECONDS", "21600"))
 PULSE_TIER_COLD_MIN_SECONDS = int(os.getenv("PULSE_TIER_COLD_MIN_SECONDS", "43200"))
-PULSE_TIER_HOT_MAX_FIXTURES = int(os.getenv("PULSE_TIER_HOT_MAX_FIXTURES", "5"))
-PULSE_TIER_WARM_MAX_FIXTURES = int(os.getenv("PULSE_TIER_WARM_MAX_FIXTURES", "8"))
+PULSE_TIER_HOT_MAX_FIXTURES = int(os.getenv("PULSE_TIER_HOT_MAX_FIXTURES", "10"))
+PULSE_TIER_WARM_MAX_FIXTURES = int(os.getenv("PULSE_TIER_WARM_MAX_FIXTURES", "10"))
 PULSE_TIER_COOL_MAX_FIXTURES = int(os.getenv("PULSE_TIER_COOL_MAX_FIXTURES", "6"))
 PULSE_TIER_COLD_MAX_FIXTURES = int(os.getenv("PULSE_TIER_COLD_MAX_FIXTURES", "4"))
+
+# Per-fixture candidate cap (applies inside PolicyLayer). Old implicit
+# default was 3; raising to 5 so high-conviction fixtures (Premier League
+# with multiple storylines) can surface more supply to the ranker.
+PULSE_NEWS_CANDIDATES_PER_FIXTURE_MAX = int(
+    os.getenv("PULSE_NEWS_CANDIDATES_PER_FIXTURE_MAX", "5")
+)
+
+# Boot-freshness skip: before scouting a fixture in a tier cycle, check
+# the DB for the latest `news_items.ingested_at` for that fixture. If it
+# is newer than the tier's own cadence, skip the scout entirely — news
+# is fresh, candidates + prices will rebuild from cache. This is the
+# money-saver: on a redeploy the DB already holds fresh news from the
+# most recent cycle, so we don't re-pay Haiku + web_search on boot.
+#
+# Kill-switch: set false to force every tier tick to scout regardless of
+# DB freshness (demo mode / forced-content scenario).
+PULSE_BOOT_FRESHNESS_SKIP_ENABLED = os.getenv(
+    "PULSE_BOOT_FRESHNESS_SKIP_ENABLED", "true",
+).lower() == "true"
+
+# Hook-diversity release buffer (social-feed stream ordering rule).
+# Candidates that pass gates are buffered for up to this many seconds
+# instead of broadcasting immediately. A single release scheduler wakes
+# ~every 20s and picks the next-best buffered card whose hook_type
+# differs from the last 2 published. If no match found, the oldest card
+# in the buffer is released anyway (no starvation).
+#
+# Set to 0 to disable buffering (cards broadcast immediately, pre-PR #53
+# behaviour).
+PULSE_PUBLISH_BUFFER_SECONDS = int(
+    os.getenv("PULSE_PUBLISH_BUFFER_SECONDS", "60")
+)
 
 # Staggered publish: each candidate is broadcast as it passes gates, not in
 # an atomic batch swap. Disable with false to revert to batch behaviour
