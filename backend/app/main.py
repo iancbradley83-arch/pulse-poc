@@ -651,7 +651,20 @@ async def generate_prematch_cards():
         # Kick off the periodic rerun loop AFTER initial load completes.
         # The loop sleeps first, so it doesn't compete with the boot pass.
         import asyncio as _asyncio
-        _rerun_task = _asyncio.create_task(_scheduled_rerun_loop())
+        from app.config import PULSE_TIERED_FRESHNESS_ENABLED as _TIERED
+        if _TIERED:
+            # New (2026-04-24) tiered freshness + staggered publish. Each
+            # tier schedules itself; cards stream into the live feed one at
+            # a time via the per-card broadcaster hook.
+            for _tier in _TIER_ORDER:
+                _tier_tasks.append(_asyncio.create_task(_tier_loop(_tier)))
+            _tier_tasks.append(_asyncio.create_task(_card_ttl_sweep_loop()))
+            logger.info(
+                "[PULSE] Tiered freshness active — %d tier loops + TTL sweep",
+                len(_TIER_ORDER),
+            )
+        else:
+            _rerun_task = _asyncio.create_task(_scheduled_rerun_loop())
 
         # Start the SSE live-pricing manager. Separate long-lived RogueClient
         # so the SSE stream isn't killed when the rerun's transient client
@@ -672,6 +685,11 @@ async def generate_prematch_cards():
 
 @app.on_event("shutdown")
 async def _shutdown_tasks():
+    for t in _tier_tasks:
+        try:
+            t.cancel()
+        except Exception:
+            pass
     if _sse_manager is not None:
         await _sse_manager.stop()
     if _sse_rogue_client is not None:
@@ -764,6 +782,45 @@ async def admin_rerun():
     _ondemand_rerun_inflight = True
     _ondemand_rerun_started_at = time.time()
     import asyncio as _asyncio
+    from app.config import PULSE_TIERED_FRESHNESS_ENABLED as _TIERED
+    if _TIERED:
+        # Tiered mode: fan out one cycle per tier concurrently so the demo
+        # sees cards insert one-by-one across every window. Keeps the
+        # single-flight guard via `_tier_inflight` per tier.
+        async def _fanout():
+            global _ondemand_rerun_inflight, _ondemand_rerun_last_result
+            t0 = time.time()
+            try:
+                results = await _asyncio.gather(
+                    *[_run_tier_once(t) for t in _TIER_ORDER],
+                    return_exceptions=True,
+                )
+                _ondemand_rerun_last_result = {
+                    "ok": True,
+                    "tiers": {t: str(r) for t, r in zip(_TIER_ORDER, results)},
+                    "elapsed_s": round(time.time() - t0, 1),
+                    "finished_at": time.time(),
+                }
+                logger.info("[PULSE] Tiered rerun fan-out complete")
+            except Exception as exc:
+                logger.exception("[PULSE] Tiered rerun fan-out failed: %s", exc)
+                _ondemand_rerun_last_result = {
+                    "ok": False, "error": str(exc),
+                    "elapsed_s": round(time.time() - t0, 1),
+                    "finished_at": time.time(),
+                }
+            finally:
+                _ondemand_rerun_inflight = False
+        _asyncio.create_task(_fanout())
+        return {
+            "ok": True,
+            "status": "started",
+            "mode": "tiered",
+            "tiers": list(_TIER_ORDER),
+            "estimated_seconds": 120,
+            "poll": "/admin/rerun/status",
+            "ws_event": "card_added",
+        }
     _asyncio.create_task(_do_ondemand_rerun())
     return {
         "ok": True,
@@ -984,6 +1041,268 @@ async def _scheduled_rerun_loop():
         )
 
 
+# ── Tiered freshness helpers ───────────────────────────────────────────
+#
+# Social-feed pivot (2026-04-24): replace the single 4h atomic cycle with
+# four independent tier loops (HOT/WARM/COOL/COLD) so cards stream in over
+# the hour rather than arriving in a 15-card burst once every 4h.
+#
+# Tier classification uses kickoff proximity. Game.start_time is a
+# formatted string like "23 Apr 20:00 UTC" (no year — `_start_time` in
+# catalogue_loader drops it). We reconstruct via the current year and
+# bump to next year if the resulting kickoff is >6 months in the past
+# (handles December→January wrap at year boundaries).
+
+_TIER_HOT = "HOT"
+_TIER_WARM = "WARM"
+_TIER_COOL = "COOL"
+_TIER_COLD = "COLD"
+_TIER_ORDER = (_TIER_HOT, _TIER_WARM, _TIER_COOL, _TIER_COLD)
+
+
+def _parse_kickoff_to_epoch(raw: str) -> "float | None":
+    """Parse catalogue_loader's formatted kickoff string into a unix ts.
+
+    Input shape: "23 Apr 20:00 UTC". Missing year — fill with the current
+    UTC year, bump forward a year if the result lands >6 months in the
+    past (Dec fixture viewed from Jan).
+    """
+    if not raw:
+        return None
+    try:
+        from datetime import datetime, timezone, timedelta
+        txt = raw.strip()
+        # Drop trailing "UTC" marker so strptime doesn't fail on tz text.
+        if txt.endswith(" UTC"):
+            txt = txt[:-4]
+        now = datetime.now(timezone.utc)
+        parsed = datetime.strptime(txt, "%d %b %H:%M").replace(
+            year=now.year, tzinfo=timezone.utc,
+        )
+        if (now - parsed) > timedelta(days=180):
+            parsed = parsed.replace(year=now.year + 1)
+        return parsed.timestamp()
+    except Exception:
+        return None
+
+
+def _classify_tier(game: Game, *, now: float) -> str:
+    """Return the tier bucket for a fixture based on seconds-to-kickoff."""
+    ko = _parse_kickoff_to_epoch(game.start_time or "")
+    if ko is None:
+        # Unknown kickoff — treat as COOL so we don't starve it but don't
+        # waste HOT budget either. Can be tuned.
+        return _TIER_COOL
+    seconds_to_kickoff = ko - now
+    if seconds_to_kickoff < 6 * 3600:
+        return _TIER_HOT
+    if seconds_to_kickoff < 24 * 3600:
+        return _TIER_WARM
+    if seconds_to_kickoff < 72 * 3600:
+        return _TIER_COOL
+    return _TIER_COLD
+
+
+_TIER_CONFIG = {
+    # (cadence_seconds, max_fixtures) pulled from env at read time so the
+    # values reflect any runtime override.
+    _TIER_HOT: lambda: (
+        int(os.getenv("PULSE_TIER_HOT_MIN_SECONDS", "3600")),
+        int(os.getenv("PULSE_TIER_HOT_MAX_FIXTURES", "5")),
+    ),
+    _TIER_WARM: lambda: (
+        int(os.getenv("PULSE_TIER_WARM_MIN_SECONDS", "7200")),
+        int(os.getenv("PULSE_TIER_WARM_MAX_FIXTURES", "8")),
+    ),
+    _TIER_COOL: lambda: (
+        int(os.getenv("PULSE_TIER_COOL_MIN_SECONDS", "21600")),
+        int(os.getenv("PULSE_TIER_COOL_MAX_FIXTURES", "6")),
+    ),
+    _TIER_COLD: lambda: (
+        int(os.getenv("PULSE_TIER_COLD_MIN_SECONDS", "43200")),
+        int(os.getenv("PULSE_TIER_COLD_MAX_FIXTURES", "4")),
+    ),
+}
+
+# Per-tier reentry guard so a long-running cycle can't overlap itself.
+_tier_inflight: dict[str, bool] = {t: False for t in _TIER_ORDER}
+_tier_tasks: list = []
+# Cross-tier mutex — the candidate engine sets a module-global
+# `candidate_engine` singleton during `_run_candidate_engine`, so two
+# tier cycles running concurrently would race it. Serialise the work
+# (tier loops each publish quickly; minutes-apart cadence so this isn't
+# a throughput bottleneck).
+_engine_mutex = None  # initialised lazily (anyio/asyncio loop must exist)
+
+
+async def _run_tier_once(tier: str) -> dict:
+    """Execute one cycle of a tier: filter fixtures, scout, publish per-card.
+
+    Called by both the periodic tier loop and the `/admin/rerun` fan-out.
+    Safe against self-overlap: guarded by `_tier_inflight[tier]`.
+    """
+    import time as _time
+    import asyncio as _asyncio
+    global _engine_mutex
+    if _engine_mutex is None:
+        _engine_mutex = _asyncio.Lock()
+    if _tier_inflight.get(tier):
+        logger.info("[tier:%s] skip — previous cycle still running", tier)
+        return {"skipped": "inflight"}
+    _tier_inflight[tier] = True
+    t0 = _time.time()
+    try:
+        _, max_fixtures = _TIER_CONFIG[tier]()
+        games = dict(simulator._games or {})
+        if not games:
+            logger.info("[tier:%s] no games loaded yet — skipping", tier)
+            return {"skipped": "no_games"}
+        now = _time.time()
+        tier_games = {
+            gid: g for gid, g in games.items()
+            if _classify_tier(g, now=now) == tier
+        }
+        if not tier_games:
+            logger.info("[tier:%s] no fixtures in window", tier)
+            return {"skipped": "no_fixtures"}
+        # Respect per-tier cap — sort by earliest kickoff so we always
+        # pick the most imminent within-window fixtures first.
+        tier_games = dict(
+            sorted(
+                tier_games.items(),
+                key=lambda kv: _parse_kickoff_to_epoch(kv[1].start_time or "") or 9e18,
+            )[:max_fixtures]
+        )
+        fixture_ids = list(tier_games.keys())
+        logger.info(
+            "[tier:%s] cycle start — %d fixtures (cap=%d)",
+            tier, len(fixture_ids), max_fixtures,
+        )
+        # Expire prior published candidates for ONLY these fixtures so
+        # other tiers' live cards stay in place.
+        try:
+            n_expired = await candidate_store.expire_published_for_fixtures(fixture_ids)
+            logger.info("[tier:%s] expired %d prior published candidates", tier, n_expired)
+        except Exception as exc:
+            logger.warning("[tier:%s] expire_for_fixtures failed: %s", tier, exc)
+        # Drop existing feed cards for these fixtures (+ broadcast removal)
+        # so the re-scout's freshly-published cards don't duplicate them.
+        # Uses a set for lookup; cross-event combos have game_id pointing
+        # to a nominal primary fixture so those get swept alongside.
+        fixture_set = set(fixture_ids)
+        stale_cards = [
+            c for c in list(feed.prematch_cards)
+            if getattr(c, "game", None) and c.game.id in fixture_set
+        ]
+        for sc in stale_cards:
+            feed.remove_prematch_card(sc.id)
+            try:
+                await feed.broadcast_card_removed(sc.id)
+            except Exception as exc:
+                logger.warning("[tier:%s] stale broadcast_card_removed errored: %s", tier, exc)
+        if stale_cards:
+            logger.info(
+                "[tier:%s] removed %d stale cards for re-scout fixtures",
+                tier, len(stale_cards),
+            )
+        # Spin a short-lived RogueClient for the cycle.
+        client = None
+        if ROGUE_CONFIG_JWT:
+            client = RogueClient(
+                base_url=ROGUE_BASE_URL,
+                config_jwt=ROGUE_CONFIG_JWT,
+                per_second=ROGUE_RATE_LIMIT_PER_SECOND,
+            )
+        try:
+            # Per-card broadcast hook. Only fires when staggered publish
+            # is on (kill-switch PULSE_STAGGERED_PUBLISH_ENABLED).
+            from app.config import PULSE_STAGGERED_PUBLISH_ENABLED
+            async def _on_card(card: Card) -> None:
+                if not PULSE_STAGGERED_PUBLISH_ENABLED:
+                    return
+                try:
+                    await feed.broadcast_card_added(card)
+                except Exception as exc:
+                    logger.warning("[tier:%s] broadcast_card_added errored: %s", tier, exc)
+            if not PULSE_NEWS_INGEST_ENABLED:
+                logger.info("[tier:%s] skipped — PULSE_NEWS_INGEST_ENABLED=false", tier)
+            else:
+                async with _engine_mutex:
+                    await _run_candidate_engine(
+                        tier_games,
+                        rogue_client=client,
+                        target_feed=feed,
+                        max_fixtures=max_fixtures,
+                        per_card_publish_hook=_on_card,
+                        tier_label=tier,
+                    )
+            if _sse_manager is not None:
+                _sse_manager.set_cards(feed.prematch_cards)
+        finally:
+            if client is not None:
+                await client.close()
+        elapsed = _time.time() - t0
+        logger.info("[tier:%s] cycle finish in %.1fs", tier, elapsed)
+        return {"ok": True, "fixtures": len(fixture_ids), "elapsed_s": round(elapsed, 1)}
+    except Exception as exc:
+        logger.exception("[tier:%s] cycle errored: %s", tier, exc)
+        return {"ok": False, "error": str(exc)}
+    finally:
+        _tier_inflight[tier] = False
+
+
+async def _tier_loop(tier: str) -> None:
+    """Periodic tier loop — sleeps cadence, runs one cycle, repeats."""
+    import asyncio as _asyncio
+    cadence_s, _ = _TIER_CONFIG[tier]()
+    # Stagger first-run offsets so tiers don't all fire at once on boot.
+    _offset_map = {_TIER_HOT: 90, _TIER_WARM: 180, _TIER_COOL: 270, _TIER_COLD: 360}
+    await _asyncio.sleep(_offset_map.get(tier, 60))
+    logger.info("[tier:%s] loop active — cadence %ds", tier, cadence_s)
+    while True:
+        try:
+            await _run_tier_once(tier)
+        except _asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.exception("[tier:%s] unexpected loop error: %s", tier, exc)
+        # Re-read cadence each cycle so env overrides without redeploy
+        # take effect on the next iteration.
+        cadence_s, _ = _TIER_CONFIG[tier]()
+        try:
+            await _asyncio.sleep(max(60, cadence_s))
+        except _asyncio.CancelledError:
+            return
+
+
+async def _card_ttl_sweep_loop() -> None:
+    """Periodically drop expired cards + broadcast removals."""
+    import asyncio as _asyncio
+    from app.config import PULSE_CARD_TTL_SECONDS, PULSE_CARD_TTL_SWEEP_SECONDS
+    logger.info(
+        "[PULSE] TTL sweep active — ttl=%ds, every %ds",
+        PULSE_CARD_TTL_SECONDS, PULSE_CARD_TTL_SWEEP_SECONDS,
+    )
+    while True:
+        try:
+            await _asyncio.sleep(max(10, PULSE_CARD_TTL_SWEEP_SECONDS))
+        except _asyncio.CancelledError:
+            return
+        try:
+            dropped = feed.expire_stale_prematch(PULSE_CARD_TTL_SECONDS)
+            if dropped:
+                logger.info("[PULSE] TTL swept %d cards off the feed", len(dropped))
+                for c in dropped:
+                    try:
+                        await feed.broadcast_card_removed(c.id)
+                    except Exception as exc:
+                        logger.warning(
+                            "[PULSE] broadcast_card_removed errored: %s", exc,
+                        )
+        except Exception as exc:
+            logger.exception("[PULSE] TTL sweep errored: %s", exc)
+
+
 def _label_contains_excluded_player(label: str, excluded: set) -> bool:
     """True if the goalscorer selection label names a player in `excluded`.
 
@@ -1015,6 +1334,9 @@ async def _run_candidate_engine(
     *,
     rogue_client: _Optional[RogueClient] = None,
     target_feed: _Optional[FeedManager] = None,
+    max_fixtures: _Optional[int] = None,
+    per_card_publish_hook=None,
+    tier_label: str = "",
 ):
     """Run the news-driven engine across the live catalogue.
 
@@ -1026,9 +1348,18 @@ async def _run_candidate_engine(
 
     target_feed: which FeedManager to publish into. Defaults to live `feed`;
     scheduled rerun loop passes a staging FeedManager.
+
+    max_fixtures: override PULSE_NEWS_MAX_FIXTURES. Tier loops pass a
+    tier-specific cap so HOT fixtures get more frequent, tighter scans
+    and COLD fixtures don't consume the whole budget.
+
+    per_card_publish_hook: async callable invoked with each published Card
+    immediately after insertion into target_feed. Staggered-publish mode
+    uses this to broadcast `card_added` per card. None = silent batch.
     """
     if target_feed is None:
         target_feed = feed
+    _tier_prefix = f"[tier:{tier_label}] " if tier_label else ""
     global candidate_engine
     await candidate_store.init()
 
@@ -1113,10 +1444,11 @@ async def _run_candidate_engine(
         combo_builder=combo_builder,
     )
 
+    _cap = max_fixtures if (max_fixtures is not None) else PULSE_NEWS_MAX_FIXTURES
     counts = await candidate_engine.run_once(
-        games_by_id, max_fixtures=PULSE_NEWS_MAX_FIXTURES,
+        games_by_id, max_fixtures=_cap,
     )
-    logger.info("[PULSE] Candidate engine counts: %s", counts)
+    logger.info("%s[PULSE] Candidate engine counts: %s", _tier_prefix, counts)
 
     # ── Cross-event storyline combos (spike, replaces Stage 3d) ──
     # Runs ONCE per cycle after the per-fixture news engine. Asks the LLM to
@@ -1655,6 +1987,18 @@ async def _run_candidate_engine(
                 cand.bscode = card.bscode
                 bscode_updates.append(cand)
         target_feed.add_prematch_card(card)
+        # Staggered publish hook — fires on every successful insert. Tier
+        # loops wire this to `feed.broadcast_card_added` so the frontend
+        # drops each new card into the feed one-by-one rather than waiting
+        # for a 4h atomic swap. Errors never block the publish.
+        if per_card_publish_hook is not None:
+            try:
+                await per_card_publish_hook(card)
+            except Exception as exc:
+                logger.warning(
+                    "%s[PULSE] per-card publish hook errored (ignored): %s",
+                    _tier_prefix, exc,
+                )
 
     if rewriter is not None:
         logger.info("[PULSE] NarrativeRewriter: %d hits, %d misses (fell back to scout copy)",

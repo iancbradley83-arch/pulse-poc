@@ -33,8 +33,46 @@ class FeedManager:
         return card
 
     def add_prematch_card(self, card: Card):
-        self.prematch_cards.append(self._decorate(card))
+        # Stamp published_at on first insert so tiered freshness + TTL
+        # sweeps have a stable reference (card.created_at is set when the
+        # Card object is built, which can be earlier when a rerun re-uses
+        # a cached scout's output).
+        decorated = self._decorate(card)
+        if getattr(decorated, "published_at", None) is None:
+            try:
+                decorated.published_at = time.time()
+            except Exception:
+                pass
+        self.prematch_cards.append(decorated)
         self._sort_prematch()
+
+    def remove_prematch_card(self, card_id: str) -> Card | None:
+        """Drop a card by id and return it (or None if absent)."""
+        for i, c in enumerate(self.prematch_cards):
+            if c.id == card_id:
+                return self.prematch_cards.pop(i)
+        return None
+
+    def expire_stale_prematch(self, ttl_seconds: float) -> list[Card]:
+        """Remove cards whose published_at is older than ttl_seconds.
+
+        Returns the removed Cards so the caller can broadcast per-card
+        `card_removed` events. Falls back to created_at if published_at
+        is missing (pre-PR cards).
+        """
+        if ttl_seconds <= 0:
+            return []
+        now = time.time()
+        keep: list[Card] = []
+        dropped: list[Card] = []
+        for c in self.prematch_cards:
+            stamp = getattr(c, "published_at", None) or c.created_at
+            if (now - stamp) > ttl_seconds:
+                dropped.append(c)
+            else:
+                keep.append(c)
+        self.prematch_cards = keep
+        return dropped
 
     def replace_prematch_cards(self, cards: list[Card]):
         """Atomic swap of the entire pre-match card list. Used by the
@@ -131,6 +169,49 @@ class FeedManager:
                 for leg in card.legs
                 if leg.selection_id
             },
+            "ts": time.time(),
+        }, default=str)
+        dead = []
+        for ws in self._websocket_clients:
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.unregister_ws(ws)
+
+    async def broadcast_card_added(self, card: Card) -> None:
+        """Push a single newly-published card to all WebSocket clients.
+
+        Part of the staggered-publish model (2026-04-24 social-feed pivot):
+        each candidate broadcasts as it lands rather than waiting for a
+        4h atomic swap. Frontend inserts at the correct sorted slot,
+        flashes a `.card-hero--new` glow, and starts the relative
+        timestamp ticking.
+        """
+        data = json.dumps({
+            "type": "card_added",
+            "card": card.model_dump(),
+            "ts": time.time(),
+        }, default=str)
+        dead = []
+        for ws in self._websocket_clients:
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.unregister_ws(ws)
+
+    async def broadcast_card_removed(self, card_id: str) -> None:
+        """Push a card removal to all WebSocket clients.
+
+        Fires when TTL expires a card or the engine decides to retract one.
+        Frontend fades the article out and drops it from the DOM.
+        """
+        data = json.dumps({
+            "type": "card_removed",
+            "card_id": card_id,
             "ts": time.time(),
         }, default=str)
         dead = []

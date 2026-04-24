@@ -90,6 +90,21 @@ const PULSE = (() => {
     return `${d}d`;
   }
 
+  // Live relative-time label driven off the card's `published_at` epoch
+  // (stamped by FeedManager.add_prematch_card). Ticks every 30s via
+  // startTimestampTicker below, so the feed feels alive even when nothing
+  // else is happening. Falls back to "just now" when published_at is
+  // missing or in the future (clock skew).
+  function formatRelativeTime(publishedAt) {
+    if (!publishedAt || typeof publishedAt !== 'number') return 'just now';
+    const deltaSec = (Date.now() / 1000) - publishedAt;
+    if (deltaSec < 30) return 'just now';
+    if (deltaSec < 60) return `${Math.floor(deltaSec)}s ago`;
+    if (deltaSec < 3600) return `${Math.floor(deltaSec / 60)}m ago`;
+    if (deltaSec < 86400) return `${Math.floor(deltaSec / 3600)}h ago`;
+    return `${Math.floor(deltaSec / 86400)}d ago`;
+  }
+
   function formatKickoff(raw) {
     if (!raw) return '';
     // Catalogue loader returns "21 Apr 19:00 UTC". Show "21 Apr · 19:00".
@@ -194,8 +209,11 @@ const PULSE = (() => {
       `--hook-color-10:${hook.color}20`,   // ~12% alpha
     ].join(';');
 
+    const publishedAt = (typeof card.published_at === 'number') ? card.published_at : null;
+    const relTime = formatRelativeTime(publishedAt);
+
     return `
-      <article class="card-hero${card.suspended ? ' card-suspended' : ''}" data-card-id="${escape(card.id || '')}" style="${style}">
+      <article class="card-hero${card.suspended ? ' card-suspended' : ''}" data-card-id="${escape(card.id || '')}" data-published-at="${publishedAt || ''}" style="${style}">
         <div class="card-glyph">${hookGlyph(hook.icon, 40, hook.color)}</div>
         <div class="card-body">
           <div class="card-head">
@@ -208,6 +226,7 @@ const PULSE = (() => {
             ${hookId === 'live_moment'
               ? `<span class="recency live"><span class="pulse"></span>Live · ${escape(ago)}</span>`
               : `<span class="recency">${escape(ago)} ago</span>`}
+            <time class="card-timestamp" data-timestamp>${escape(relTime)}</time>
           </div>
 
           <h2 class="card-headline">${escape(headline)}</h2>
@@ -606,12 +625,120 @@ const PULSE = (() => {
       if (!msg || !msg.type) return;
       if (msg.type === 'card_update') return applyCardUpdate(msg);
       if (msg.type === 'feed_refresh') return loadFeed();
+      if (msg.type === 'card_added') return applyCardAdded(msg);
+      if (msg.type === 'card_removed') return applyCardRemoved(msg);
       // new_card / game_update etc — ignored in v1
     });
   }
   function scheduleWSReconnect() {
     setTimeout(connectWS, _wsBackoffMs);
     _wsBackoffMs = Math.min(_wsBackoffMs * 2, 30000);
+  }
+
+  // ── Staggered insert: one card lands via WS, slot it into the correct
+  // sorted position (based on relevance_score + news-first) instead of a
+  // blind prepend. Respects the current filter — if the new card doesn't
+  // pass filters it's still added to the in-memory model but not the DOM.
+  function applyCardAdded(msg) {
+    const card = msg && msg.card;
+    if (!card || !card.id) return;
+    // Dedupe: if we already have this id in-memory, patch it (a tier
+    // loop might re-publish a card after a re-scout) rather than dup.
+    const existingIdx = allCards.findIndex(c => c.id === card.id);
+    if (existingIdx >= 0) {
+      allCards[existingIdx] = card;
+    } else {
+      allCards.push(card);
+    }
+    // Re-sort the whole in-memory list so ordering stays stable. Same
+    // comparator as loadFeed() for consistency.
+    allCards.sort((a, b) => {
+      const aNews = !!(a.hook_type && a.source_name);
+      const bNews = !!(b.hook_type && b.source_name);
+      if (aNews !== bNews) return aNews ? -1 : 1;
+      return (b.relevance_score || 0) - (a.relevance_score || 0);
+    });
+    if (!passesFilters(card)) return;
+
+    const feedEl = document.getElementById('feed');
+    if (!feedEl) return;
+    // Clear the empty-state if present.
+    const empty = feedEl.querySelector('.empty-state');
+    if (empty) feedEl.innerHTML = '';
+
+    // If a DOM node for this card already exists (dedupe), just re-render
+    // it in place so we don't double-render.
+    const existingArticle = feedEl.querySelector(
+      `article[data-card-id="${CSS.escape(card.id)}"]`,
+    );
+    if (existingArticle) {
+      const fresh = document.createElement('div');
+      fresh.innerHTML = renderHeroCard(card);
+      const replacement = fresh.firstElementChild;
+      if (replacement) {
+        replacement.classList.add('card-hero--new');
+        existingArticle.replaceWith(replacement);
+        if (window.PulseReactions) window.PulseReactions.injectInto(replacement);
+        setTimeout(() => replacement.classList.remove('card-hero--new'), 3000);
+      }
+      return;
+    }
+
+    // Fresh insert at the sorted slot. Find the visible position of
+    // the card in the currently-filtered list.
+    const filtered = allCards.filter(passesFilters);
+    const insertIdx = filtered.findIndex(c => c.id === card.id);
+    const articles = feedEl.querySelectorAll('article.card-hero');
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = renderHeroCard(card);
+    const newArticle = wrapper.firstElementChild;
+    if (!newArticle) return;
+    newArticle.classList.add('card-hero--new');
+    if (insertIdx <= 0 || articles.length === 0) {
+      feedEl.prepend(newArticle);
+    } else if (insertIdx >= articles.length) {
+      feedEl.appendChild(newArticle);
+    } else {
+      feedEl.insertBefore(newArticle, articles[insertIdx]);
+    }
+    if (window.PulseReactions) window.PulseReactions.injectInto(newArticle);
+    // Drop the NEW class after the pulse animation runs its course.
+    setTimeout(() => newArticle.classList.remove('card-hero--new'), 3000);
+  }
+
+  function applyCardRemoved(msg) {
+    const id = msg && msg.card_id;
+    if (!id) return;
+    const idx = allCards.findIndex(c => c.id === id);
+    if (idx >= 0) allCards.splice(idx, 1);
+    const feedEl = document.getElementById('feed');
+    if (!feedEl) return;
+    const article = feedEl.querySelector(
+      `article[data-card-id="${CSS.escape(id)}"]`,
+    );
+    if (!article) return;
+    article.classList.add('fading-out');
+    setTimeout(() => {
+      if (article.parentNode) article.parentNode.removeChild(article);
+      // If that was the last card, re-render the empty state.
+      if (!feedEl.querySelector('article.card-hero')) renderFeed();
+    }, 400);
+  }
+
+  // Timestamp ticker — every 30s, refresh each card's `time.card-timestamp`
+  // from its data-published-at attribute so "3m ago" → "4m ago" without a
+  // re-render of the whole card.
+  function startTimestampTicker() {
+    setInterval(() => {
+      document.querySelectorAll('article.card-hero').forEach(article => {
+        const stamp = parseFloat(article.getAttribute('data-published-at') || '');
+        if (!Number.isFinite(stamp)) return;
+        const node = article.querySelector('time.card-timestamp');
+        if (!node) return;
+        const next = formatRelativeTime(stamp);
+        if (node.textContent !== next) node.textContent = next;
+      });
+    }, 30 * 1000);
   }
 
   function applyCardUpdate(msg) {
@@ -658,6 +785,7 @@ const PULSE = (() => {
     wireFeedDelegation();
     loadFeed();
     connectWS();
+    startTimestampTicker();
   }
 
   return {
