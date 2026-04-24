@@ -23,6 +23,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from typing import Optional
@@ -173,13 +174,27 @@ class KmiankoSlipMinter:
 
     # ── Minting ────────────────────────────────────────────────────────
 
-    def _cache_key(self, selection_ids: list[str]) -> str:
+    def _cache_key(self, selection_ids: list[str], bet_type: str) -> str:
         joined = "|".join(sorted(s for s in selection_ids if s))
-        return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+        return hashlib.sha1(f"{bet_type}::{joined}".encode("utf-8")).hexdigest()
 
-    async def mint(self, selection_ids: list[str]) -> Optional[str]:
+    async def mint(
+        self,
+        selection_ids: list[str],
+        bet_type: str = "single",
+    ) -> Optional[str]:
         """Mint a bscode for the given selection IDs. Returns None on any
         failure (caller should fall back to selectionId deep-link).
+
+        `bet_type` drives the payload shape Kmianko persists:
+          - "single"      → section="single",  1 selection,  isBetBuilderBet=false
+          - "bet_builder" → section="single",  1 piped 0VS selection, isBetBuilderBet=true
+          - "combo"       → section="combo",   N selections, isCrossBet=true
+        Shape confirmed by decompiling `BetSlipState-BkAbsN8S.min.js` +
+        round-trip-verifying against prod kmianko /share-betslip +
+        /shared-betslip (POST 201 is not enough — GET must return 200 with
+        `bets` populated). The prior bare-string payload had the POST
+        succeed but the GET 500 with an empty slip.
         """
         if not selection_ids:
             return None
@@ -188,14 +203,15 @@ class KmiankoSlipMinter:
         if not clean:
             return None
 
-        key = self._cache_key(clean)
+        bt = (bet_type or "single").lower()
+        key = self._cache_key(clean, bt)
         now = time.time()
         cached = self._bscode_cache.get(key)
         if cached and (now - cached[1]) < self._BSCODE_TTL_S:
             return cached[0]
 
         async with self._sem:
-            bscode = await self._mint_once(clean)
+            bscode = await self._mint_once(clean, bt)
             if bscode is None:
                 return None
             self._bscode_cache[key] = (bscode, time.time())
@@ -208,12 +224,82 @@ class KmiankoSlipMinter:
                     self._bscode_cache.pop(k, None)
             return bscode
 
-    async def _mint_once(self, selection_ids: list[str]) -> Optional[str]:
+    @staticmethod
+    def _build_selection_entry(
+        selection_id: str,
+        view_key: int,
+        bet_type: str,
+    ) -> dict:
+        """Build one selection object for the /share-betslip payload.
+
+        Field semantics (decompiled from BetSlipState minified bundle):
+          selectionId       — Rogue selection id (or piped `0VS…` for BB)
+          viewKey           — client-assigned sequence number; endpoint
+                              stores it so the slip renders in order. We
+                              use 1..N matching the `Array.from(…,(_,i)=>i+1)`
+                              pattern the JS uses for anonymous users.
+          isCrossBet        — true only for multi-event combos
+          isDynamicMarket   — we don't use dynamic markets (always false)
+          isBetBuilderBet   — true when selection is a piped 0VS id
+          promotionIds      — [] (no active promotions surfaced here)
+          marketTypeTier    — "PRIMARY". The bundle reads it from each
+                              leg's stored MarketType.Tier but the endpoint
+                              accepts this literal for the slip-restore
+                              path (verified via prod round-trip). We
+                              can't enrich legs with a per-market Tier
+                              without a Rogue fetch; "PRIMARY" is the
+                              dominant value and keeps the payload
+                              structurally valid.
+          stake             — 0 (restore is read-only; user enters stake)
+          selectionPoints   — null (set only for dynamic-market legs)
+          mappedSelections  — [] for standard selections; populated only
+                              for virtual (BB) selections with expanded
+                              sub-selections, which we don't have access
+                              to here. The endpoint accepts [] for BBs
+                              too (round-trip verified).
+        """
+        is_bb = bet_type == "bet_builder" and selection_id.startswith("0VS")
+        is_cross = bet_type == "combo"
+        return {
+            "selectionId": selection_id,
+            "viewKey": view_key,
+            "isCrossBet": is_cross,
+            "isDynamicMarket": False,
+            "isBetBuilderBet": is_bb,
+            "promotionIds": [],
+            "marketTypeTier": "PRIMARY",
+            "stake": 0,
+            "selectionPoints": None,
+            "mappedSelections": [],
+        }
+
+    async def _mint_once(
+        self,
+        selection_ids: list[str],
+        bet_type: str,
+    ) -> Optional[str]:
         internal, session = await self.get_tokens()
         if not internal or not session:
             logger.warning("[kmianko] mint aborted — no tokens")
             return None
-        body = {"selections": selection_ids}
+        # BB is stored as a single virtual selection; section stays
+        # "single" because the BB-expanded legs live inside that one
+        # entry's Selections array server-side, not as separate entries.
+        section = "combo" if bet_type == "combo" else "single"
+        selections = [
+            self._build_selection_entry(sid, idx + 1, bet_type)
+            for idx, sid in enumerate(selection_ids)
+        ]
+        body = {
+            "selections": selections,
+            "systemOption": {"selectedIndex": 0, "selectedName": ""},
+            "section": section,
+        }
+        if os.environ.get("PULSE_KMIANKO_DEBUG_MINT", "").lower() == "true":
+            logger.info(
+                "[kmianko] mint payload (n=%d section=%s): %s",
+                len(selections), section, json.dumps(body),
+            )
         url = f"{self._base_url}/api/betslip/betslip/share-betslip"
         headers = {
             "Authorization": internal,

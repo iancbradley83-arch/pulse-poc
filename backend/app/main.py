@@ -237,7 +237,9 @@ async def _mint_and_stamp(card: Card) -> None:
     if not sel_ids:
         return
     try:
-        code = await kmianko_slip_minter.mint(sel_ids)
+        code = await kmianko_slip_minter.mint(
+            sel_ids, bet_type=(card.bet_type or "single").lower(),
+        )
     except Exception as exc:
         logger.warning("[PULSE] kmianko mint raised (ignored): %s", exc)
         return
