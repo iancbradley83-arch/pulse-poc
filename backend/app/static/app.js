@@ -401,30 +401,29 @@ const PULSE = (() => {
     // (PULSE_REACTIONS_ENABLED=false kill switch on the server).
     if (window.PulseReactions) window.PulseReactions.wireAll(feed);
 
-    // Wire engagement buttons
-    feed.querySelectorAll('.engagement button').forEach(btn => {
-      btn.addEventListener('click', () => {
-        if (btn.dataset.kind === 'share') return;
-        btn.classList.toggle('active');
-      });
-    });
+    // Engagement + CTA buttons are wired via one delegated listener on
+    // #feed (see wireFeedDelegation, called once at init). Per-render
+    // re-wiring was dropping handlers when `applyCardUpdate` replaced a
+    // card's <article> on SSE pricing ticks — first click worked, next
+    // click on any SSE-updated card was dead. Delegation survives any
+    // DOM replacement under #feed.
+  }
 
-    // CTA — Stage 5: the backend stamps `card.deep_link` with the
-    // operator's bet-slip URL (Apuesta Total's kmianko iframe URL with
-    // the Rogue selectionId / virtual_selection pre-loaded). Prefer that
-    // over the postMessage path.
-    //
-    // Order of preference:
-    //   1. card.deep_link present → fire click-track (sendBeacon) then
-    //      window.open in new tab. Covers singles, news BBs, featured BBs,
-    //      combos, storylines uniformly.
-    //   2. No deep_link AND we're inside an operator iframe → fall back to
-    //      the postMessage schema so embed integrations keep working.
-    //   3. Standalone demo with no deep_link → show debug toast.
-    feed.querySelectorAll('.cta-button').forEach(btn => {
-      btn.addEventListener('click', () => {
-        btn.animate([{ transform: 'scale(0.98)' }, { transform: 'scale(1)' }], { duration: 120 });
-        const cardId = btn.getAttribute('data-card-id');
+  // One-time delegated click handler on #feed. Handles:
+  //   - .cta-button         → open operator slip (deep_link) or postMessage fallback
+  //   - .engagement button  → toggle .active (cosmetic)
+  // Attached once at init; survives card re-renders + SSE card_update patches.
+  let _feedDelegationWired = false;
+  function wireFeedDelegation() {
+    if (_feedDelegationWired) return;
+    const feed = document.getElementById('feed');
+    if (!feed) return;
+    _feedDelegationWired = true;
+    feed.addEventListener('click', (ev) => {
+      const cta = ev.target.closest('.cta-button');
+      if (cta) {
+        cta.animate([{ transform: 'scale(0.98)' }, { transform: 'scale(1)' }], { duration: 120 });
+        const cardId = cta.getAttribute('data-card-id');
         const card = allCards.find(c => c.id === cardId);
         if (!card) return;
         if (card.deep_link) {
@@ -437,7 +436,13 @@ const PULSE = (() => {
         // Legacy embed path (operator host that listens for pulse:add_to_slip)
         const message = buildAddToSlipMessage(card);
         emitAddToSlip(message);
-      });
+        return;
+      }
+      const engBtn = ev.target.closest('.engagement button');
+      if (engBtn) {
+        if (engBtn.dataset.kind === 'share') return;
+        engBtn.classList.toggle('active');
+      }
     });
   }
 
@@ -650,6 +655,7 @@ const PULSE = (() => {
       document.body.classList.add('embed');
     }
     renderFilterStrip();
+    wireFeedDelegation();
     loadFeed();
     connectWS();
   }
