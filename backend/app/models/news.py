@@ -115,11 +115,25 @@ class StorylineParticipant(BaseModel):
     anytime-goalscorer selection in that fixture's Goalscorer market.
     For RELEGATION / EUROPE_CHASE: `team_name` anchors the leg and
     `player_name` is left empty.
+
+    `participant_context` is an additive structured block populated by the
+    detector's web-search pass (RELEGATION / EUROPE_CHASE only). Shape:
+      {"league": "La Liga",
+       "league_position": 17,
+       "league_size": 20,
+       "points_from_safety": 2,         # RELEGATION only
+       "points_from_european_spot": 3,  # EUROPE_CHASE only
+       "form_last_5": "LWLDL"}
+    Used by standings verification in the detector AND by
+    CombinedNarrativeAuthor to ground each team's framing in real numbers.
+    Empty dict = detector couldn't confidently fill it; narrative author
+    must NOT invent numbers the detector didn't supply.
     """
     player_name: str = ""                    # "Erling Haaland"
     team_name: str = ""                      # "Manchester City"
     fixture_id: str = ""                     # Rogue event id (resolved downstream)
     extra: str = ""                          # "23 goals", "19th in the table" — free text
+    participant_context: dict = Field(default_factory=dict)
 
 
 class StorylineItem(BaseModel):

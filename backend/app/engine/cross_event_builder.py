@@ -262,6 +262,11 @@ class CrossEventBuilder:
                 team_name=p.team_name,
                 fixture_id=game.id,
                 extra=p.extra,
+                # Carry the standings-verified context through so the
+                # CombinedNarrativeAuthor can ground each team's framing
+                # in real numbers. Additive field — empty dict on older
+                # detector output.
+                participant_context=getattr(p, "participant_context", {}) or {},
             ))
 
         if len(legs) < MIN_COMBO_LEGS:
