@@ -276,3 +276,26 @@ That's Stages 1 → 5. Everything after is enhancement.
 - **Not yet deployed** to Railway. Need to add `PULSE_DATA_SOURCE` and `ROGUE_CONFIG_JWT` as env vars there before the Railway build serves real data.
 
 - Rogue API MCP available at `/Users/ianbradley/Downloads/rogue-api-mcp/` — reference for the Python port.
+
+
+---
+
+## Backlog — UX / theming
+
+### Light theme (proper) — BACKLOG
+
+**Status:** scoped, not started. Quick 15-min attempt (PR #57) reverted via PR #58 — card backgrounds + header gradient + filter strip are hardcoded dark, so a token-swap alone flipped only text colour and produced invisible black-on-dark text.
+
+**Full scope:** [`docs/light-theme-brief.md`](docs/light-theme-brief.md). Four phases:
+1. **Token audit** — replace ~20 hardcoded colours in `styles.css` with CSS variables. Zero visual change in dark. Precondition for everything else.
+2. **Light palette design** — off-white background, white cards with real 1px borders + soft shadow, AA-contrast hook colour recalibration (dark theme's tactical `#5ee2a0` reads 1.8:1 on white — fails).
+3. **Depth system** — real elevation (box-shadow) replaces dark-mode's glow+border approach. New-card pulse + price-flash animations reworked for light.
+4. **Skeleton / scrollbar / gradient crown / per-card hook tint** — specific surfaces with their own math.
+
+**Gates before dispatch:**
+- Playwright E2E in both themes required (contrast-ratio sweep, screenshot comparison, toggle + first-visit OS-preference paths)
+- Ship behind `PULSE_LIGHT_THEME_ENABLED=false` kill switch for soft launch
+
+**Effort:** ~1 day focused work.
+
+**Priority:** P3. Don't start until R/U/S backlog completes (ranker, mix, supply, storyline coverage, combo quality). Product-quality wins beat cosmetic optionality at this stage.
