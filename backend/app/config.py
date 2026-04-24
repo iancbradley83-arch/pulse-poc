@@ -147,3 +147,22 @@ PULSE_DEEPLINK_TEMPLATE_BSCODE = os.getenv(
     # Default composes wrapper + iframe path + bscode query param.
     "{wrapper}?fpath=%2Fes-pe%2Fspbkv3%3Fbscode%3D{bscode}",
 )
+
+# Default TRUE: emit the direct kmianko URL instead of the apuestatotal.com
+# wrapper. Discovered post-PR #37 that the outer wrapper is a Next.js SPA
+# that builds the kmianko iframe client-side — its fpath decoder strips or
+# mangles the `bscode` query param when composing the iframe URL, so the
+# slip never hydrates. The direct kmianko URL ships `APP_QUERY_OVERRIDES =
+# {'bscode': '...'}` in the SSR HTML, which the bundle's useEffect reads to
+# fire `sendBsEvent({action:'GET_SHARED_BETSLIP', payload:{code:t}})` on
+# boot. Flip to false to restore the wrapper URL (PR #37 shape) without a
+# redeploy if needed.
+PULSE_DEEPLINK_USE_DIRECT_KMIANKO = os.getenv(
+    "PULSE_DEEPLINK_USE_DIRECT_KMIANKO", "true",
+).lower() == "true"
+# Direct-kmianko shape:
+#   {kmianko_base}{spbkv3_path}?bscode={bscode}
+PULSE_DEEPLINK_TEMPLATE_BSCODE_DIRECT = os.getenv(
+    "PULSE_DEEPLINK_TEMPLATE_BSCODE_DIRECT",
+    "{kmianko_base}{spbkv3_path}?bscode={bscode}",
+)
