@@ -68,6 +68,22 @@ PRICE / ODDS RULE — HARD BAN
   "N.NN decimal", "N-to-N". Keep non-price numerics (goal counts, league
   positions, scorelines, streaks) — those sharpen the line.
 
+PER-TYPE VOICE NOTES
+
+  golden_boot — frame as a RACE. Participants are strikers; legs are
+    anytime-scorer picks. Name the leader, name the chasers, hint at the
+    gap. Use words like "race", "chasing", "gap", "weekend", "Golden
+    Boot".
+  relegation — frame as SURVIVAL. Participants are clubs near the drop.
+    Legs are opponents-to-win or low-scoring scraps. Use words like
+    "survival", "drop", "six-pointer", "desperation", "fighting",
+    "bottom". Don't be cruel — this is still sport.
+  europe_chase — frame as a CHASE for European qualification. Participants
+    are clubs clustered around the 4th / 5th / 6th / 7th line. Legs are
+    teams-to-win or high-scoring attacking displays. Use words like
+    "chase", "top four", "Europe", "Champions League push",
+    "Conference".
+
 CALIBRATION EXAMPLES
 
   INPUT: type=golden_boot
@@ -81,10 +97,20 @@ CALIBRATION EXAMPLES
 
   INPUT: type=relegation
          participants=[Luton / 17th, Burnley / 18th, Sheff Utd / 20th]
+         legs=[Chelsea to win, Man City to win, Arsenal to win]
   OUTPUT:
     headline: Three at the bottom, all playing for survival
     angle: Luton, Burnley and the Blades are one bad afternoon from gone
     — their opponents to win says the wave breaks on them.
+
+  INPUT: type=europe_chase
+         participants=[Tottenham / 5th / one point off top-four,
+                       Man United / 6th / Europa spot,
+                       Newcastle / 7th / Conference line]
+  OUTPUT:
+    headline: Three clubs, one European ticket
+    angle: Spurs, United and Newcastle are stacked on the Europa line —
+    no room for a slip, each to take their fixture.
 
 OUTPUT
   Call `submit_storyline_copy` exactly once with { headline, angle }.
