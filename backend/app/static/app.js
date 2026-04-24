@@ -323,23 +323,38 @@ const PULSE = (() => {
     const el = document.getElementById('filter-strip');
     const parts = [];
 
-    // "All" chip
+    // Derive which hooks + leagues actually have cards in the current feed.
+    // Hide chips with zero representation — no point surfacing a filter that
+    // produces an empty view. The "Hook" / "League" labels are also dropped
+    // (not useful for end users).
+    const presentHooks = new Set();
+    const presentLeagues = new Set();
+    for (const c of allCards) {
+      if (c.hook_type) presentHooks.add(c.hook_type);
+      const lg = c.game?.broadcast || '';
+      if (lg) presentLeagues.add(lg);
+    }
+
+    // "All" chip — always visible
     parts.push(chipHTML({ id: 'all', label: 'All', active: activeHook === 'all' && activeLeague === 'all' }));
 
-    // Hook label + chips
-    parts.push(`<span class="filter-label">Hook</span>`);
-    for (const id of HOOK_CHIPS) {
+    // Hook chips — only render if at least one card has this hook
+    const visibleHookChips = HOOK_CHIPS.filter(id => presentHooks.has(id));
+    for (const id of visibleHookChips) {
       const h = HOOKS[id];
       parts.push(chipHTML({
         id, label: h.label, active: activeHook === id, hook: id, color: h.color,
       }));
     }
 
-    parts.push(`<span class="filter-divider" role="separator"></span>`);
-
-    // League label + chips
-    parts.push(`<span class="filter-label">League</span>`);
-    for (const l of LEAGUE_CHIPS) {
+    // League chips — only render if at least one card is in this league.
+    // LEAGUE_CHIPS uses .label for both id + display, so filter by label
+    // presence in the set above.
+    const visibleLeagueChips = LEAGUE_CHIPS.filter(l => presentLeagues.has(l.label));
+    if (visibleHookChips.length && visibleLeagueChips.length) {
+      parts.push(`<span class="filter-divider" role="separator"></span>`);
+    }
+    for (const l of visibleLeagueChips) {
       parts.push(chipHTML({
         id: `league:${l.label}`, label: l.label,
         active: activeLeague === l.label,
@@ -580,6 +595,9 @@ const PULSE = (() => {
         if (aNews !== bNews) return aNews ? -1 : 1;
         return (b.relevance_score || 0) - (a.relevance_score || 0);
       });
+      // Re-render filter strip so chips reflect only hook_types + leagues
+      // present in the current feed (empty categories stay hidden).
+      renderFilterStrip();
       renderFeed();
     } catch (err) {
       console.error('Feed fetch failed', err);
