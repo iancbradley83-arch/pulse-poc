@@ -4,7 +4,7 @@ Pure functions only. Takes a list of Cards plus the PULSE_BET_TYPE_MIX dict
 and returns an ordered list. See docs/refresh-and-ordering.md §2 for the
 target spec and ROADMAP R1/R2 for acceptance.
 
-The ranker does four things:
+The ranker does five things:
   1. Scores every card on relevance + fixture-proximity + freshness + a
      small featured bump.
   2. Drops cards that are "no-shows" (kickoff passed, fully suspended).
@@ -12,9 +12,12 @@ The ranker does four things:
      scored one.
   4. Interleaves by bet_type using the operator-configured quota slots so
      no single bet_type (today: featured BBs) monopolises the lead.
-  5. Runs a variety guard that demotes a card one slot back if the card
-     immediately above it shares the same league (`game.broadcast`) AND
-     `hook_type` — capped at 3 swaps per card so we never loop.
+  5. Runs a hook-variety guard that breaks up consecutive same-hook_type
+     pairs regardless of league, prefers same-bucket swaps to preserve
+     the bet_type mix, and falls back to cross-bucket swaps if needed.
+     Budget-capped at 5 swaps per pass to avoid thrashing.
+  6. Runs the legacy same-league + same-hook demotion as a tie-breaker
+     for any collision the hook-variety pass couldn't resolve.
 
 Imports from `app.models.schemas` for Card typing, but stays side-effect
 free so the `python backend/app/engine/feed_ranker.py` self-test runs in
@@ -47,6 +50,9 @@ _FEATURED_BUMP = 0.05
 
 # Variety guard
 _MAX_VARIETY_SWAPS = 3
+# Hook-variety guard (runs before the league+hook demotion). Budget-capped
+# per rank pass to avoid pathological shuffling on hook-heavy inputs.
+_MAX_HOOK_VARIETY_SWAPS = 5
 
 
 # ── Bet-type normalisation ──────────────────────────────────────────────
@@ -273,6 +279,87 @@ def _apply_mix_quota(
     return out
 
 
+# ── Hook-variety guard (runs first) ─────────────────────────────────────
+def _apply_hook_variety_guard(
+    ordered: list[Card], *, max_swaps: int = _MAX_HOOK_VARIETY_SWAPS,
+) -> list[Card]:
+    """Break up consecutive cards that share ``hook_type`` regardless of
+    league.
+
+    Walk the ordered list. For each slot ``i`` where
+    ``cards[i].hook_type == cards[i-1].hook_type`` (both non-empty), look
+    for the best later card whose hook_type differs from both
+    ``cards[i-1]`` and ``cards[i+1]`` (if present) and swap it in.
+
+    Preference order when picking a donor card:
+      1. Same bet_type bucket as ``cards[i]`` (preserves the mix quota).
+      2. Any bucket — log one line when we take a cross-bucket swap.
+
+    Budget-capped at ``max_swaps`` per rank pass. If no compatible swap
+    exists, accept the clump and move on.
+    """
+    n = len(ordered)
+    if n < 2:
+        return ordered
+    swaps_used = 0
+    i = 1
+    while i < n and swaps_used < max_swaps:
+        prev_hook = ordered[i - 1].hook_type or ""
+        curr_hook = ordered[i].hook_type or ""
+        if not prev_hook or prev_hook != curr_hook:
+            i += 1
+            continue
+        # Hook clump at slot i. Look for a donor at index j > i whose
+        # hook differs from prev_hook AND from the card that would land
+        # at slot i+1 after the swap (i.e. ordered[i+1] if j != i+1,
+        # else the old ordered[i]). Prefer same-bucket donors.
+        target_bucket = _bucket_of(ordered[i])
+        after_hook = ordered[i + 1].hook_type or "" if i + 1 < n else ""
+        same_bucket_donor: Optional[int] = None
+        any_bucket_donor: Optional[int] = None
+        for j in range(i + 1, n):
+            donor = ordered[j]
+            dhook = donor.hook_type or ""
+            if not dhook or dhook == prev_hook:
+                continue
+            # After the swap the card at i+1 will be the old ordered[i]
+            # (if j == i+1) — its hook equals prev_hook, which is fine;
+            # the clump we care about is between i-1 and i, not i and
+            # i+1. For j > i+1, the card at i+1 stays the same so we
+            # also want donor's hook != after_hook to avoid immediately
+            # creating a new i/i+1 clump.
+            if j > i + 1 and after_hook and dhook == after_hook:
+                continue
+            if any_bucket_donor is None:
+                any_bucket_donor = j
+            if _bucket_of(donor) == target_bucket:
+                same_bucket_donor = j
+                break
+        donor_idx = same_bucket_donor if same_bucket_donor is not None else any_bucket_donor
+        if donor_idx is None:
+            # No compatible donor — accept the clump.
+            i += 1
+            continue
+        if same_bucket_donor is None:
+            # Cross-bucket swap: log one line so we can see it in the feed
+            # audit. Keep it lightweight — this is a pure function so we
+            # just print; the caller captures stdout in admin rerun logs.
+            print(
+                "[feed_ranker] hook-variety cross-bucket swap: "
+                f"slot={i} hook={curr_hook!r} donor_slot={donor_idx} "
+                f"donor_bucket={_bucket_of(ordered[donor_idx])} "
+                f"target_bucket={target_bucket}"
+            )
+        ordered[i], ordered[donor_idx] = ordered[donor_idx], ordered[i]
+        swaps_used += 1
+        # Re-check this slot — the swapped-in card may still clump with
+        # i-1 if all later cards share the same hook, in which case the
+        # next loop iteration will find no donor and move on.
+        # Advance to next slot regardless; budget cap bounds total work.
+        i += 1
+    return ordered
+
+
 # ── Variety guard ───────────────────────────────────────────────────────
 def _apply_variety_guard(ordered: list[Card]) -> list[Card]:
     """If consecutive cards share league AND hook_type, push the later one
@@ -338,7 +425,18 @@ def rank_cards(
     # 5. Slot-interleave by bet-type quota.
     picked = _apply_mix_quota(alive, mix, limit)
 
-    # 6. Variety guard.
+    # 6. Hook-variety guard (league-agnostic). Toggleable so we can A/B
+    # via PULSE_HOOK_VARIETY_GUARD_ENABLED. Import is deferred to keep
+    # this module importable in the self-test without the app package
+    # being fully wired.
+    try:
+        from app.config import PULSE_HOOK_VARIETY_GUARD_ENABLED as _hvg_on
+    except Exception:
+        _hvg_on = True
+    if _hvg_on:
+        picked = _apply_hook_variety_guard(picked)
+
+    # 7. Legacy league+hook variety guard (tie-breaker).
     picked = _apply_variety_guard(picked)
 
     return picked[:limit]
@@ -471,4 +569,61 @@ if __name__ == "__main__":
             f"({c.game.broadcast}/{c.hook_type or '-'}) "
             f"rel={c.relevance_score:.2f} score={s:.3f}"
         )
+
+    # --- Hook-variety stress test ----------------------------------------
+    # 10 cards: 6 team_news, 3 injury, 1 preview, spread across leagues so
+    # the league+hook guard alone would not break them up.
+    hv_cards: list[Card] = []
+    leagues = ["EPL", "La Liga", "Bundesliga", "Serie A", "Ligue 1", "Eredivisie"]
+    # 6 team_news singles across 6 different leagues
+    for idx in range(6):
+        hv_cards.append(mk_card(
+            gid=f"tn{idx}", league=leagues[idx], hours_ahead=10 + idx,
+            bet_type="single", relevance=0.80 - idx * 0.01,
+            hook="team_news", ago_minutes=30 + idx,
+            market_type=f"mt_tn{idx}",
+        ))
+    # 3 injury singles across 3 different leagues
+    for idx in range(3):
+        hv_cards.append(mk_card(
+            gid=f"inj{idx}", league=leagues[idx], hours_ahead=20 + idx,
+            bet_type="single", relevance=0.75 - idx * 0.01,
+            hook="injury", ago_minutes=40 + idx,
+            market_type=f"mt_inj{idx}",
+        ))
+    # 1 preview single
+    hv_cards.append(mk_card(
+        gid="prev0", league="EPL", hours_ahead=36,
+        bet_type="single", relevance=0.70,
+        hook="preview", ago_minutes=90,
+        market_type="mt_prev0",
+    ))
+
+    hv_ranked = rank_cards(hv_cards, {"singles": 100, "bb": 0, "combos": 0}, limit=15)
+    print("\n=== hook-variety stress test ===")
+    for i, c in enumerate(hv_ranked):
+        print(f"  {i + 1}. hook={c.hook_type or '-':10s} league={c.game.broadcast}")
+
+    # Count remaining consecutive-same-hook pairs in the first 15 slots.
+    hv_consecutive = 0
+    for i in range(1, min(15, len(hv_ranked))):
+        a_hook = hv_ranked[i - 1].hook_type or ""
+        b_hook = hv_ranked[i].hook_type or ""
+        if a_hook and a_hook == b_hook:
+            # With 6 team_news + 3 injury + 1 preview = 10 cards, we have
+            # at most 4 "other" cards to slot between the 6 team_news, so
+            # some clumping is mathematically forced. Check that we did
+            # better than the dumb sorted order (which would yield 5
+            # consecutive pairs from the 6 team_news block).
+            hv_consecutive += 1
+    print(f"Consecutive same-hook pairs in first 15: {hv_consecutive}")
+    # Dumb sort would give 5 (6-in-a-row team_news) + 2 (3-in-a-row
+    # injury) = 7 clump pairs. The guard should bring this down well
+    # below that. Assert strictly less than 3 — the mathematically
+    # forced floor with this composition is 2 (6 team_news spread
+    # among 4 others = two clumps).
+    assert hv_consecutive <= 2, (
+        f"hook-variety guard should leave ≤2 forced clumps, got {hv_consecutive}"
+    )
+
     print("PASS")
