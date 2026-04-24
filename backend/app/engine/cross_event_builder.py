@@ -183,11 +183,109 @@ def _pick_europe_chase_leg(
     return _pick_totals_leg(catalog, game, "over")
 
 
+def _pick_btts_yes_leg(
+    catalog: MarketCatalog, game: Game,
+) -> Optional[tuple[Market, MarketSelection]]:
+    """Pick the "Yes" selection from the btts market for DERBY_WEEKEND.
+
+    BTTS is the canonical derby bet — rivalry + stakes + familiarity
+    between XIs reliably produces goals at both ends. Returns None if
+    the fixture has no btts market.
+    """
+    markets = [m for m in catalog.get_by_game(game.id) if m.market_type == "btts"]
+    if not markets:
+        return None
+    market = markets[0]
+    # btts selections carry outcome_type "yes" / "no" post-catalogue-load.
+    for sel in market.selections:
+        if (sel.outcome_type or "").lower() == "yes" and sel.selection_id:
+            return market, sel
+    # Some ingested btts markets use label-only; last-resort match.
+    for sel in market.selections:
+        if "yes" in (sel.label or "").lower() and sel.selection_id:
+            return market, sel
+    return None
+
+
+def _pick_derby_weekend_leg(
+    catalog: MarketCatalog, game: Game, _side: str,
+) -> Optional[tuple[Market, MarketSelection]]:
+    """Pick a derby-aligned leg — BTTS Yes primary, Over 2.5 fallback.
+
+    `side` is ignored: DERBY_WEEKEND doesn't back either team, it backs
+    the FIXTURE to be eventful. Keeping the signature identical to the
+    other pickers lets the dispatch table stay uniform.
+    """
+    picked = _pick_btts_yes_leg(catalog, game)
+    if picked is not None:
+        return picked
+    return _pick_totals_leg(catalog, game, "over")
+
+
+def _pick_european_week_leg(
+    catalog: MarketCatalog, game: Game, club_side: str,
+) -> Optional[tuple[Market, MarketSelection]]:
+    """Pick a European-week-aligned leg — club to win (1X2), fallback
+    over 2.5 goals. Same shape as Europe Chase since the "back the
+    narrative" intent is identical.
+    """
+    picked = _pick_match_result_leg(catalog, game, club_side)
+    if picked is not None:
+        return picked
+    return _pick_totals_leg(catalog, game, "over")
+
+
+def _pick_title_race_leg(
+    catalog: MarketCatalog, game: Game, contender_side: str,
+) -> Optional[tuple[Market, MarketSelection]]:
+    """Pick a title-race-aligned leg — contender to win their match.
+
+    No fallback to totals — if a title contender's fixture is missing
+    1X2 odds something is off with the catalogue, skip the leg rather
+    than corrupt the "all to win" framing with a goals bet.
+    """
+    return _pick_match_result_leg(catalog, game, contender_side)
+
+
+def _pick_home_fortress_leg(
+    catalog: MarketCatalog, game: Game, _side: str,
+) -> Optional[tuple[Market, MarketSelection]]:
+    """Pick a fortress-aligned leg — home side to win. Always 'home'
+    regardless of the side value (the scout only emits home-side
+    participants for this type).
+    """
+    return _pick_match_result_leg(catalog, game, "home")
+
+
+_SUPPORTED_TYPES: set[StorylineType] = {
+    StorylineType.GOLDEN_BOOT,
+    StorylineType.RELEGATION,
+    StorylineType.EUROPE_CHASE,
+    StorylineType.TITLE_RACE,
+    StorylineType.DERBY_WEEKEND,
+    StorylineType.EUROPEAN_WEEK,
+    StorylineType.HOME_FORTRESS,
+    StorylineType.GOAL_MACHINES,
+}
+
+# Types whose leg is a player-anytime-goalscorer pick — they need a
+# player_name on the participant (GOLDEN_BOOT's original guard is now
+# shared with GOAL_MACHINES).
+_PLAYER_LEG_TYPES: set[StorylineType] = {
+    StorylineType.GOLDEN_BOOT,
+    StorylineType.GOAL_MACHINES,
+}
+
+
 class CrossEventBuilder:
     """StorylineItem -> CandidateCard(COMBO).
 
-    Supports GOLDEN_BOOT, RELEGATION, and EUROPE_CHASE. Other storyline
-    types return None until a market-leg picker is wired per type.
+    Supports the three original types (GOLDEN_BOOT, RELEGATION,
+    EUROPE_CHASE) plus the five expansion types (TITLE_RACE,
+    DERBY_WEEKEND, EUROPEAN_WEEK, HOME_FORTRESS, GOAL_MACHINES). Each
+    type has a dedicated leg-picker; types not in _SUPPORTED_TYPES
+    (reserved enum values like MANAGER_PRESSURE / DEBUT_RETURN) return
+    None.
     """
 
     def __init__(self, catalog: MarketCatalog):
@@ -197,11 +295,7 @@ class CrossEventBuilder:
         self, storyline: StorylineItem, games: dict[str, Game]
     ) -> Optional[CandidateCard]:
         st = storyline.storyline_type
-        if st not in (
-            StorylineType.GOLDEN_BOOT,
-            StorylineType.RELEGATION,
-            StorylineType.EUROPE_CHASE,
-        ):
+        if st not in _SUPPORTED_TYPES:
             logger.debug(
                 "CrossEventBuilder: type=%s not supported", st.value,
             )
@@ -219,11 +313,14 @@ class CrossEventBuilder:
                     "CrossEventBuilder: skipping participant with missing team: %s", p,
                 )
                 continue
-            # Golden Boot needs a player name too — the leg is a
-            # goalscorer selection. Relegation / Europe chase don't.
-            if st == StorylineType.GOLDEN_BOOT and not p.player_name:
+            # Player-leg types (GOLDEN_BOOT, GOAL_MACHINES) need a player
+            # name — the leg is a goalscorer selection. Team-leg types
+            # (relegation, europe chase, title race, derby weekend,
+            # european week, home fortress) don't.
+            if st in _PLAYER_LEG_TYPES and not p.player_name:
                 logger.debug(
-                    "CrossEventBuilder: golden_boot participant missing player_name: %s", p,
+                    "CrossEventBuilder: %s participant missing player_name: %s",
+                    st.value, p,
                 )
                 continue
             match = _find_fixture_for_team(p.team_name, games)
@@ -245,10 +342,22 @@ class CrossEventBuilder:
                 continue
             if st == StorylineType.GOLDEN_BOOT:
                 picked = _pick_goalscorer_leg(self._catalog, game, p.player_name)
+            elif st == StorylineType.GOAL_MACHINES:
+                picked = _pick_goalscorer_leg(self._catalog, game, p.player_name)
             elif st == StorylineType.RELEGATION:
                 picked = _pick_relegation_leg(self._catalog, game, side)
-            else:  # EUROPE_CHASE
+            elif st == StorylineType.EUROPE_CHASE:
                 picked = _pick_europe_chase_leg(self._catalog, game, side)
+            elif st == StorylineType.TITLE_RACE:
+                picked = _pick_title_race_leg(self._catalog, game, side)
+            elif st == StorylineType.DERBY_WEEKEND:
+                picked = _pick_derby_weekend_leg(self._catalog, game, side)
+            elif st == StorylineType.EUROPEAN_WEEK:
+                picked = _pick_european_week_leg(self._catalog, game, side)
+            elif st == StorylineType.HOME_FORTRESS:
+                picked = _pick_home_fortress_leg(self._catalog, game, side)
+            else:  # unreachable — _SUPPORTED_TYPES gates at the top
+                picked = None
             if picked is None:
                 logger.info(
                     "CrossEventBuilder: no aligned leg for %s in fixture %s (type=%s) — skipping",

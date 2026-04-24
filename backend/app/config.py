@@ -147,6 +147,58 @@ PULSE_STORYLINE_EUROPE_CHASE_ENABLED = os.getenv(
     "PULSE_STORYLINE_EUROPE_CHASE_ENABLED", "true",
 ).lower() == "true"
 
+# Five new storyline types (PR: storyline-expansion-top5). All default
+# true; flip to "false" on Railway to disable any one detector without a
+# redeploy. See `app/engine/storyline_detector.py` for per-type prompts
+# and verification logic.
+#
+#   TITLE_RACE     — top 2-4 clubs within 6 league-points, all in action.
+#                    Leg per club: to win (1X2).
+#   DERBY_WEEKEND  — >=3 known local / classic rivalry fixtures same week.
+#                    Leg per fixture: BTTS Yes (fallback Over 2.5).
+#   EUROPEAN_WEEK  — UCL + UEL + UECL midweek. Leg per club: to win (1X2).
+#   HOME_FORTRESS  — 4-6 clubs with elite home form all hosting this week.
+#                    Leg per club: home win (1X2 home side).
+#   GOAL_MACHINES  — 4-6 of Europe's top ~15 scorers all playing; legs are
+#                    anytime-scorer per player (cross-league OK, unlike
+#                    GOLDEN_BOOT which stays single-league by design).
+PULSE_STORYLINE_TITLE_RACE_ENABLED = os.getenv(
+    "PULSE_STORYLINE_TITLE_RACE_ENABLED", "true",
+).lower() == "true"
+PULSE_STORYLINE_DERBY_WEEKEND_ENABLED = os.getenv(
+    "PULSE_STORYLINE_DERBY_WEEKEND_ENABLED", "true",
+).lower() == "true"
+PULSE_STORYLINE_EUROPEAN_WEEK_ENABLED = os.getenv(
+    "PULSE_STORYLINE_EUROPEAN_WEEK_ENABLED", "true",
+).lower() == "true"
+PULSE_STORYLINE_HOME_FORTRESS_ENABLED = os.getenv(
+    "PULSE_STORYLINE_HOME_FORTRESS_ENABLED", "true",
+).lower() == "true"
+PULSE_STORYLINE_GOAL_MACHINES_ENABLED = os.getenv(
+    "PULSE_STORYLINE_GOAL_MACHINES_ENABLED", "true",
+).lower() == "true"
+
+# Per-type participant caps. GOAL_MACHINES, HOME_FORTRESS, EUROPEAN_WEEK,
+# and DERBY_WEEKEND all support up to 6 legs — the narrative scales
+# naturally with more actors on the stage. TITLE_RACE caps at 4 (only 4
+# clubs ever sit within 6 points of the leader in a real season). Lower
+# the caps here if we find 6-leg combos price out too absurd.
+PULSE_STORYLINE_GOAL_MACHINES_MAX_PARTICIPANTS = int(
+    os.getenv("PULSE_STORYLINE_GOAL_MACHINES_MAX_PARTICIPANTS", "6")
+)
+PULSE_STORYLINE_HOME_FORTRESS_MAX_PARTICIPANTS = int(
+    os.getenv("PULSE_STORYLINE_HOME_FORTRESS_MAX_PARTICIPANTS", "6")
+)
+PULSE_STORYLINE_EUROPEAN_WEEK_MAX_PARTICIPANTS = int(
+    os.getenv("PULSE_STORYLINE_EUROPEAN_WEEK_MAX_PARTICIPANTS", "6")
+)
+PULSE_STORYLINE_DERBY_WEEKEND_MAX_PARTICIPANTS = int(
+    os.getenv("PULSE_STORYLINE_DERBY_WEEKEND_MAX_PARTICIPANTS", "6")
+)
+PULSE_STORYLINE_TITLE_RACE_MAX_PARTICIPANTS = int(
+    os.getenv("PULSE_STORYLINE_TITLE_RACE_MAX_PARTICIPANTS", "4")
+)
+
 # ── Storyline standings verification ───────────────────────────────────
 # Before a team is emitted as a RELEGATION / EUROPE_CHASE participant,
 # the detector hits web_search via a second Haiku call to confirm the
