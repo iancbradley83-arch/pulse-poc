@@ -126,6 +126,21 @@ PULSE_STORYLINE_MIN_PARTICIPANTS = int(
     os.getenv("PULSE_STORYLINE_MIN_PARTICIPANTS", "2")
 )
 
+# Per-storyline-type kill switches. All default true so a deploy picks up
+# the new types automatically; set any to "false" to disable the
+# corresponding detector without a redeploy (Railway env flip). The
+# top-level `PULSE_STORYLINE_COMBOS_ENABLED` master switch gates the
+# whole storyline step and still applies.
+PULSE_STORYLINE_GOLDEN_BOOT_ENABLED = os.getenv(
+    "PULSE_STORYLINE_GOLDEN_BOOT_ENABLED", "true",
+).lower() == "true"
+PULSE_STORYLINE_RELEGATION_ENABLED = os.getenv(
+    "PULSE_STORYLINE_RELEGATION_ENABLED", "true",
+).lower() == "true"
+PULSE_STORYLINE_EUROPE_CHASE_ENABLED = os.getenv(
+    "PULSE_STORYLINE_EUROPE_CHASE_ENABLED", "true",
+).lower() == "true"
+
 # ── Stage 5 — deep-link CTA ────────────────────────────────────────────
 # The card's "Tap to bet" / "Add Bet Builder" CTA opens this URL (target=
 # _blank) with the card's Rogue selection_ids pre-loaded on the operator's

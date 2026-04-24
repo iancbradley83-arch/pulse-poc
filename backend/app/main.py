@@ -35,7 +35,10 @@ from app.config import (
     PULSE_NEWS_MAX_SEARCHES,
     PULSE_NEWS_MODEL,
     PULSE_PUBLISH_THRESHOLD,
+    PULSE_STORYLINE_EUROPE_CHASE_ENABLED,
+    PULSE_STORYLINE_GOLDEN_BOOT_ENABLED,
     PULSE_STORYLINE_MIN_PARTICIPANTS,
+    PULSE_STORYLINE_RELEGATION_ENABLED,
     ROGUE_BASE_URL,
     ROGUE_CATALOGUE_DAYS_AHEAD,
     ROGUE_CATALOGUE_MAX_EVENTS,
@@ -1484,33 +1487,87 @@ async def _run_candidate_engine(
             except ValueError:
                 story_cap = 3
 
-            storyline_candidates: list = []
-            for st in (_SType.GOLDEN_BOOT,):   # v1: only one type wired
-                if len(storyline_candidates) >= story_cap:
-                    break
+            # Enabled types — each with its own kill switch so ops can
+            # disable a misbehaving detector without a redeploy. Insertion
+            # order is the newsworthiness tiebreaker if all three have
+            # equal participant counts.
+            enabled_types: list = []
+            if PULSE_STORYLINE_RELEGATION_ENABLED:
+                enabled_types.append(_SType.RELEGATION)
+            if PULSE_STORYLINE_EUROPE_CHASE_ENABLED:
+                enabled_types.append(_SType.EUROPE_CHASE)
+            if PULSE_STORYLINE_GOLDEN_BOOT_ENABLED:
+                enabled_types.append(_SType.GOLDEN_BOOT)
+
+            # Detect across all enabled types FIRST, score + select AFTER.
+            # This way we don't burn the cap on the first type detected
+            # and starve the others. Keeps at-most-one of each type when
+            # possible so the feed doesn't get three Golden Boot cards.
+            detected: list[tuple[object, int]] = []  # (story, score)
+            for st in enabled_types:
                 try:
                     stories = await detector.detect(st, games_by_id)
                 except Exception as exc:
-                    logger.warning("[PULSE] StorylineDetector %s errored: %s", st.value, exc)
+                    logger.warning(
+                        "[PULSE] StorylineDetector %s errored: %s",
+                        st.value, exc,
+                    )
                     stories = []
                 for story in stories:
-                    if len(storyline_candidates) >= story_cap:
+                    # Score = participant count (more participants = more
+                    # newsworthy; 2 is the floor, 5 is the ceiling). We
+                    # don't have a real recency signal yet — standings
+                    # lookups are always today — so this keeps it honest.
+                    score = len(story.participants)
+                    detected.append((story, score))
+                    logger.info(
+                        "[PULSE] Storyline detected: type=%s score=%d headline=%s",
+                        story.storyline_type.value, score,
+                        (story.headline_hint or "")[:80],
+                    )
+
+            # Sort by score desc. Then greedy-pick up to `story_cap`,
+            # preferring diversity — take one of each type before a second
+            # of the same type.
+            detected.sort(key=lambda ss: -ss[1])
+            picked_stories: list = []
+            used_types: set = set()
+            for story, _ in detected:
+                if len(picked_stories) >= story_cap:
+                    break
+                if story.storyline_type in used_types:
+                    continue
+                picked_stories.append(story)
+                used_types.add(story.storyline_type)
+            # Second pass — if we have room and more stories detected,
+            # take the remaining highest-scored regardless of type. This
+            # only matters if future detectors return >1 storyline each;
+            # today each returns 0 or 1 so pass 2 is a no-op.
+            if len(picked_stories) < story_cap:
+                for story, _ in detected:
+                    if len(picked_stories) >= story_cap:
                         break
-                    cand = xbuilder.build(story, games_by_id)
-                    if cand is None:
+                    if story in picked_stories:
                         continue
-                    # Storyline combos are hand-curated patterns — they skip
-                    # the news scorer + policy layer. Mark them published so
-                    # the render loop picks them up.
-                    cand.score = 0.85
-                    cand.reason = f"cross-event storyline: {story.storyline_type.value}"
-                    cand.threshold_passed = True
-                    cand.status = _CStatus.PUBLISHED
-                    # Stash the storyline in-memory via the candidate's
-                    # narrative field for the author step below; author will
-                    # overwrite with fresh headline + angle.
-                    cand._storyline = story  # type: ignore[attr-defined] — transient
-                    storyline_candidates.append(cand)
+                    picked_stories.append(story)
+
+            storyline_candidates: list = []
+            for story in picked_stories:
+                cand = xbuilder.build(story, games_by_id)
+                if cand is None:
+                    continue
+                # Storyline combos are hand-curated patterns — they skip
+                # the news scorer + policy layer. Mark them published so
+                # the render loop picks them up.
+                cand.score = 0.85
+                cand.reason = f"cross-event storyline: {story.storyline_type.value}"
+                cand.threshold_passed = True
+                cand.status = _CStatus.PUBLISHED
+                # Stash the storyline in-memory via the candidate's
+                # narrative field for the author step below; author will
+                # overwrite with fresh headline + angle.
+                cand._storyline = story  # type: ignore[attr-defined] — transient
+                storyline_candidates.append(cand)
 
             # Author synthesised copy for each storyline combo BEFORE save,
             # so the headline on the CandidateCard is the storyline headline
