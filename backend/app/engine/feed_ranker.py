@@ -198,10 +198,15 @@ def score_card(card: Card, *, now: Optional[datetime] = None) -> float:
 
 
 def _is_featured(card: Card) -> bool:
-    """Featured BBs are operator-curated BBs with no news attached."""
+    """Featured BBs are operator-curated BBs with no news attached.
+
+    In production featured BBs come through with either ``hook_type`` unset
+    or explicitly tagged ``"featured"`` (case-insensitive) — accept both.
+    """
     if (card.bet_type or "") != "bet_builder":
         return False
-    if card.hook_type:
+    hook = (card.hook_type or "").strip().lower()
+    if hook and hook != "featured":
         return False  # news-driven BB
     if card.news:
         return False
@@ -624,6 +629,17 @@ if __name__ == "__main__":
     # among 4 others = two clumps).
     assert hv_consecutive <= 2, (
         f"hook-variety guard should leave ≤2 forced clumps, got {hv_consecutive}"
+    )
+
+    # --- _is_featured: accept hook_type="featured" ------------------------
+    # Production featured BBs come through tagged with hook_type="featured"
+    # rather than None — both shapes must count as operator-featured.
+    featured_tagged = mk_card(
+        gid="feat1", league="EPL", hours_ahead=48, bet_type="bet_builder",
+        relevance=0.60, hook="featured",
+    )
+    assert _is_featured(featured_tagged) is True, (
+        "BB with hook_type='featured' and no news should be treated as featured"
     )
 
     print("PASS")
