@@ -108,9 +108,12 @@ def create_reactions_routes(
         # Pull fixture/hook/bet/storyline for every clicked card so we
         # can re-aggregate click totals onto the same cohort grouping
         # that reactions use.
+        # Reuse CandidateStore._connect so journal_mode=DELETE pragma is
+        # applied — raw aiosqlite.connect throws disk-I/O errors on the
+        # Railway NFS-style volume (see feedback_sqlite_railway_volume).
         import aiosqlite as _aio
         cohort_clicks: dict[tuple, int] = {}
-        async with _aio.connect(store._db_path) as db:
+        async with store._connect() as db:
             db.row_factory = _aio.Row
             async with db.execute(
                 """

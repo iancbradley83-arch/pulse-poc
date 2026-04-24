@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 import aiosqlite
 
@@ -175,8 +177,75 @@ class CandidateStore:
         self._db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
+    @asynccontextmanager
+    async def _connect(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Open an aiosqlite connection with Railway-volume-safe pragmas.
+
+        Railway's persistent volumes are NFS-style and do NOT support
+        SQLite's WAL journal (mmap + file locking). WAL mode throws
+        `disk I/O error` on these mounts. We force the classic rollback
+        journal (`DELETE`) on every connection so the setting sticks
+        regardless of prior boots, and keep synchronous=NORMAL for
+        throughput. See memory feedback_sqlite_railway_volume.md.
+        """
+        conn = await aiosqlite.connect(self._db_path)
+        try:
+            await conn.execute("PRAGMA journal_mode=DELETE")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            yield conn
+        finally:
+            await conn.close()
+
     async def init(self) -> None:
-        async with aiosqlite.connect(self._db_path) as db:
+        # Ensure the parent dir exists — critical when PULSE_DB_PATH points
+        # at a freshly mounted Railway volume like /data/pulse.db.
+        parent_dir = os.path.dirname(self._db_path) or "."
+        os.makedirs(parent_dir, exist_ok=True)
+
+        # Sweep stale -wal / -shm sidecars from a prior WAL-mode attempt.
+        # If we inherit these from a previous boot that tried WAL on the
+        # NFS volume, every subsequent connection fails with "disk I/O
+        # error" even though we're now in DELETE mode — sqlite sees the
+        # files and assumes WAL is still active.
+        for suffix in ("-wal", "-shm"):
+            stale = Path(self._db_path + suffix)
+            try:
+                if stale.exists():
+                    stale.unlink()
+                    logger.info("[CandidateStore] swept stale sidecar %s", stale)
+            except Exception as exc:
+                logger.warning(
+                    "[CandidateStore] could not remove %s: %s", stale, exc
+                )
+
+        # Log fresh-vs-pre-existing for the Railway deploy verification.
+        db_file = Path(self._db_path)
+        if db_file.exists():
+            size = db_file.stat().st_size
+            logger.info(
+                "[CandidateStore] opening pre-existing DB at %s (%d bytes)",
+                self._db_path,
+                size,
+            )
+        else:
+            logger.info(
+                "[CandidateStore] opening fresh DB at %s", self._db_path
+            )
+
+        async with self._connect() as db:
+            # Confirm the pragma actually took — useful proof-of-persistence
+            # log line that Railway deploy verification greps for.
+            async with db.execute("PRAGMA journal_mode") as cur:
+                mode_row = await cur.fetchone()
+                mode = (mode_row[0] if mode_row else "?")
+                if str(mode).lower() == "delete":
+                    logger.info("[CandidateStore] journal_mode=DELETE confirmed")
+                else:
+                    logger.warning(
+                        "[CandidateStore] unexpected journal_mode=%s (expected DELETE)",
+                        mode,
+                    )
+
             # Schema migrations — additive only, idempotent. The candidates
             # table grew over multiple PRs:
             #   - PR #8  added total_odds + price_source
@@ -236,13 +305,30 @@ class CandidateStore:
             await db.executescript(_SCHEMA)
             await db.commit()
 
+            # Proof-of-persistence log: after init, how many rows did we
+            # inherit from the previous boot? First-boot runs will all
+            # read 0; a post-redeploy cache-hit boot will show non-zero
+            # and confirms the Railway volume retained state.
+            try:
+                async with db.execute("SELECT COUNT(*) FROM candidates") as cur:
+                    cand_row = await cur.fetchone()
+                async with db.execute("SELECT COUNT(*) FROM news_items") as cur:
+                    news_row = await cur.fetchone()
+                logger.info(
+                    "[CandidateStore] init complete — candidates=%s news_items=%s",
+                    (cand_row[0] if cand_row else 0),
+                    (news_row[0] if news_row else 0),
+                )
+            except Exception as exc:
+                logger.warning("[CandidateStore] row-count probe failed: %s", exc)
+
     # ── News items ──
 
     async def save_news_items(self, items: list[NewsItem]) -> None:
         if not items:
             return
         rows = [_news_to_row(item) for item in items]
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             await db.executemany(
                 """
                 INSERT OR REPLACE INTO news_items (
@@ -257,7 +343,7 @@ class CandidateStore:
             await db.commit()
 
     async def get_news_item(self, news_item_id: str) -> Optional[NewsItem]:
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM news_items WHERE id = ?", (news_item_id,)
@@ -271,7 +357,7 @@ class CandidateStore:
         if not candidates:
             return
         rows = [_candidate_to_row(c) for c in candidates]
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             await db.executemany(
                 """
                 INSERT OR REPLACE INTO candidates (
@@ -313,7 +399,7 @@ class CandidateStore:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY created_at DESC LIMIT ?"
         args.append(limit)
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(sql, args) as cur:
                 rows = await cur.fetchall()
@@ -329,7 +415,7 @@ class CandidateStore:
         reviewer: Optional[str] = None,
     ) -> None:
         import time as _t
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO candidate_reviews
@@ -351,7 +437,7 @@ class CandidateStore:
         Historical rows are kept (status=EXPIRED) so the admin table can
         still show what was published in past cycles.
         """
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "UPDATE candidates SET status = 'expired' WHERE status = 'published'"
             )
@@ -360,7 +446,7 @@ class CandidateStore:
 
     async def latest_verdict_by_candidate(self) -> dict[str, str]:
         """Return {candidate_id: latest_verdict} for fast render in the admin table."""
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -379,7 +465,7 @@ class CandidateStore:
 
     async def review_summary(self) -> dict[str, Any]:
         """Aggregate review stats for the admin dashboard."""
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT verdict, COUNT(*) AS n FROM candidate_reviews GROUP BY verdict") as cur:
                 verdicts = {r["verdict"]: r["n"] for r in await cur.fetchall()}
@@ -401,7 +487,7 @@ class CandidateStore:
         }
 
     async def counts_by_hook_and_status(self) -> list[dict[str, Any]]:
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -441,7 +527,7 @@ class CandidateStore:
             }
             for p in storyline.participants
         ]
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT OR REPLACE INTO storyline_items (
@@ -486,7 +572,7 @@ class CandidateStore:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY generated_at DESC LIMIT ?"
         args.append(limit)
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(sql, args) as cur:
                 rows = await cur.fetchall()
@@ -497,7 +583,7 @@ class CandidateStore:
     async def get_cached_ingest(
         self, fixture_id: str, cache_key: str, max_age_seconds: float
     ) -> Optional[list[dict[str, Any]]]:
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT ingested_at, payload_json FROM ingest_cache
@@ -521,7 +607,7 @@ class CandidateStore:
         self, fixture_id: str, cache_key: str, payload: list[dict[str, Any]]
     ) -> None:
         import time as _t
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT OR REPLACE INTO ingest_cache
@@ -547,7 +633,7 @@ class CandidateStore:
         import time as _t
         if reaction not in ("up", "down"):
             raise ValueError(f"reaction must be 'up'|'down', got {reaction!r}")
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO card_reactions (card_id, anon_id, reaction, created_at)
@@ -562,7 +648,7 @@ class CandidateStore:
         return await self.reaction_totals(card_id)
 
     async def reaction_totals(self, card_id: str) -> dict[str, int]:
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -583,7 +669,7 @@ class CandidateStore:
         """The caller's own stored reaction for this card, or None."""
         if not anon_id:
             return None
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT reaction FROM card_reactions WHERE card_id = ? AND anon_id = ?",
                 (card_id, anon_id),
@@ -600,7 +686,7 @@ class CandidateStore:
         kept — each is one distinct deep-link open, useful for seeing
         abandonment vs repeat-tap patterns."""
         import time as _t
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT INTO card_clicks (card_id, anon_id, created_at) "
                 "VALUES (?, ?, ?)",
@@ -610,7 +696,7 @@ class CandidateStore:
 
     async def click_totals(self) -> dict[str, int]:
         """Total clicks per card_id. Returned as {card_id: count} dict."""
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT card_id, COUNT(*) AS n FROM card_clicks GROUP BY card_id"
@@ -626,7 +712,7 @@ class CandidateStore:
         won't appear here — that's fine for v1; the interesting signal is on
         engine-produced cards anyway. Sorted by total desc.
         """
-        async with aiosqlite.connect(self._db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """

@@ -10,3 +10,19 @@ dockerfilePath = "backend/Dockerfile"
 [deploy]
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
+
+# ── Persistent SQLite cache (U1) ────────────────────────────────────────
+# Pulse's candidate / news / reactions cache lives in SQLite. Without a
+# volume, Railway's ephemeral FS wipes the DB on every redeploy, so every
+# boot re-scouts every fixture from scratch (~$0.30/boot in LLM spend).
+#
+# Railway's TOML schema doesn't support volume *creation* — volumes must
+# be provisioned via the Railway UI or GraphQL API and then mounted at
+# `/data`. Production env var `PULSE_DB_PATH=/data/pulse.db` is set via
+# the `railway-env` skill; see PR body for the one-line create command.
+#
+# IMPORTANT: Railway volumes are NFS-style and do NOT support SQLite's
+# WAL mode. Every connection in candidate_store.py forces
+# `journal_mode=DELETE`; init() sweeps any stale `-wal` / `-shm`
+# sidecars left over from a pre-migration boot. See memory
+# feedback_sqlite_railway_volume.md.
