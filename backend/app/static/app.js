@@ -793,7 +793,37 @@ const PULSE = (() => {
 
   // ── Init ────────────────────────────────────────────────────────────
 
+  // ── Theme (light/dark) ──
+  // Persisted in localStorage under "pulse_theme". On first load we
+  // honour the user's OS preference via matchMedia so the page isn't
+  // jarringly dark on a light system. Applied to <html data-theme="..."> so
+  // CSS variable overrides cascade to every element.
+  function applyTheme(theme) {
+    const t = theme === 'light' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', t);
+    try { localStorage.setItem('pulse_theme', t); } catch (_) {}
+  }
+  function initTheme() {
+    let stored = null;
+    try { stored = localStorage.getItem('pulse_theme'); } catch (_) {}
+    if (stored === 'light' || stored === 'dark') {
+      applyTheme(stored);
+      return;
+    }
+    // Respect OS preference on first visit. Default to dark (the brand
+    // default) if the query fails.
+    const prefersLight = window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: light)').matches;
+    applyTheme(prefersLight ? 'light' : 'dark');
+  }
+  function toggleTheme() {
+    const current = document.documentElement.getAttribute('data-theme') || 'dark';
+    applyTheme(current === 'dark' ? 'light' : 'dark');
+  }
+
   function init() {
+    // Apply theme BEFORE rendering so the feed doesn't flash dark-then-light.
+    initTheme();
     // Embed mode: strip shell chrome when loaded inside iframe with ?embed=1
     const params = new URLSearchParams(window.location.search);
     if (params.get('embed') === '1' || window.self !== window.top) {
@@ -809,6 +839,7 @@ const PULSE = (() => {
   return {
     init,
     refresh: loadFeed,
+    toggleTheme,
   };
 })();
 
