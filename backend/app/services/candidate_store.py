@@ -689,12 +689,16 @@ class CandidateStore:
             await db.commit()
 
     async def reaction_aggregates(self) -> list[dict[str, Any]]:
-        """Aggregate reactions by (fixture, hook_type, bet_type, storyline).
+        """Aggregate reactions by (fixture, hook_type, bet_type, storyline) for
+        narrative-engine cards only — i.e. rows that JOIN cleanly to the
+        `candidates` table.
 
-        Joins card_reactions → candidates on card_id. Cards that never landed
-        in the candidates table (e.g. featured BBs which bypass the store)
-        won't appear here — that's fine for v1; the interesting signal is on
-        engine-produced cards anyway. Sorted by total desc.
+        Featured BBs bypass candidate_store entirely (built at runtime in
+        services/featured_bb.py), so their reactions don't JOIN. Those are
+        reported separately via `reaction_aggregates_orphan()` so the admin
+        surface can split them into their own cohort — a straight LEFT JOIN
+        collapses them all into one (None, None, None, None) row that's
+        useless for analysis.
         """
         async with aiosqlite.connect(self._db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -708,7 +712,7 @@ class CandidateStore:
                     SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END) AS up,
                     SUM(CASE WHEN r.reaction = 'down' THEN 1 ELSE 0 END) AS down
                 FROM card_reactions r
-                LEFT JOIN candidates c ON c.id = r.card_id
+                INNER JOIN candidates c ON c.id = r.card_id
                 GROUP BY c.game_id, c.hook_type, c.bet_type, c.storyline_id
                 ORDER BY (
                     SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END)
@@ -728,6 +732,66 @@ class CandidateStore:
                 "down": int(r["down"] or 0),
             })
         return out
+
+    async def reaction_aggregates_orphan(self) -> list[dict[str, Any]]:
+        """Reactions on card_ids NOT present in `candidates` — i.e. featured
+        BBs from the operator-curated feed, which bypass candidate_store.
+
+        Grouped by card_id since we have no other metadata; the card_id prefix
+        (e.g. `featured_`) is the only cohort clue we can surface. Sorted by
+        total desc.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT
+                    r.card_id AS card_id,
+                    SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END) AS up,
+                    SUM(CASE WHEN r.reaction = 'down' THEN 1 ELSE 0 END) AS down
+                FROM card_reactions r
+                WHERE r.card_id NOT IN (SELECT id FROM candidates)
+                GROUP BY r.card_id
+                ORDER BY (
+                    SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END)
+                  + SUM(CASE WHEN r.reaction = 'down' THEN 1 ELSE 0 END)
+                ) DESC
+                """,
+            ) as cur:
+                rows = await cur.fetchall()
+        return [
+            {
+                "card_id": r["card_id"],
+                "up": int(r["up"] or 0),
+                "down": int(r["down"] or 0),
+            }
+            for r in rows
+        ]
+
+    async def click_totals_orphan(self) -> int:
+        """Total clicks on card_ids NOT present in `candidates`. Single scalar
+        — we surface featured-BB clicks as one aggregate since we don't yet
+        split by fixture for those."""
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM card_clicks "
+                "WHERE card_id NOT IN (SELECT id FROM candidates)"
+            ) as cur:
+                row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def click_totals_by_card(self) -> dict[str, int]:
+        """Clicks per card_id for cards NOT in the candidates table (featured
+        BBs). Lets the admin page show per-featured-card CTR."""
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT card_id, COUNT(*) AS n FROM card_clicks "
+                "WHERE card_id NOT IN (SELECT id FROM candidates) "
+                "GROUP BY card_id"
+            ) as cur:
+                rows = await cur.fetchall()
+        return {r["card_id"]: int(r["n"]) for r in rows}
 
 
 # ── Row <-> model helpers ──
