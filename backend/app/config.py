@@ -29,9 +29,11 @@ ROGUE_CATALOGUE_MAX_EVENTS = int(os.getenv("ROGUE_CATALOGUE_MAX_EVENTS", "25"))
 ROGUE_SOCCER_SPORT_ID = os.getenv("ROGUE_SOCCER_SPORT_ID", "1")
 
 # ── Recommendation engine ──
-# News ingestion + candidate store live under backend/app/data/. Kept out of
-# git via .gitignore — it's a local, rebuildable cache plus candidate history.
-PULSE_DB_PATH = os.getenv("PULSE_DB_PATH", "app/data/pulse.db")
+# News ingestion + candidate store. In production we mount a Railway volume
+# at /data and set PULSE_DB_PATH=/data/pulse.db so the cache survives
+# redeploys (U1). Locally we default to ./pulse.db in the CWD — kept out
+# of git via .gitignore.
+PULSE_DB_PATH = os.getenv("PULSE_DB_PATH", "./pulse.db")
 
 # Per-fixture news scouting budget. Each run calls Haiku 4.5 + web_search.
 PULSE_NEWS_MODEL = os.getenv("PULSE_NEWS_MODEL", "claude-haiku-4-5")

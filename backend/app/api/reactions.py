@@ -109,9 +109,12 @@ def create_reactions_routes(
         # reaction_aggregates already collapses by (fixture, hook, bet,
         # storyline); pulling click totals for the same cohort needs a
         # parallel pass via the candidates table — cheap at current volumes.
+        # U1: we use store._connect() (not raw aiosqlite.connect) so the
+        # Railway-volume-safe `journal_mode=DELETE` pragma is applied —
+        # raw connects throw disk-I/O on the NFS mount.
         import aiosqlite as _aio
         cohort_clicks: dict[tuple, int] = {}
-        async with _aio.connect(store._db_path) as db:
+        async with store._connect() as db:
             db.row_factory = _aio.Row
             async with db.execute(
                 """

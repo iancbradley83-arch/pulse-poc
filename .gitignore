@@ -20,6 +20,12 @@ node_modules/
 twitter-bot/.env
 .claude/
 
-# Local SQLite (pulse.db + WAL/SHM sidecars)
+# Local SQLite (pulse.db + WAL/SHM sidecars). Default path is now ./pulse.db
+# (CWD) so ignore any pulse.db at the repo root; production mounts a Railway
+# volume at /data.
 backend/app/data/pulse.db
 backend/app/data/pulse.db-*
+pulse.db
+pulse.db-*
+backend/pulse.db
+backend/pulse.db-*
