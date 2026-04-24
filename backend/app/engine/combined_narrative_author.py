@@ -132,6 +132,45 @@ PER-TYPE VOICE NOTES
     "chase", "top four", "European qualification", "Champions League
     push", "Conference place". Prefer specific competition names over
     generic "Europa League".
+  title_race — frame as a TITLE RACE. Participants are the top-of-table
+    contenders, within 6-8 points of each other. Legs are each
+    contender to win their fixture. Use words like "title race", "top
+    of the table", "gap", "points behind", "leaders", "title push".
+    Ground the framing in points_from_leader / points_from_second when
+    participant_context carries them. Never write "back all three" —
+    describe the STORY ("three points separate the top — all in
+    action", "the leaders host; the chasers travel").
+  derby_weekend — frame as a RIVALRY WEEKEND. Participants are derby
+    fixtures; legs are BTTS Yes (or Over 2.5 where BTTS wasn't
+    available). Use words like "derby", "rivalry", "bragging rights",
+    "local", "classic fixture". The `extra` field on each participant
+    carries the derby's common name (e.g. "Merseyside derby", "Derby
+    della Madonnina") — lean on those names in the angle when space
+    allows. No standings numbers here; the drama IS the content.
+  european_week — frame as a BIG NIGHT IN EUROPE. Participants are
+    clubs in UCL / UEL / UECL this week; legs are clubs to win. The
+    participant_context may include "competition" = UCL/UEL/UECL —
+    name the SPECIFIC competition in the angle when possible. Use
+    words like "European stage", "Champions League night", "European
+    clean sweep", "midweek". Don't mush competitions together — "UCL
+    + UEL" is fine, "European football" is fine, "Europa League"
+    generically is not (banned).
+  home_fortress — frame as a WEEKEND OF HOME COMFORTS. Participants
+    are home sides with elite home records; legs are home wins. The
+    participant_context may include home_win_rate (0.0..1.0) and
+    home_form_last_10 (W/L/D chars). Reference the rate or the streak
+    when present ("nine wins from ten at home", "unbeaten at the
+    Emirates since December"). Use words like "fortress", "home",
+    "hosting", "record", "unbeaten at home". Avoid "nobody wants to
+    visit" cliché — find a fresher angle.
+  goal_machines — frame as EUROPE'S TOP SCORERS. Participants are
+    strikers across multiple leagues; legs are anytime-scorer picks.
+    The participant_context may include goals_this_season. Use words
+    like "scorers", "lethal", "prolific", "goal machines", "Europe's
+    best". Naming 2-3 of the players in the angle is fine — the full
+    list is too many. When possible reference the CROSS-LEAGUE framing
+    ("across four leagues", "from the Premier League to Serie A")
+    because it distinguishes this card from golden_boot.
 
 CALIBRATION EXAMPLES
 
@@ -332,6 +371,22 @@ def _format_participant(p) -> str:
         bits.append(f"pts_from_safety={ctx['points_from_safety']}")
     if "points_from_european_spot" in ctx:
         bits.append(f"pts_from_european_spot={ctx['points_from_european_spot']}")
+    # Expansion-type context fields — ground framing in real numbers
+    # without forcing the author to guess which storyline called them.
+    if "points_from_leader" in ctx:
+        bits.append(f"pts_from_leader={ctx['points_from_leader']}")
+    if "points_from_second" in ctx:
+        bits.append(f"pts_from_second={ctx['points_from_second']}")
+    if "competition" in ctx:
+        bits.append(f"comp={ctx['competition']}")
+    if "home_win_rate" in ctx:
+        bits.append(f"home_win_rate={ctx['home_win_rate']}")
+    if ctx.get("home_form_last_10"):
+        bits.append(f"home_form10={ctx['home_form_last_10']}")
+    if "goals_this_season" in ctx:
+        bits.append(f"goals={ctx['goals_this_season']}")
+    if ctx.get("recent_form_last_5"):
+        bits.append(f"recent5={ctx['recent_form_last_5']}")
     if ctx.get("form_last_5"):
         bits.append(f"form={ctx['form_last_5']}")
     if ctx.get("league"):

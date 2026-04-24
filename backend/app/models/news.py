@@ -97,14 +97,21 @@ class NewsItem(BaseModel):
 class StorylineType(str, Enum):
     """Cross-event narrative patterns — the "story across multiple fixtures".
 
-    Only GOLDEN_BOOT is wired in v1. The others are reserved for incremental
-    PRs so the enum can stay stable across database migrations.
+    Additive enum — new values slot in as individual detectors come online.
+    `candidate_store.storyline_type` column is TEXT so no schema change
+    needed when this enum grows.
     """
     GOLDEN_BOOT = "golden_boot"              # top-scorer race (anytime-scorer legs)
     RELEGATION = "relegation"                # bottom-of-table sides all playing
     EUROPE_CHASE = "europe_chase"            # 4th/5th/Europa spot fight
     MANAGER_PRESSURE = "manager_pressure"    # 2-3 managers one loss from sack
     DEBUT_RETURN = "debut_return"            # newly-signed / returning stars
+    # PR: storyline-expansion-top5 — five new types the detector supports.
+    TITLE_RACE = "title_race"                # top-of-table contenders same matchweek
+    DERBY_WEEKEND = "derby_weekend"          # multiple local / classic rivalry fixtures
+    EUROPEAN_WEEK = "european_week"          # UCL / UEL / UECL midweek stack
+    HOME_FORTRESS = "home_fortress"          # clubs with elite home records, all hosting
+    GOAL_MACHINES = "goal_machines"          # Europe's top scorers all playing (cross-league)
 
 
 class StorylineParticipant(BaseModel):

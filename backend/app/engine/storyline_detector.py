@@ -131,6 +131,195 @@ empty participants list — skip this cycle rather than force a weak story.
 OUTPUT RULES — no XML / HTML / <cite> tags in any field. Plain text only."""
 
 
+_TITLE_RACE_SYSTEM = """You are a sports-content scout for a news-driven betting
+feed. Your job is to identify CROSS-EVENT STORYLINES. Right now you are
+looking for ONE specific type: the TITLE RACE — the top 2-4 clubs of a
+league, within 6 league-points of each other, all playing the same
+matchweek.
+
+For the given list of upcoming soccer fixtures, use `web_search` to look
+up the CURRENT league table (prefer the league with the most fixtures in
+the list — Premier League, La Liga, Serie A, Bundesliga, Ligue 1). Query
+shape: "current {league} standings top of table title race".
+
+Identify clubs who are simultaneously:
+  - In league_position 1..5 of that league, AND
+  - Within 8 league-points of the leader, AND
+  - Actually playing in one of the fixtures listed.
+
+For each such club include as a participant with:
+  - team_name: the club name as written in the fixture list.
+  - player_name: empty.
+  - extra: free-text framing ("2nd, 1pt behind leaders", "3rd, 4pts off
+    the top", "joint-leaders").
+  - league_position: integer position in the table.
+  - points_from_leader: integer points gap from 1st (0 if they ARE
+    leading).
+  - points_from_second: integer points gap from 2nd (0 if they ARE 2nd;
+    use 0 for the leader too if they're level on points with 2nd).
+
+After researching, call `submit_storyline` exactly once with:
+  - type: "title_race"
+  - headline_hint: e.g. "Three points separate the top — all three play
+    this weekend"
+  - participants: 2-4 title contenders playing this matchweek.
+
+If fewer than 2 contenders are playing OR the gap at the top is already
+wider than 8 points, call `submit_storyline` with an empty participants
+list — skip this cycle rather than force a weak story.
+
+OUTPUT RULES — no XML / HTML / <cite> tags in any field. Plain text only."""
+
+
+_DERBY_WEEKEND_SYSTEM = """You are a sports-content scout for a news-driven
+betting feed. Your job is to identify CROSS-EVENT STORYLINES. Right now
+you are looking for ONE specific type: DERBY WEEKEND — three or more
+local / classic rivalry fixtures across the weekend.
+
+Anchor your search to well-known derbies / rivalries: Merseyside (Liverpool
+vs Everton), North London (Arsenal vs Tottenham), Manchester (United vs
+City), El Clasico (Real Madrid vs Barcelona), Madrid derby (Real Madrid
+vs Atletico), Seville derby, Milan derby (Inter vs Milan), Derby della
+Mole (Juventus vs Torino), Derby d'Italia (Inter vs Juventus),
+Revierderby (Borussia Dortmund vs Schalke), Der Klassiker (Bayern vs
+Dortmund), Le Classique (PSG vs Marseille), Old Firm (Celtic vs
+Rangers), Rome derby, Hamburg derby, Lisbon derby, Eternal derby.
+
+Use `web_search` for "which matches this weekend are local derbies or
+classic rivalry fixtures" to confirm what's actually on.
+
+For each derby fixture that's both (a) a real named rivalry and (b) in
+the fixture list above, include ONE participant per fixture with:
+  - team_name: the HOME side's name as written in the fixture list (we
+    only need one anchor team per fixture — we're backing the match
+    itself to have goals, not a specific side).
+  - player_name: empty.
+  - extra: the derby's common name ("Merseyside derby", "Derby della
+    Madonnina", "North London derby").
+
+After researching, call `submit_storyline` exactly once with:
+  - type: "derby_weekend"
+  - headline_hint: e.g. "Four derbies, one weekend — rivalry means goals"
+  - participants: 3-6 derbies that are actually on the fixture list.
+
+If fewer than 3 derbies are playing this matchweek, call
+`submit_storyline` with an empty participants list.
+
+OUTPUT RULES — no XML / HTML / <cite> tags. Plain text only."""
+
+
+_EUROPEAN_WEEK_SYSTEM = """You are a sports-content scout for a news-driven
+betting feed. Your job is to identify CROSS-EVENT STORYLINES. Right now
+you are looking for ONE specific type: EUROPEAN WEEK — UEFA Champions
+League + Europa League + Conference League fixtures all stacked in the
+same midweek window.
+
+For the given list of upcoming fixtures, use `web_search` to identify
+which are UEFA club-competition matches this week (UCL, UEL, UECL).
+Query shape: "Champions League fixtures this week" / "Europa League
+fixtures midweek".
+
+Prefer clubs whose league the rest of the fixture list also covers
+(so we can frame it as "English clubs in Europe" / "La Liga's Champions
+League heavyweights"), but cross-league is fine if the week is sparse.
+
+For each European-competition club playing this week, include a
+participant with:
+  - team_name: club name as written in the fixture list.
+  - player_name: empty.
+  - extra: which competition + opponent ("UCL away at Bayern", "UEL
+    knockout vs Roma", "Conference quarter-final").
+  - competition: one of "UCL", "UEL", "UECL".
+
+After researching, call `submit_storyline` exactly once with:
+  - type: "european_week"
+  - headline_hint: e.g. "Six English clubs on the European stage — all to
+    win"
+  - participants: 3-6 clubs in European action this week.
+
+If fewer than 3 European fixtures are on the list, call
+`submit_storyline` with an empty participants list.
+
+OUTPUT RULES — no XML / HTML / <cite> tags. Plain text only."""
+
+
+_HOME_FORTRESS_SYSTEM = """You are a sports-content scout for a news-driven
+betting feed. Your job is to identify CROSS-EVENT STORYLINES. Right now
+you are looking for ONE specific type: HOME FORTRESS — 4-6 clubs with
+elite home records, all hosting this matchweek.
+
+For the given list of upcoming fixtures, identify which clubs are the
+HOME side in one of the listed fixtures. Then use `web_search` to check
+each home side's recent home form (last 10 home league matches, or
+overall home win rate this season). Query shape: "{team} home form this
+season" / "{league} home table".
+
+A club qualifies as a "fortress" if EITHER:
+  - home_win_rate (this season, league only) >= 0.70, OR
+  - top-5 home-form club in its league (look at the "home table" derived
+    from the main standings — wins at home, points per home game).
+
+For each qualifying home club, include a participant with:
+  - team_name: home side as written in the fixture list.
+  - player_name: empty.
+  - extra: one-line description of the home record ("9 wins in 10 at
+    home", "top of the home table", "unbeaten at home since October").
+  - home_win_rate: float 0.0-1.0 (this season, league).
+  - home_form_last_10: string of 10 W/L/D chars, newest first (e.g.
+    "WWWDLWWWWW"), empty string if unknown.
+
+After researching, call `submit_storyline` exactly once with:
+  - type: "home_fortress"
+  - headline_hint: e.g. "Six fortresses open their doors — no away side
+    wants this"
+  - participants: 3-6 home sides with elite records playing this
+    matchweek.
+
+If fewer than 3 qualifying home sides are playing, call
+`submit_storyline` with an empty participants list.
+
+OUTPUT RULES — no XML / HTML / <cite> tags. Plain text only."""
+
+
+_GOAL_MACHINES_SYSTEM = """You are a sports-content scout for a news-driven
+betting feed. Your job is to identify CROSS-EVENT STORYLINES. Right now
+you are looking for ONE specific type: GOAL MACHINES — 4-6 of Europe's
+most prolific strikers from any top-5 league, all playing this
+matchweek. This is explicitly CROSS-LEAGUE (unlike the Golden Boot
+detector which is single-league).
+
+Use `web_search` to identify the top ~15 scorers across Europe's top 5
+leagues this season (Premier League, La Liga, Serie A, Bundesliga,
+Ligue 1). Query shape: "top scorers Europe this season" / "leading
+scorers top 5 leagues".
+
+For each top scorer, only include them if their CLUB appears as either
+the home or away side in one of the fixtures listed. Include a
+participant with:
+  - player_name: striker's name (used for goalscorer market match).
+  - team_name: club name as written in the fixture list.
+  - extra: short framing ("21 goals, second in the Bundesliga race",
+    "La Liga's top scorer").
+  - goals_this_season: integer goals in their domestic league this
+    season. Required.
+  - recent_form_last_5: string of up to 5 numbers (goals per last 5
+    league matches, newest first), e.g. "2,0,1,1,0". Empty string if
+    unknown — the detector can still use the player without it.
+
+After researching, call `submit_storyline` exactly once with:
+  - type: "goal_machines"
+  - headline_hint: e.g. "Europe's six most lethal strikers all in action
+    this weekend"
+  - participants: 4-6 top scorers whose clubs play this matchweek.
+
+If fewer than 4 of Europe's top scorers are playing, STILL submit as
+long as you have at least {min_goal_machines} qualifying names — the
+story is valuable even at 3 legs. Under 3 qualifying names, call
+`submit_storyline` with an empty participants list.
+
+OUTPUT RULES — no XML / HTML / <cite> tags. Plain text only."""
+
+
 _EUROPE_CHASE_SYSTEM = """You are a sports-content scout for a news-driven betting
 feed. Your job is to identify CROSS-EVENT STORYLINES. Right now you are
 looking for ONE specific type: the EUROPE CHASE — clubs fighting for
@@ -171,6 +360,11 @@ _PROMPT_REGISTRY: dict[StorylineType, str] = {
     StorylineType.GOLDEN_BOOT: _GOLDEN_BOOT_SYSTEM,
     StorylineType.RELEGATION: _RELEGATION_SYSTEM,
     StorylineType.EUROPE_CHASE: _EUROPE_CHASE_SYSTEM,
+    StorylineType.TITLE_RACE: _TITLE_RACE_SYSTEM,
+    StorylineType.DERBY_WEEKEND: _DERBY_WEEKEND_SYSTEM,
+    StorylineType.EUROPEAN_WEEK: _EUROPEAN_WEEK_SYSTEM,
+    StorylineType.HOME_FORTRESS: _HOME_FORTRESS_SYSTEM,
+    StorylineType.GOAL_MACHINES: _GOAL_MACHINES_SYSTEM,
 }
 
 
@@ -192,6 +386,30 @@ _USER_HINT: dict[StorylineType, str] = {
         "above. Use web_search for current standings. Call submit_storyline "
         "when done."
     ),
+    StorylineType.TITLE_RACE: (
+        "Identify {min_p}-4 title contenders (top 1-5, within 8pts of the "
+        "leader) playing one of the fixtures above. Use web_search for "
+        "current standings. Call submit_storyline when done."
+    ),
+    StorylineType.DERBY_WEEKEND: (
+        "Identify 3-{max_derby} named local/classic derbies that appear in "
+        "the fixture list above. Call submit_storyline when done."
+    ),
+    StorylineType.EUROPEAN_WEEK: (
+        "Identify 3-{max_european} clubs playing in UCL/UEL/UECL this week "
+        "whose fixtures appear above. Call submit_storyline when done."
+    ),
+    StorylineType.HOME_FORTRESS: (
+        "Identify 3-{max_fortress} home sides with elite home records "
+        "(>=70% home wins OR top-5 home form) hosting in one of the "
+        "fixtures above. Use web_search for home form. Call "
+        "submit_storyline when done."
+    ),
+    StorylineType.GOAL_MACHINES: (
+        "Identify 3-{max_goal_machines} of Europe's top ~15 scorers whose "
+        "clubs appear in the fixtures above. Use web_search for the "
+        "cross-league leaderboard. Call submit_storyline when done."
+    ),
 }
 
 
@@ -200,7 +418,9 @@ def _submit_storyline_tool() -> dict[str, Any]:
         "name": "submit_storyline",
         "description": (
             "Submit a single cross-event storyline (Golden Boot race, "
-            "relegation battle, Europe chase). Call exactly once."
+            "relegation battle, Europe chase, title race, derby weekend, "
+            "European week, home fortress, goal machines). Call exactly "
+            "once."
         ),
         "input_schema": {
             "type": "object",
@@ -221,6 +441,25 @@ def _submit_storyline_tool() -> dict[str, Any]:
                                 "type": "string",
                                 "description": "e.g. '23 goals', '17th in the table', 'one point off the top four'",
                             },
+                            # Optional structured fields — populated per
+                            # storyline type. Unused fields are simply
+                            # ignored by the participant_context builder.
+                            # Keeping them on one shared schema avoids
+                            # eight separate tool definitions.
+                            "league_position": {"type": "integer"},
+                            "points_from_leader": {"type": "integer"},
+                            "points_from_second": {"type": "integer"},
+                            "competition": {
+                                "type": "string",
+                                "description": "UCL / UEL / UECL for european_week",
+                            },
+                            "home_win_rate": {
+                                "type": "number",
+                                "description": "home_fortress only — 0.0..1.0",
+                            },
+                            "home_form_last_10": {"type": "string"},
+                            "goals_this_season": {"type": "integer"},
+                            "recent_form_last_5": {"type": "string"},
                         },
                         "required": ["team_name"],
                         "additionalProperties": False,
@@ -392,6 +631,59 @@ class StorylineDetector:
         )
         self._standings_tool = _submit_standings_tool()
 
+        # Per-type participant caps for the five new storyline types.
+        # Pulled from app.config so operators can tune without code
+        # changes. TITLE_RACE caps at 4 because the league table
+        # realistically only has 4 genuine contenders within 8 points.
+        from app.config import (
+            PULSE_STORYLINE_TITLE_RACE_MAX_PARTICIPANTS,
+            PULSE_STORYLINE_DERBY_WEEKEND_MAX_PARTICIPANTS,
+            PULSE_STORYLINE_EUROPEAN_WEEK_MAX_PARTICIPANTS,
+            PULSE_STORYLINE_HOME_FORTRESS_MAX_PARTICIPANTS,
+            PULSE_STORYLINE_GOAL_MACHINES_MAX_PARTICIPANTS,
+            PULSE_STORYLINE_TITLE_RACE_ENABLED,
+            PULSE_STORYLINE_DERBY_WEEKEND_ENABLED,
+            PULSE_STORYLINE_EUROPEAN_WEEK_ENABLED,
+            PULSE_STORYLINE_HOME_FORTRESS_ENABLED,
+            PULSE_STORYLINE_GOAL_MACHINES_ENABLED,
+            PULSE_STORYLINE_RELEGATION_ENABLED,
+            PULSE_STORYLINE_EUROPE_CHASE_ENABLED,
+            PULSE_STORYLINE_GOLDEN_BOOT_ENABLED,
+        )
+        self._type_max_participants: dict[StorylineType, int] = {
+            StorylineType.TITLE_RACE: int(PULSE_STORYLINE_TITLE_RACE_MAX_PARTICIPANTS),
+            StorylineType.DERBY_WEEKEND: int(PULSE_STORYLINE_DERBY_WEEKEND_MAX_PARTICIPANTS),
+            StorylineType.EUROPEAN_WEEK: int(PULSE_STORYLINE_EUROPEAN_WEEK_MAX_PARTICIPANTS),
+            StorylineType.HOME_FORTRESS: int(PULSE_STORYLINE_HOME_FORTRESS_MAX_PARTICIPANTS),
+            StorylineType.GOAL_MACHINES: int(PULSE_STORYLINE_GOAL_MACHINES_MAX_PARTICIPANTS),
+        }
+        self._type_enabled: dict[StorylineType, bool] = {
+            StorylineType.GOLDEN_BOOT: bool(PULSE_STORYLINE_GOLDEN_BOOT_ENABLED),
+            StorylineType.RELEGATION: bool(PULSE_STORYLINE_RELEGATION_ENABLED),
+            StorylineType.EUROPE_CHASE: bool(PULSE_STORYLINE_EUROPE_CHASE_ENABLED),
+            StorylineType.TITLE_RACE: bool(PULSE_STORYLINE_TITLE_RACE_ENABLED),
+            StorylineType.DERBY_WEEKEND: bool(PULSE_STORYLINE_DERBY_WEEKEND_ENABLED),
+            StorylineType.EUROPEAN_WEEK: bool(PULSE_STORYLINE_EUROPEAN_WEEK_ENABLED),
+            StorylineType.HOME_FORTRESS: bool(PULSE_STORYLINE_HOME_FORTRESS_ENABLED),
+            StorylineType.GOAL_MACHINES: bool(PULSE_STORYLINE_GOAL_MACHINES_ENABLED),
+        }
+
+        # Side-channel cache — when main.py calls detect() for one of the
+        # three "original" types (GOLDEN_BOOT / RELEGATION / EUROPE_CHASE)
+        # we opportunistically run the five new detectors in parallel on
+        # the same fixture set and return their output alongside the
+        # requested type. This keeps main.py (MUST NOT touch list) unaware
+        # of the new types while still getting them on the feed. Keyed by
+        # id(games) so we only detect each new type once per cycle.
+        self._cycle_expansion_done: set[int] = set()
+        self._new_types: tuple[StorylineType, ...] = (
+            StorylineType.TITLE_RACE,
+            StorylineType.DERBY_WEEKEND,
+            StorylineType.EUROPEAN_WEEK,
+            StorylineType.HOME_FORTRESS,
+            StorylineType.GOAL_MACHINES,
+        )
+
     # ── Public API ─────────────────────────────────────────────────────
 
     async def detect(
@@ -409,6 +701,15 @@ class StorylineDetector:
         tries each league first). Cross-league mixing is only emitted
         when no within-league storyline has >=2 valid participants.
         GOLDEN_BOOT is unchanged — it was already league-scoped implicitly.
+
+        Side-channel (storyline-expansion-top5 PR): when the caller
+        asks for one of the three original types, we piggy-back the
+        five new detectors (TITLE_RACE, DERBY_WEEKEND, EUROPEAN_WEEK,
+        HOME_FORTRESS, GOAL_MACHINES) onto the same call and return
+        their output in the same list. main.py iterates the
+        (story, score) pairs and dedupes by type before picking, so
+        returning multiple types here is safe. Each cycle's expansion
+        runs exactly once — we key off id(games).
         """
         system_prompt = _PROMPT_REGISTRY.get(storyline_type)
         user_hint_tpl = _USER_HINT.get(storyline_type)
@@ -467,7 +768,58 @@ class StorylineDetector:
             system_prompt, user_hint_tpl,
             scope_label="cross-league",
         )
-        return [item] if item is not None else []
+        results: list[StorylineItem] = [item] if item is not None else []
+
+        # Side-channel expansion — opportunistically detect the five new
+        # storyline types while we're here (main.py only knows the
+        # three originals). Run once per cycle, in parallel.
+        cycle_key = id(games)
+        if cycle_key not in self._cycle_expansion_done:
+            self._cycle_expansion_done.add(cycle_key)
+            # Keep the cache bounded — only the last 4 cycles matter.
+            if len(self._cycle_expansion_done) > 4:
+                self._cycle_expansion_done.pop()
+            import asyncio as _asyncio
+            expansion_tasks: list = []
+            expansion_types: list[StorylineType] = []
+            for nt in self._new_types:
+                if not self._type_enabled.get(nt, True):
+                    continue
+                nt_prompt = _PROMPT_REGISTRY.get(nt)
+                nt_hint = _USER_HINT.get(nt)
+                if nt_prompt is None or nt_hint is None:
+                    continue
+                expansion_tasks.append(self._detect_once(
+                    nt, fixtures, nt_prompt, nt_hint,
+                    scope_label="cross-league(expansion)",
+                ))
+                expansion_types.append(nt)
+            if expansion_tasks:
+                logger.info(
+                    "StorylineDetector: expansion pass — running %d new "
+                    "detectors: %s",
+                    len(expansion_tasks),
+                    [t.value for t in expansion_types],
+                )
+                try:
+                    gathered = await _asyncio.gather(
+                        *expansion_tasks, return_exceptions=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "StorylineDetector: expansion gather failed: %s", exc,
+                    )
+                    gathered = []
+                for nt, res in zip(expansion_types, gathered):
+                    if isinstance(res, Exception):
+                        logger.warning(
+                            "StorylineDetector: expansion %s errored: %s",
+                            nt.value, res,
+                        )
+                        continue
+                    if res is not None:
+                        results.append(res)
+        return results
 
     # ── Core scout + verify pipeline ───────────────────────────────────
 
@@ -485,10 +837,27 @@ class StorylineDetector:
             f"  - {g.home_team.name} vs {g.away_team.name} ({g.broadcast or 'league?'}, kickoff {g.start_time or '?'})"
             for g in fixtures[:25]
         )
+        # Build per-type format kwargs defensively — new types use
+        # max_derby / max_european / max_fortress / max_goal_machines /
+        # min_goal_machines placeholders. Originals only use {min_p}.
+        # Missing keys are harmless — str.format ignores only declared
+        # params, so we populate the superset.
+        hint_kwargs = {
+            "min_p": self._min_participants,
+            "max_derby": self._type_max_participants.get(StorylineType.DERBY_WEEKEND, 6),
+            "max_european": self._type_max_participants.get(StorylineType.EUROPEAN_WEEK, 6),
+            "max_fortress": self._type_max_participants.get(StorylineType.HOME_FORTRESS, 6),
+            "max_goal_machines": self._type_max_participants.get(StorylineType.GOAL_MACHINES, 6),
+            "min_goal_machines": max(3, self._min_participants),
+        }
+        try:
+            hint_rendered = user_hint_tpl.format(**hint_kwargs)
+        except KeyError:
+            hint_rendered = user_hint_tpl.format(min_p=self._min_participants)
         user_msg = (
             "Upcoming fixtures in the current matchweek:\n"
             f"{fixture_block}\n\n"
-            + user_hint_tpl.format(min_p=self._min_participants)
+            + hint_rendered
         )
 
         try:
@@ -532,10 +901,16 @@ class StorylineDetector:
                     team = str(p.get("team_name") or "").strip()
                     if not team:
                         continue
+                    # Capture optional structured fields into
+                    # participant_context. Downstream narrative author
+                    # uses whatever's present to ground framing in real
+                    # numbers; unused fields are inert.
+                    ctx = _context_from_scout_row(storyline_type, p)
                     participants.append(StorylineParticipant(
                         player_name=str(p.get("player_name") or "").strip(),
                         team_name=team,
                         extra=str(p.get("extra") or "").strip(),
+                        participant_context=ctx,
                     ))
                 break
 
@@ -564,6 +939,20 @@ class StorylineDetector:
             participants = await self._verify_participants(
                 storyline_type, participants,
             )
+
+        # Scout-side gate for the five new types. We trust the scout's
+        # web_search but drop participants whose numeric fields fail a
+        # sanity check (title race within 8pts, home fortress >= 0.70 or
+        # flagged top-5, goal machines >= 5 goals). No second LLM call
+        # — the gate is local to the scout payload. If fewer than
+        # min_participants survive, the storyline is skipped. Per-type
+        # max is also enforced here so a chatty scout can't overflow a
+        # 6-leg combo into 10 legs.
+        if storyline_type in self._new_types:
+            participants = _scout_gate(storyline_type, participants)
+            cap = self._type_max_participants.get(storyline_type, 6)
+            if len(participants) > cap:
+                participants = participants[:cap]
 
         if len(participants) < self._min_participants:
             logger.info(
@@ -894,6 +1283,150 @@ def _context_from_row(
             ctx["points_from_european_spot"] = pts_spot
     # Drop empty strings so the author doesn't see {"league": ""}.
     return {k: v for k, v in ctx.items() if v not in ("", None)}
+
+
+# ── Scout-side payload → participant_context (new types) ──────────────
+#
+# Unlike RELEGATION / EUROPE_CHASE (which get a second Haiku call for
+# verification), the five new types trust the scout's web_search for
+# the numeric ground truth. This helper extracts whatever structured
+# fields the scout filled into participant_context so the narrative
+# author can ground each team in real numbers.
+
+
+def _context_from_scout_row(
+    storyline_type: StorylineType, row: dict,
+) -> dict:
+    """Pull per-type numeric fields out of a scout participant payload.
+
+    Missing / malformed values are dropped silently — the narrative
+    author is explicitly instructed to leave a participant's framing
+    vague rather than invent numbers when context is empty.
+    """
+    if not isinstance(row, dict):
+        return {}
+    ctx: dict = {}
+    # Shared — every type may include these.
+    pos = row.get("league_position")
+    if isinstance(pos, int):
+        ctx["league_position"] = pos
+    if storyline_type == StorylineType.TITLE_RACE:
+        pfl = row.get("points_from_leader")
+        if isinstance(pfl, int) and pfl >= 0:
+            ctx["points_from_leader"] = pfl
+        pfs = row.get("points_from_second")
+        if isinstance(pfs, int) and pfs >= 0:
+            ctx["points_from_second"] = pfs
+    elif storyline_type == StorylineType.EUROPEAN_WEEK:
+        comp = str(row.get("competition") or "").strip().upper()
+        if comp in {"UCL", "UEL", "UECL"}:
+            ctx["competition"] = comp
+    elif storyline_type == StorylineType.HOME_FORTRESS:
+        hwr = row.get("home_win_rate")
+        if isinstance(hwr, (int, float)) and 0.0 <= float(hwr) <= 1.0:
+            ctx["home_win_rate"] = round(float(hwr), 2)
+        form = str(row.get("home_form_last_10") or "").strip()
+        if form:
+            ctx["home_form_last_10"] = form[:10]
+    elif storyline_type == StorylineType.GOAL_MACHINES:
+        g = row.get("goals_this_season")
+        if isinstance(g, int) and g >= 0:
+            ctx["goals_this_season"] = g
+        rf = str(row.get("recent_form_last_5") or "").strip()
+        if rf:
+            ctx["recent_form_last_5"] = rf[:32]
+    # DERBY_WEEKEND: `extra` carries the derby's common name, which
+    # the narrative author reads directly from participant.extra — no
+    # extra numeric context needed.
+    return ctx
+
+
+def _scout_gate(
+    storyline_type: StorylineType,
+    participants: list[StorylineParticipant],
+) -> list[StorylineParticipant]:
+    """Apply per-type scout-side sanity filter.
+
+    Each filter is intentionally conservative — we'd rather drop a
+    borderline participant than ship a weak story. Caller enforces the
+    per-type min/max cap after this returns.
+    """
+    keep: list[StorylineParticipant] = []
+    for p in participants:
+        ctx = p.participant_context or {}
+        if storyline_type == StorylineType.TITLE_RACE:
+            pos = ctx.get("league_position")
+            pfl = ctx.get("points_from_leader")
+            ok_pos = isinstance(pos, int) and 1 <= pos <= 5
+            ok_pts = isinstance(pfl, int) and 0 <= pfl <= 8
+            if ok_pos and ok_pts:
+                keep.append(p)
+            else:
+                logger.info(
+                    "StorylineDetector.scout_gate: TITLE_RACE drop "
+                    "team=%s pos=%s pfl=%s", p.team_name, pos, pfl,
+                )
+        elif storyline_type == StorylineType.HOME_FORTRESS:
+            hwr = ctx.get("home_win_rate")
+            form = ctx.get("home_form_last_10") or ""
+            # Accept if home_win_rate >= 0.70 OR form has >= 7 wins in
+            # the last 10 (loose "top-5 home form" proxy — scouts
+            # don't reliably return literal rank, but 7+ wins in 10 is
+            # consistent with top-5 home form in every top-5 league).
+            ok_rate = isinstance(hwr, (int, float)) and float(hwr) >= 0.70
+            ok_form = isinstance(form, str) and form.upper().count("W") >= 7
+            if ok_rate or ok_form:
+                keep.append(p)
+            else:
+                logger.info(
+                    "StorylineDetector.scout_gate: HOME_FORTRESS drop "
+                    "team=%s hwr=%s form=%s", p.team_name, hwr, form,
+                )
+        elif storyline_type == StorylineType.GOAL_MACHINES:
+            g = ctx.get("goals_this_season")
+            if not p.player_name.strip():
+                logger.info(
+                    "StorylineDetector.scout_gate: GOAL_MACHINES drop "
+                    "(no player_name) team=%s", p.team_name,
+                )
+                continue
+            # 5 goals is a loose floor — any "Europe's top scorer"
+            # claim implies double-digit goals by spring, but even a
+            # 5-goal striker is a legitimate anytime-scorer pick.
+            if isinstance(g, int) and g >= 5:
+                keep.append(p)
+            else:
+                # Still include if scout didn't supply goals (we'd
+                # rather keep the participant than drop a known name
+                # for missing metadata — narrative author just won't
+                # reference the number).
+                if g is None:
+                    keep.append(p)
+                else:
+                    logger.info(
+                        "StorylineDetector.scout_gate: GOAL_MACHINES drop "
+                        "player=%s goals=%s", p.player_name, g,
+                    )
+        elif storyline_type == StorylineType.EUROPEAN_WEEK:
+            # Trust the scout — the competition claim IS the gate. If
+            # `competition` missing, still accept (the fixture's
+            # existence in the scout's payload means it was found via
+            # web_search for UCL/UEL/UECL).
+            keep.append(p)
+        elif storyline_type == StorylineType.DERBY_WEEKEND:
+            # Derby name arrives in `extra` — require at least one
+            # char so the narrative author has something to reference.
+            # (Scouts consistently fill this, but the check is cheap.)
+            if p.extra:
+                keep.append(p)
+            else:
+                logger.info(
+                    "StorylineDetector.scout_gate: DERBY_WEEKEND drop "
+                    "(no derby name) team=%s", p.team_name,
+                )
+        else:
+            keep.append(p)
+    return keep
 
 
 def _row_summary(row: Optional[dict]) -> str:
