@@ -18,8 +18,9 @@ scout's raw headline/summary so the pipeline never blocks.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from anthropic import AsyncAnthropic
 
@@ -27,7 +28,33 @@ from app.engine._price_scrub import strip_prices
 from app.models.news import CandidateCard, NewsItem
 from app.models.schemas import CardLeg, Game, Market
 
+if TYPE_CHECKING:
+    from app.services.candidate_store import CandidateStore
+
 logger = logging.getLogger(__name__)
+
+
+def _cache_key(
+    *,
+    bet_type: str,
+    hook_type: str,
+    headline: str,
+    legs: Optional[list[CardLeg]],
+    total_odds: Optional[float],
+) -> str:
+    """SHA256 over the canonicalised inputs that feed the Sonnet prompt.
+
+    legs_csv is the sorted selection_ids pipe-joined so leg order doesn't
+    affect the hash. total_odds is rounded to 2dp because tiny price jitter
+    shouldn't bust the cache — the prompt already ignores small moves.
+    """
+    if legs:
+        legs_csv = "|".join(sorted(str(leg.selection_id) for leg in legs))
+    else:
+        legs_csv = ""
+    odds_str = f"{total_odds:.2f}" if total_odds is not None else ""
+    raw = f"{bet_type}|{hook_type}|{headline}|{legs_csv}|{odds_str}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 VOICE_BRIEF = """You are the senior copywriter for Pulse, a news-driven sports
@@ -217,11 +244,36 @@ class NarrativeRewriter:
 
     Uses Sonnet by default (cost per rewrite ~$0.002, prose quality is the
     bottleneck). Haiku works in a pinch — override `model` at construction.
+
+    When `store` and `cache_enabled` are both set, rewrites are memoised by
+    SHA256(bet_type|hook_type|headline|legs_csv|total_odds) for
+    `cache_ttl_seconds` (default 24h). Identical candidates across reruns
+    then skip the Sonnet call entirely (U3, 2026-04-23). `cache_hits` /
+    `cache_misses` are per-instance counters the orchestrator reads at
+    end-of-cycle for the summary log line.
     """
 
-    def __init__(self, client: AsyncAnthropic, model: str = "claude-sonnet-4-6"):
+    def __init__(
+        self,
+        client: AsyncAnthropic,
+        model: str = "claude-sonnet-4-6",
+        *,
+        store: "Optional[CandidateStore]" = None,
+        cache_enabled: bool = True,
+        cache_ttl_seconds: float = 86400.0,
+    ):
         self._client = client
         self._model = model
+        self._store = store
+        self._cache_enabled = bool(cache_enabled and store is not None)
+        self._cache_ttl_seconds = float(cache_ttl_seconds)
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def reset_cache_counters(self) -> None:
+        """Clear per-cycle cache counters (called by the orchestrator)."""
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     async def rewrite(
         self,
@@ -233,6 +285,31 @@ class NarrativeRewriter:
         legs: Optional[list[CardLeg]] = None,
         total_odds: Optional[float] = None,
     ) -> Optional[dict[str, str]]:
+        # ── Cache lookup (U3). Hash the same inputs that determine the
+        # Sonnet output; on hit, return the cached pair without touching
+        # the API. Keep the hash computation cheap — no network calls.
+        cache_key = _cache_key(
+            bet_type=candidate.bet_type.value,
+            hook_type=candidate.hook_type.value,
+            headline=news.headline or "",
+            legs=legs,
+            total_odds=total_odds,
+        )
+        if self._cache_enabled and self._store is not None:
+            try:
+                cached = await self._store.get_rewrite_cache(
+                    cache_key, max_age_seconds=self._cache_ttl_seconds,
+                )
+            except Exception as exc:
+                logger.warning("NarrativeRewriter cache read failed: %s", exc)
+                cached = None
+            if cached and cached.get("headline"):
+                self.cache_hits += 1
+                logger.debug(
+                    "[NarrativeRewriter] rewrite_cache_hit key=%s...", cache_key[:12],
+                )
+                return {"headline": cached["headline"], "angle": cached.get("angle", "")}
+
         pick_label = ""
         pick_odds: Optional[float] = None
         market_label = ""
@@ -307,6 +384,23 @@ class NarrativeRewriter:
                 headline = strip_prices(_clean(inp.get("headline")))
                 angle = strip_prices(_clean(inp.get("angle")))
                 if headline:
+                    # Cache miss path — store the freshly-generated rewrite
+                    # under the same key we probed above. Failures here are
+                    # non-fatal; we still return the rewrite.
+                    if self._cache_enabled and self._store is not None:
+                        self.cache_misses += 1
+                        logger.debug(
+                            "[NarrativeRewriter] rewrite_cache_miss key=%s...", cache_key[:12],
+                        )
+                        try:
+                            await self._store.save_rewrite_cache(
+                                key=cache_key,
+                                headline=headline,
+                                angle=angle,
+                                model=self._model,
+                            )
+                        except Exception as exc:
+                            logger.warning("NarrativeRewriter cache write failed: %s", exc)
                     return {"headline": headline, "angle": angle}
         return None
 

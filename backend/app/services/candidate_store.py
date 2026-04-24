@@ -169,6 +169,23 @@ CREATE TABLE IF NOT EXISTS card_clicks (
 );
 CREATE INDEX IF NOT EXISTS idx_clicks_card ON card_clicks(card_id);
 CREATE INDEX IF NOT EXISTS idx_clicks_created ON card_clicks(created_at);
+
+-- U3 rewrite cache. NarrativeRewriter calls Sonnet for every published
+-- candidate every cycle; when the same fixture still has the same news
+-- items 4h later the inputs hash to the same key and the second run is
+-- free. TTL (default 24h) bounds how stale a cached rewrite can be
+-- before we pay Sonnet again. Key is a SHA256 over
+--   bet_type|hook_type|headline|legs_csv|total_odds
+-- computed by NarrativeRewriter so we don't have to reconstruct it on
+-- read. Additive table; does not touch candidates / news_items.
+CREATE TABLE IF NOT EXISTS rewrite_cache (
+    key TEXT PRIMARY KEY,
+    headline TEXT NOT NULL,
+    angle TEXT NOT NULL,
+    model TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rewrite_cache_created ON rewrite_cache(created_at);
 """
 
 
@@ -301,6 +318,17 @@ class CandidateStore:
                 )
                 await db.commit()
 
+            # rewrite_cache migration (U3 — 2026-04-23). Additive new table
+            # only; follows the storyline_items pattern (CREATE TABLE IF
+            # NOT EXISTS via executescript below is enough on first-run,
+            # but we probe table_info so a future column addition has a
+            # place to live without duplicating the whole block).
+            async with db.execute("PRAGMA table_info(rewrite_cache)") as cur:
+                _rc_cols = {row[1] for row in await cur.fetchall()}
+            # No columns to migrate yet — the table is created by the
+            # executescript(_SCHEMA) call below when missing. Probe exists
+            # so the next drift has a landing spot.
+            _ = _rc_cols
 
             await db.executescript(_SCHEMA)
             await db.commit()
@@ -704,13 +732,59 @@ class CandidateStore:
                 rows = await cur.fetchall()
         return {r["card_id"]: int(r["n"]) for r in rows}
 
-    async def reaction_aggregates(self) -> list[dict[str, Any]]:
-        """Aggregate reactions by (fixture, hook_type, bet_type, storyline).
+    # ── Rewrite cache (U3 — narrative rewriter memoisation) ──
 
-        Joins card_reactions → candidates on card_id. Cards that never landed
-        in the candidates table (e.g. featured BBs which bypass the store)
-        won't appear here — that's fine for v1; the interesting signal is on
-        engine-produced cards anyway. Sorted by total desc.
+    async def get_rewrite_cache(
+        self, key: str, *, max_age_seconds: float,
+    ) -> Optional[dict[str, str]]:
+        """Read a cached rewrite by key. Returns None on miss or TTL expiry.
+
+        The hash is computed by NarrativeRewriter from
+        (bet_type, hook_type, headline, legs_csv, total_odds) so unchanged
+        candidates across reruns hit this path and skip the Sonnet call.
+        """
+        import time as _t
+        cutoff = _t.time() - max_age_seconds
+        async with self._connect() as db:
+            async with db.execute(
+                """
+                SELECT headline, angle FROM rewrite_cache
+                WHERE key = ? AND created_at > ?
+                """,
+                (key, cutoff),
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"headline": row[0] or "", "angle": row[1] or ""}
+
+    async def save_rewrite_cache(
+        self, *, key: str, headline: str, angle: str, model: str,
+    ) -> None:
+        """Upsert a fresh rewrite into the cache. Idempotent via PK on key."""
+        import time as _t
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO rewrite_cache
+                    (key, headline, angle, model, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (key, headline, angle, model, _t.time()),
+            )
+            await db.commit()
+
+    async def reaction_aggregates(self) -> list[dict[str, Any]]:
+        """Aggregate reactions by (fixture, hook_type, bet_type, storyline) for
+        narrative-engine cards only — i.e. rows that JOIN cleanly to the
+        `candidates` table.
+
+        Featured BBs bypass candidate_store entirely (built at runtime in
+        services/featured_bb.py), so their reactions don't JOIN. Those are
+        reported separately via `reaction_aggregates_orphan()` so the admin
+        surface can split them into their own cohort — a straight LEFT JOIN
+        collapses them all into one (None, None, None, None) row that's
+        useless for analysis.
         """
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -724,7 +798,7 @@ class CandidateStore:
                     SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END) AS up,
                     SUM(CASE WHEN r.reaction = 'down' THEN 1 ELSE 0 END) AS down
                 FROM card_reactions r
-                LEFT JOIN candidates c ON c.id = r.card_id
+                INNER JOIN candidates c ON c.id = r.card_id
                 GROUP BY c.game_id, c.hook_type, c.bet_type, c.storyline_id
                 ORDER BY (
                     SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END)
@@ -744,6 +818,66 @@ class CandidateStore:
                 "down": int(r["down"] or 0),
             })
         return out
+
+    async def reaction_aggregates_orphan(self) -> list[dict[str, Any]]:
+        """Reactions on card_ids NOT present in `candidates` — i.e. featured
+        BBs from the operator-curated feed, which bypass candidate_store.
+
+        Grouped by card_id since we have no other metadata; the card_id prefix
+        (e.g. `featured_`) is the only cohort clue we can surface. Sorted by
+        total desc.
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT
+                    r.card_id AS card_id,
+                    SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END) AS up,
+                    SUM(CASE WHEN r.reaction = 'down' THEN 1 ELSE 0 END) AS down
+                FROM card_reactions r
+                WHERE r.card_id NOT IN (SELECT id FROM candidates)
+                GROUP BY r.card_id
+                ORDER BY (
+                    SUM(CASE WHEN r.reaction = 'up' THEN 1 ELSE 0 END)
+                  + SUM(CASE WHEN r.reaction = 'down' THEN 1 ELSE 0 END)
+                ) DESC
+                """,
+            ) as cur:
+                rows = await cur.fetchall()
+        return [
+            {
+                "card_id": r["card_id"],
+                "up": int(r["up"] or 0),
+                "down": int(r["down"] or 0),
+            }
+            for r in rows
+        ]
+
+    async def click_totals_orphan(self) -> int:
+        """Total clicks on card_ids NOT present in `candidates`. Single scalar
+        — we surface featured-BB clicks as one aggregate since we don't yet
+        split by fixture for those."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM card_clicks "
+                "WHERE card_id NOT IN (SELECT id FROM candidates)"
+            ) as cur:
+                row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def click_totals_by_card(self) -> dict[str, int]:
+        """Clicks per card_id for cards NOT in the candidates table (featured
+        BBs). Lets the admin page show per-featured-card CTR."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT card_id, COUNT(*) AS n FROM card_clicks "
+                "WHERE card_id NOT IN (SELECT id FROM candidates) "
+                "GROUP BY card_id"
+            ) as cur:
+                rows = await cur.fetchall()
+        return {r["card_id"]: int(r["n"]) for r in rows}
 
 
 # ── Row <-> model helpers ──

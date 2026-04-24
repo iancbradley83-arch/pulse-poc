@@ -1,11 +1,16 @@
 """REST API routes for the feed."""
 from __future__ import annotations
 
+import logging
 from typing import Optional
 from fastapi import APIRouter, Query
 from app.services.market_catalog import MarketCatalog
 from app.services.feed_manager import FeedManager
 from app.services.game_simulator import GameSimulator
+from app.engine.feed_ranker import rank_cards
+from app.config import PULSE_BET_TYPE_MIX
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
 
@@ -21,16 +26,27 @@ def create_routes(
         type: str = Query("prematch", regex="^(prematch|live)$"),
         sport: Optional[str] = None,
         game_id: Optional[str] = None,
-        # 50 keeps the full mix visible. With ~33 cards typical (20 news BBs +
-        # 4 featured BBs + 10 baseline singles + future combos), the prior
-        # default of 20 was clipping all singles off the bottom of a
-        # relevance-sorted list, hiding them from the UI. A proper mix-aware
-        # publisher (PULSE_BET_TYPE_MIX enforcement, top-N per bet_type) is
-        # the longer-term fix; this just stops the truncation.
+        # 50 keeps the full mix visible. Ordering now driven by
+        # app.engine.feed_ranker (score + bet-type quota + variety guard);
+        # see docs/refresh-and-ordering.md §2.
         limit: int = 50,
     ):
         if type == "prematch":
-            return {"cards": feed.get_prematch_feed(sport=sport, limit=limit)}
+            # Apply ranker v1: score-based sort, PULSE_BET_TYPE_MIX quota
+            # interleaving, variety guard, drop no-shows + dupes. Falls back
+            # to the FeedManager's relevance-only list if anything blows up.
+            try:
+                pool = list(feed.prematch_cards)
+                if sport:
+                    pool = [c for c in pool if c.game.sport.value == sport]
+                ranked = rank_cards(pool, PULSE_BET_TYPE_MIX, limit=limit)
+                return {"cards": [c.model_dump() for c in ranked]}
+            except Exception as exc:
+                logger.warning(
+                    "[PULSE] feed_ranker failed, falling back to relevance "
+                    "sort: %s", exc,
+                )
+                return {"cards": feed.get_prematch_feed(sport=sport, limit=limit)}
         else:
             return {"cards": feed.get_live_feed(game_id=game_id, limit=limit)}
 
