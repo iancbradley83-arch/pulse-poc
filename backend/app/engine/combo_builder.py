@@ -68,48 +68,50 @@ ThemeLeg = tuple[str, str]
 # selection); legs beyond that are dropped. So order matters — put the most
 # narratively-aligned legs first.
 HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
-    # Injury THEME — position-aware routing (2026-04-23). When the news
-    # carries injury_details with a known position, _injury_theme_for()
-    # rewrites this list into a position-specific stack (striker out =>
-    # unders + BTTS NO; defender out => overs + BTTS YES; etc). The entries
-    # below are the fallback used when position is unknown (scout emitted
-    # no injury_details, or the named player resolved to "unknown"). We
-    # deliberately REMOVED DNB-opponent because backing a heavy fav with
-    # no edge was the exact 1-2/5 pathology. The replacement default is
-    # Over 2.5 + BTTS YES — a conservative "injury story =/= direct fade
-    # on either team" stance that isn't wrong on any specific injury
-    # narrative and keeps the card shippable as a 2-leg BB. See PR #33
-    # review feedback point 2 (2026-04-23).
+    # Injury THEME — position-aware routing (2026-04-23, re-enriched
+    # 2026-04-24 for leg-count recovery). When the news carries
+    # injury_details with a known position, _injury_theme_for() rewrites
+    # this list into a position-specific stack. The entries below are the
+    # *fallback* used when position is unknown. Enriched to 3 legs so the
+    # typical unpositioned INJURY yields a 3-leg BB instead of the 2-leg
+    # floor the PR #33 fix left behind. Order encodes narrative fit —
+    # dedup-on-market-type + walk-down validator takes care of the rest.
     HookType.INJURY: [
         ("over_under", "over"),
         ("btts",       "btts_yes"),
+        ("corners_ou", "over"),
     ],
     # Team news (return from suspension, fit XI, etc.) — lean into the
     # affected side attacking better. Goalscorer-by-mentioned-player is
     # tried first; if no player in the news matches the goalscorer market
     # it's skipped silently and the BB falls through to the generic legs.
+    # Order favours: player-matched goalscorer → primary 1X2 → goals
+    # thesis → BTTS alignment. 4 preferred slots so we frequently hit 4
+    # when the full catalogue is available.
     HookType.TEAM_NEWS: [
         ("goalscorer",   "mentioned_player"),
         ("match_result", "affected"),
         ("over_under",   "over"),
-        ("corners_ou",   "over"),
         ("btts",         "btts_yes"),
+        ("corners_ou",   "over"),
     ],
-    # MANAGER_QUOTE theme is set further down (it includes the player-aware
-    # goalscorer leg, so the entry lives next to TRANSFER for clarity).
-    # Tactical stories (aggressive press, new formation, high block) — expect
-    # set pieces and bookings, plus goals either way.
+    # Tactical stories (aggressive press, new formation, high block) —
+    # expect set pieces and bookings, plus goals either way. Enriched to
+    # 4 preferred legs so a TACTICAL BB reads like a tactical BB instead
+    # of a generic over/btts.
     HookType.TACTICAL: [
         ("corners_ou",   "over"),
         ("cards_ou",     "over"),
         ("over_under",   "over"),
         ("btts",         "btts_yes"),
     ],
-    # Preview copy tends to point at the favourite. Use double-chance for
-    # safety + Over 2.5 for the "lots of goals expected" angle.
+    # Preview copy tends to point at the favourite. Now that PREVIEW is
+    # "both" in the per-hook preference (2026-04-24), we want the BB to
+    # carry its own weight — 3 legs: primary pick + goals thesis + BTTS.
     HookType.PREVIEW: [
         ("match_result", "affected"),
         ("over_under",   "over"),
+        ("btts",         "btts_yes"),
     ],
     # Transfer — usually a new attacker. Lead with the named player as
     # anytime scorer if we can match them; back the affected side + goals.
@@ -117,17 +119,62 @@ HOOK_THEMES: dict[HookType, list[ThemeLeg]] = {
         ("goalscorer",   "mentioned_player"),
         ("match_result", "affected"),
         ("over_under",   "over"),
+        ("btts",         "btts_yes"),
     ],
     # Manager quote that names a specific player (e.g. "I expect Saka to
-    # punish them today") — reuse the player-aware path.
+    # punish them today") — reuse the player-aware path. 1st-half angle
+    # fits a pre-match quote thesis ("we want to start on the front foot")
+    # and stacks cleanly with FT outcome + over.
     HookType.MANAGER_QUOTE: [
-        ("goalscorer",        "mentioned_player"),
-        ("first_half_result", "affected"),
-        ("match_result",      "affected"),
-        ("over_under",        "over"),
+        ("goalscorer",           "mentioned_player"),
+        ("first_half_result",    "affected"),
+        ("first_half_goals_ou",  "over"),
+        ("match_result",         "affected"),
+        ("over_under",           "over"),
     ],
     # Article / other -> no BB; the single-bet path handles these.
 }
+
+# Alternate legs per hook theme for the leg-swap retry path (2026-04-24).
+# When Rogue rejects the initial N-leg combo, instead of immediately
+# dropping the last leg, we try swapping in one of these alternates for
+# the last leg at the same leg-count. Only after swap attempts exhaust do
+# we drop to N-1. Each alternate is a (market_type, outcome_key) pair.
+#
+# Capped at 2 alternates per hook — keeps the total validator-call budget
+# sane (see _MAX_VALIDATOR_CALLS below). Order matters: first alternate
+# is tried before second.
+HOOK_ALTERNATES: dict[HookType, list[ThemeLeg]] = {
+    HookType.INJURY: [
+        ("double_chance", "dc_affected"),
+        ("cards_ou",      "over"),
+    ],
+    HookType.TEAM_NEWS: [
+        ("double_chance", "dc_affected"),
+        ("cards_ou",      "over"),
+    ],
+    HookType.TACTICAL: [
+        ("double_chance", "dc_affected"),
+        ("first_half_goals_ou", "over"),
+    ],
+    HookType.PREVIEW: [
+        ("double_chance", "dc_affected"),
+        ("corners_ou",    "over"),
+    ],
+    HookType.TRANSFER: [
+        ("corners_ou",    "over"),
+        ("double_chance", "dc_affected"),
+    ],
+    HookType.MANAGER_QUOTE: [
+        ("btts",          "btts_yes"),
+        ("corners_ou",    "over"),
+    ],
+}
+
+# Budget cap so a pathological rejection cycle can't blow our Rogue
+# call count for a single BB build. Walk-down from N legs (≈ 4) through
+# one alternate-leg swap each is ≤ 5 calls; leave headroom.
+_MAX_VALIDATOR_CALLS = 5
 
 # BB leg count is driven by narrative fit, not a fixed count (user decision
 # 2026-04-23, PR #33 review feedback point 4). We accept 2..6 legs; the
@@ -144,39 +191,50 @@ MAX_BB_LEGS = 6
 # resolver. Each list has at least 3 candidates so the MAX_BB_LEGS cap
 # leaves room to fall through if one market is missing.
 _INJURY_POSITION_THEMES: dict[str, list[ThemeLeg]] = {
-    # Attacker out on affected side => game dries up.
+    # Attacker out on affected side => game dries up. 3-leg stack: under
+    # goals + BTTS no + cards-under. Fallback tail (corners_under) gives
+    # the resolver somewhere to go when cards market isn't in the
+    # catalogue; dedup-on-market-type keeps only one.
     "striker": [
         ("over_under", "under"),
         ("btts",       "btts_no"),
+        ("cards_ou",   "under"),
         ("corners_ou", "under"),
     ],
     "winger": [
         ("over_under", "under"),
         ("btts",       "btts_no"),
+        ("cards_ou",   "under"),
         ("corners_ou", "under"),
     ],
     "attacking_mid": [
         ("over_under", "under"),
         ("btts",       "btts_no"),
+        ("cards_ou",   "under"),
         ("corners_ou", "under"),
     ],
-    # Defender out => goals should open up both ways.
+    # Defender out (CB / FB) => goals open both ways, corners and cards
+    # both up. 4-leg stack: overs + BTTS yes + corners over + cards over.
     "centre_back": [
         ("over_under", "over"),
         ("btts",       "btts_yes"),
         ("corners_ou", "over"),
+        ("cards_ou",   "over"),
     ],
     "fullback": [
         ("over_under", "over"),
         ("btts",       "btts_yes"),
         ("corners_ou", "over"),
+        ("cards_ou",   "over"),
     ],
+    # GK out → specific variant: wider spread of direct goal-threat legs.
     "goalkeeper": [
         ("over_under", "over"),
         ("btts",       "btts_yes"),
+        ("corners_ou", "over"),
         ("cards_ou",   "over"),
     ],
-    # Defensive mid => chaos signals; game opens up.
+    # Defensive mid => chaos signals; game opens up (3-leg).
     "defensive_mid": [
         ("corners_ou", "over"),
         ("cards_ou",   "over"),
@@ -280,6 +338,19 @@ def _find_selection(
         return by_label_substr("yes") or (market.selections[0] if market.selections else None)
     if outcome_key == "btts_no":
         return by_label_substr("no") or (market.selections[1] if len(market.selections) > 1 else None)
+    if outcome_key == "dc_affected":
+        # Double chance favouring the affected side. Rogue labels are
+        # typically "1X" / "12" / "X2"; for home-affected we want 1X
+        # (home or draw), for away-affected we want X2 (draw or away).
+        wanted = "1x" if affected == "home" else "x2"
+        sel = by_label_substr(wanted)
+        if sel is not None:
+            return sel
+        # Some books use "Home or Draw" / "Draw or Away" labels — try a
+        # word-based fallback before giving up.
+        if affected == "home":
+            return by_label_substr("home", "draw") or by_label_substr("home or draw")
+        return by_label_substr("draw", "away") or by_label_substr("draw or away")
     if outcome_key == "mentioned_player":
         # Goalscorer-leg-by-name. Returns None if no mentioned player matches
         # a selection in this market — caller falls through to the next leg.
@@ -413,15 +484,41 @@ class ComboBuilder:
         if len(selection_ids) != len(legs):
             return None
 
+        # Pre-resolve alternate legs for the leg-swap retry path. Each
+        # alternate is tried BEFORE dropping a leg, so we frequently land
+        # on 3-leg BBs that would otherwise collapse to the 2-leg floor
+        # just because one specific leg correlates poorly. Alternates are
+        # filtered to exclude market_types already in the primary stack —
+        # swapping e.g. over_under for corners_ou when corners_ou is
+        # already leg 3 would just duplicate.
+        alternates_raw = HOOK_ALTERNATES.get(news.hook_type, [])
+        alternate_legs: list[tuple[Market, MarketSelection]] = []
+        seen_alt_types: set[str] = set(seen_market_types)
+        for market_type, outcome_key in alternates_raw:
+            if market_type in seen_alt_types:
+                continue
+            picked = _pick_leg_selection(
+                self._catalog, game, market_type, outcome_key, affected,
+                mentions=news.mentions,
+            )
+            if picked is None:
+                continue
+            alternate_legs.append(picked)
+            seen_alt_types.add(market_type)
+
         # Validate via Rogue BB endpoint. Mock mode (no Rogue client) skips
         # validation and just trusts the combo — fine for local dev.
         #
-        # If the full N-leg combo is rejected ("uncorrelated"), walk down
-        # one leg at a time (N → N-1 → ... → MIN_BB_LEGS) peeling the last
-        # leg off each pass. The theme author ordered by must-haves first,
-        # so dropping from the end preserves the narrative core. Previous
-        # behaviour jumped straight from N to 2 which lost signal —
-        # PR #33 review feedback point 4 (2026-04-23).
+        # Walk order (2026-04-24 leg-swap retry, PR "fix/leg-counts-mix-balance"):
+        #   1. Full N-leg stack.
+        #   2. Same-leg-count swaps: for each resolved alternate, swap it
+        #      into the LAST leg slot (the least-narratively-critical
+        #      position). Caps at len(alternate_legs) tries.
+        #   3. Drop to N-1, N-2, … MIN_BB_LEGS.
+        # Total validator calls capped at _MAX_VALIDATOR_CALLS so a
+        # pathological rejection cycle can't blow our Rogue budget for a
+        # single BB build. Previous behaviour (PR #33) went straight to
+        # drop-legs which bottomed out at 2 legs most of the time.
         total_odds: Optional[float] = None
         price_source: Optional[str] = None
         virtual_selection: Optional[str] = None
@@ -429,38 +526,65 @@ class ComboBuilder:
             valid = False
             reason = ""
             odds = None
-            attempts: list[list[str]] = []
             n = len(selection_ids)
-            for size in range(n, MIN_BB_LEGS - 1, -1):
-                attempts.append(selection_ids[:size])
-            for idx, attempt in enumerate(attempts):
+
+            # Build ordered attempt list. Each entry is (legs_list,
+            # selection_ids_list, label) so logging can explain which
+            # variant was accepted.
+            attempts: list[tuple[
+                list[tuple[Market, MarketSelection]], list[str], str,
+            ]] = []
+            # 1. Full primary.
+            attempts.append((list(legs), list(selection_ids), f"primary-{n}leg"))
+            # 2. Same-leg-count alternates: replace last leg with each alt.
+            for i, alt in enumerate(alternate_legs):
+                if len(attempts) >= _MAX_VALIDATOR_CALLS:
+                    break
+                swapped_legs = legs[:-1] + [alt]
+                swapped_ids = [s.selection_id for _, s in swapped_legs]
+                if None in swapped_ids or len(swapped_ids) != len(swapped_legs):
+                    continue
+                attempts.append((swapped_legs, swapped_ids, f"swap{i}-{n}leg"))
+            # 3. Drop-leg walk (N-1 down to MIN_BB_LEGS).
+            for size in range(n - 1, MIN_BB_LEGS - 1, -1):
+                if len(attempts) >= _MAX_VALIDATOR_CALLS:
+                    break
+                attempts.append((legs[:size], selection_ids[:size], f"drop-{size}leg"))
+
+            accepted: Optional[tuple[
+                list[tuple[Market, MarketSelection]], list[str], str,
+            ]] = None
+            for attempt_legs, attempt_ids, label in attempts:
                 try:
-                    resp = await self._rogue.betbuilder_match(attempt)
+                    resp = await self._rogue.betbuilder_match(attempt_ids)
                 except RogueApiError as exc:
-                    logger.info("ComboBuilder: Rogue rejected combo %s (%s)", attempt, exc)
+                    logger.info(
+                        "ComboBuilder: Rogue rejected combo %s (%s, attempt=%s)",
+                        attempt_ids, exc, label,
+                    )
                     return None
                 except Exception as exc:
                     logger.warning("ComboBuilder: Rogue BB call errored: %s", exc)
                     return None
                 valid, odds, reason, virtual_selection = _parse_bb_validation(resp)
                 if valid:
-                    if idx > 0:
-                        # Trim legs/selection_ids to match the accepted set
-                        # so downstream pricing + persistence match the BB
-                        # the book actually validated.
-                        legs = legs[: len(attempt)]
-                        selection_ids = attempt
-                        logger.info(
-                            "ComboBuilder: %d-leg rejected, fell back to %d-leg (news=%s)",
-                            n, len(attempt), news.id,
-                        )
+                    accepted = (attempt_legs, attempt_ids, label)
                     break
                 logger.info(
-                    "ComboBuilder: combo invalid — %s (selection_ids=%s)",
-                    reason or "no reason", attempt,
+                    "ComboBuilder: combo invalid — %s (attempt=%s, selection_ids=%s)",
+                    reason or "no reason", label, attempt_ids,
                 )
-            if not valid:
+
+            if accepted is None:
                 return None
+            accepted_legs, accepted_ids, accepted_label = accepted
+            if accepted_ids != selection_ids:
+                logger.info(
+                    "ComboBuilder: %d-leg primary not accepted, used %s (%d leg, news=%s)",
+                    n, accepted_label, len(accepted_ids), news.id,
+                )
+            legs = accepted_legs
+            selection_ids = accepted_ids
             # Rogue itself returns no correlated odds. If we have a Kmianko
             # client and a VirtualSelection id, use those to get the *real*
             # operator price.

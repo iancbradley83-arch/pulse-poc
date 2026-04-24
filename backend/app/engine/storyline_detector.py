@@ -356,6 +356,7 @@ class StorylineDetector:
             PULSE_STORYLINE_EUROPE_CHASE_MIN_POSITION,
             PULSE_STORYLINE_EUROPE_CHASE_MAX_POSITION,
             PULSE_STORYLINE_EUROPE_CHASE_MAX_POINTS_FROM_SPOT,
+            PULSE_STORYLINE_BORDERLINE_TOLERANCE_ENABLED,
         )
         self._verify_enabled = bool(
             PULSE_STORYLINE_STANDINGS_VERIFY_ENABLED
@@ -385,6 +386,9 @@ class StorylineDetector:
             PULSE_STORYLINE_EUROPE_CHASE_MAX_POINTS_FROM_SPOT
             if europe_chase_max_points_from_spot is None
             else europe_chase_max_points_from_spot
+        )
+        self._borderline_enabled = bool(
+            PULSE_STORYLINE_BORDERLINE_TOLERANCE_ENABLED
         )
         self._standings_tool = _submit_standings_tool()
 
@@ -617,6 +621,14 @@ class StorylineDetector:
                 _cache_put(team_lower, row)
 
         survivors: list[StorylineParticipant] = []
+        # Collect "off_threshold" near-miss rows for the borderline
+        # fallback — participants the scout nominated and the verify
+        # step could measure (row.confident=true), but whose position /
+        # points fell just outside the threshold. We re-include them
+        # only if the hard-verified survivors count is exactly 2, so
+        # the gate behaviour is unchanged for normal cases.
+        borderline: list[tuple[StorylineParticipant, dict]] = []
+
         for p in participants:
             row = cached.get(p.team_name.lower()) or fetched.get(p.team_name.lower())
             verdict = self._verify_row(storyline_type, row)
@@ -625,12 +637,115 @@ class StorylineDetector:
                 storyline_type.value, p.team_name, verdict,
                 _row_summary(row),
             )
-            if verdict != "pass":
+            if verdict == "pass":
+                p.participant_context = _context_from_row(storyline_type, row)
+                survivors.append(p)
                 continue
-            # Attach the verified context for the narrative author.
-            p.participant_context = _context_from_row(storyline_type, row)
-            survivors.append(p)
+            # Stash near-miss candidates for the borderline pass.
+            if (
+                self._borderline_enabled
+                and verdict == "off_threshold"
+                and isinstance(row, dict)
+                and self._is_near_threshold(storyline_type, row)
+            ):
+                borderline.append((p, row))
+
+        # Borderline re-include: only fires when we're stuck at exactly 2
+        # hard-verified survivors AND at least one near-miss exists. Keeps
+        # the strict-verify behaviour intact for the common case; only
+        # relaxes when the alternative is shipping 0 storylines. Last-resort.
+        if (
+            self._borderline_enabled
+            and len(survivors) == 2
+            and borderline
+        ):
+            # Rank borderline candidates by *how close* they were to the
+            # threshold so the closest miss gets re-included first.
+            borderline.sort(
+                key=lambda pr: self._borderline_distance(storyline_type, pr[1])
+            )
+            for p, row in borderline[:1]:
+                p.participant_context = _context_from_row(storyline_type, row)
+                # Tag so downstream narrative author knows this is an
+                # edge-case inclusion, not a clean qualifier.
+                p.participant_context["borderline"] = True
+                survivors.append(p)
+                logger.info(
+                    "StorylineDetector.verify: borderline include — "
+                    "type=%s team=%s row=%s",
+                    storyline_type.value, p.team_name, _row_summary(row),
+                )
+
         return survivors
+
+    def _is_near_threshold(
+        self, storyline_type: StorylineType, row: dict,
+    ) -> bool:
+        """True if this row is within 1 position OR within 2 points of
+        the storyline-type threshold (on the qualifying side). Kept
+        tight — we're only trying to rescue the "17th with 7pts from
+        safety" kind of near-miss, not the mid-table case."""
+        pos = row.get("league_position")
+        size = row.get("league_size")
+        if storyline_type == StorylineType.RELEGATION:
+            pts_safety = row.get("points_from_safety")
+            if isinstance(pos, int) and isinstance(size, int) and size > 0:
+                threshold_pos = size - self._reg_max_pos + 1
+                if pos >= threshold_pos - 1:  # within 1 position
+                    return True
+            if (
+                isinstance(pts_safety, int)
+                and pts_safety <= self._reg_max_pts + 2  # within 2 points
+            ):
+                return True
+            return False
+        if storyline_type == StorylineType.EUROPE_CHASE:
+            pts_spot = row.get("points_from_european_spot")
+            if isinstance(pos, int):
+                if (
+                    self._ec_min_pos - 1 <= pos <= self._ec_max_pos + 1
+                ):
+                    return True
+            if (
+                isinstance(pts_spot, int)
+                and pts_spot >= 0
+                and pts_spot <= self._ec_max_pts + 2
+            ):
+                return True
+            return False
+        return False
+
+    def _borderline_distance(
+        self, storyline_type: StorylineType, row: dict,
+    ) -> int:
+        """How far past the threshold is this row? Lower = closer miss.
+        Used to pick the best borderline candidate when multiple exist."""
+        pos = row.get("league_position")
+        size = row.get("league_size")
+        if storyline_type == StorylineType.RELEGATION:
+            pts_safety = row.get("points_from_safety")
+            pos_gap = 99
+            if isinstance(pos, int) and isinstance(size, int) and size > 0:
+                pos_gap = max(0, (size - self._reg_max_pos + 1) - pos)
+            pts_gap = 99
+            if isinstance(pts_safety, int):
+                pts_gap = max(0, pts_safety - self._reg_max_pts)
+            return min(pos_gap, pts_gap)
+        if storyline_type == StorylineType.EUROPE_CHASE:
+            pts_spot = row.get("points_from_european_spot")
+            pos_gap = 99
+            if isinstance(pos, int):
+                if pos < self._ec_min_pos:
+                    pos_gap = self._ec_min_pos - pos
+                elif pos > self._ec_max_pos:
+                    pos_gap = pos - self._ec_max_pos
+                else:
+                    pos_gap = 0
+            pts_gap = 99
+            if isinstance(pts_spot, int) and pts_spot >= 0:
+                pts_gap = max(0, pts_spot - self._ec_max_pts)
+            return min(pos_gap, pts_gap)
+        return 99
 
     async def _fetch_standings(
         self,
