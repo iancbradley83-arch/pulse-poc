@@ -110,10 +110,16 @@ class StorylineDetector:
         *,
         model: str = "claude-sonnet-4-6",
         max_searches: int = 6,
+        min_participants: int = 2,
     ):
         self._client = client
         self._model = model
         self._max_searches = max_searches
+        # Minimum participants required for a storyline to be considered
+        # viable. 2 is the supply-friendly floor — a Golden Boot race with
+        # just Haaland and Watkins playing this weekend is still a legitimate
+        # cross-event combo. 3+ is ideal but often not available.
+        self._min_participants = max(2, int(min_participants))
         self._submit_tool = _submit_storyline_tool()
 
     async def detect(
@@ -131,8 +137,13 @@ class StorylineDetector:
             return []
 
         fixtures = list(games.values())
-        if len(fixtures) < 3:
-            logger.info("StorylineDetector: only %d fixtures — skipping", len(fixtures))
+        # 2 fixtures is enough to surface a 2-participant storyline. The
+        # old 3-fixture floor was silently killing valid weekends.
+        if len(fixtures) < self._min_participants:
+            logger.info(
+                "StorylineDetector: only %d fixtures (<%d) — skipping",
+                len(fixtures), self._min_participants,
+            )
             return []
 
         fixture_block = "\n".join(
@@ -142,8 +153,10 @@ class StorylineDetector:
         user_msg = (
             "Upcoming fixtures in the current matchweek:\n"
             f"{fixture_block}\n\n"
-            "Identify the top 3-5 players in the Golden Boot race whose teams "
-            "are playing in one of the fixtures above. Call submit_storyline "
+            f"Identify between {self._min_participants} and 5 players in the "
+            "Golden Boot race whose teams are playing in one of the fixtures "
+            f"above. A {self._min_participants}-participant race is valid "
+            "content if that's all the weekend has. Call submit_storyline "
             "when done."
         )
 
@@ -194,6 +207,12 @@ class StorylineDetector:
 
         if not participants:
             logger.info("StorylineDetector: 0 participants returned (type=%s)", storyline_type.value)
+            return []
+        if len(participants) < self._min_participants:
+            logger.info(
+                "StorylineDetector: %d participants < min %d (type=%s) — skipping",
+                len(participants), self._min_participants, storyline_type.value,
+            )
             return []
 
         item = StorylineItem(

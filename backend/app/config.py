@@ -72,6 +72,50 @@ def _parse_mix(s: str) -> dict[str, int]:
 
 PULSE_BET_TYPE_MIX = _parse_mix(os.getenv("PULSE_BET_TYPE_MIX", "singles=40,bb=30,combos=30"))
 
+# ── Per-hook BB/single preference (supply policy) ──────────────────────
+# Optional JSON override of the hardcoded `HOOK_BET_TYPE_PREFERENCE` dict
+# in `engine/news_scorer.py`. Keys are HookType enum values (strings like
+# "injury", "tactical"); values are "bb", "single", or "both". Anything
+# not overridden falls back to the module default. Missing / malformed
+# JSON falls back silently so a bad env flag can't kill the engine.
+#
+# Example:
+#   PULSE_HOOK_BET_TYPE_PREFERENCE_JSON='{"tactical":"bb","preview":"both"}'
+#
+# Lets ops A/B per-hook shape without a redeploy.
+import json as _json
+def _parse_hook_pref(raw: str) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        parsed = _json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in parsed.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        v_norm = v.strip().lower()
+        if v_norm not in {"bb", "single", "both"}:
+            continue
+        out[k.strip().lower()] = v_norm
+    return out
+
+PULSE_HOOK_BET_TYPE_PREFERENCE_JSON = _parse_hook_pref(
+    os.getenv("PULSE_HOOK_BET_TYPE_PREFERENCE_JSON", "")
+)
+
+# Minimum participants required for a cross-event storyline (Golden Boot
+# race, relegation battle, etc.) to be considered viable. 2 is the
+# supply-friendly floor — a weekend with only two top-scorer contenders
+# in action is still a legitimate combo story. Raise to 3 if we find
+# 2-participant stories dilute quality.
+PULSE_STORYLINE_MIN_PARTICIPANTS = int(
+    os.getenv("PULSE_STORYLINE_MIN_PARTICIPANTS", "2")
+)
+
 # ── Stage 5 — deep-link CTA ────────────────────────────────────────────
 # The card's "Tap to bet" / "Add Bet Builder" CTA opens this URL (target=
 # _blank) with the card's Rogue selection_ids pre-loaded on the operator's
