@@ -86,17 +86,31 @@ def _build_deep_link(card: Card) -> "str | None":
         PULSE_DEEPLINK_TEMPLATE_BB,
         PULSE_DEEPLINK_TEMPLATE_COMBO,
         PULSE_DEEPLINK_TEMPLATE_BSCODE,
+        PULSE_DEEPLINK_TEMPLATE_BSCODE_DIRECT,
+        PULSE_DEEPLINK_USE_DIRECT_KMIANKO,
         PULSE_OPERATOR_WRAPPER_URL,
+        PULSE_KMIANKO_BASE_URL,
+        PULSE_KMIANKO_SPBKV3_PATH,
     )
     from urllib.parse import quote as _quote
     if not PULSE_DEEPLINK_ENABLED:
         return None
     # Stage 5b: when we have a server-minted bscode, every bet type uses
-    # the same wrapper URL — kmianko restores the full slip from the code
+    # the same bscode URL — kmianko restores the full slip from the code
     # alone. Fall through to the PR #36 selectionId URLs when bscode is
     # missing (minter disabled / mint failed / no selection_ids).
+    #
+    # PULSE_DEEPLINK_USE_DIRECT_KMIANKO (default TRUE) emits the direct
+    # kmianko URL instead of the apuestatotal.com wrapper — the wrapper's
+    # Next.js fpath decoder strips `bscode` so the slip never hydrates.
     if card.bscode:
         try:
+            if PULSE_DEEPLINK_USE_DIRECT_KMIANKO:
+                return PULSE_DEEPLINK_TEMPLATE_BSCODE_DIRECT.format(
+                    kmianko_base=PULSE_KMIANKO_BASE_URL.rstrip("/"),
+                    spbkv3_path=PULSE_KMIANKO_SPBKV3_PATH,
+                    bscode=_quote(card.bscode, safe=""),
+                )
             return PULSE_DEEPLINK_TEMPLATE_BSCODE.format(
                 wrapper=PULSE_OPERATOR_WRAPPER_URL,
                 bscode=_quote(card.bscode, safe=""),
