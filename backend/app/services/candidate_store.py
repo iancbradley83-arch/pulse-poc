@@ -380,30 +380,40 @@ class CandidateStore:
         return _row_to_news(row) if row else None
 
     async def latest_news_ingested_at(self, fixture_id: str) -> Optional[float]:
-        """Return the epoch-seconds ingested_at of the freshest news_item
-        whose fixture_ids_json contains `fixture_id`, or None if no news
-        for that fixture exists.
+        """Return the epoch-seconds of the freshest news signal for a fixture.
 
         Used by the tier-loop boot-freshness skip: if the freshest news is
         newer than the tier's cadence, we skip the scout entirely (candidates
         + prices rebuild from cache, no LLM cost).
 
-        Implementation: fixture_ids_json is a JSON array of Rogue ids. We
-        use SQLite's LIKE with the quoted id to avoid pulling the whole
-        news table. Index on ingested_at keeps this cheap.
+        We check TWO tables and take MAX:
+        1. `news_items.ingested_at` — set when items are INSERTed (cache
+           miss path, i.e. genuinely-new stories).
+        2. `ingest_cache.ingested_at` — set whenever the per-fixture cache
+           row is written. Captures "we refreshed this fixture's news
+           snapshot" even if the specific items were already known.
+           Without this a fixture whose news was ingested weeks ago and
+           served from cache ever since would report stale
+           `latest_ingested_at` and never skip — the bugfix shipped post
+           PR #53 (verified in prod: zero skips until this was added).
+
+        Returns None if neither table has a record for this fixture.
         """
         if not fixture_id:
             return None
-        # JSON-encoded id is wrapped in quotes — match on that to avoid
-        # substring collisions between fixtures whose ids are prefixes.
         pattern = f'%"{fixture_id}"%'
         async with self._connect() as db:
             async with db.execute(
                 """
-                SELECT MAX(ingested_at) FROM news_items
-                WHERE fixture_ids_json LIKE ?
+                SELECT MAX(ts) FROM (
+                    SELECT MAX(ingested_at) AS ts FROM news_items
+                    WHERE fixture_ids_json LIKE ?
+                    UNION ALL
+                    SELECT MAX(ingested_at) AS ts FROM ingest_cache
+                    WHERE fixture_id = ?
+                )
                 """,
-                (pattern,),
+                (pattern, fixture_id),
             ) as cur:
                 row = await cur.fetchone()
         if not row or row[0] is None:
