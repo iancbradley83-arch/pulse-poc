@@ -30,11 +30,6 @@
   --border-subtle: rgba(255, 255, 255, 0.06);
   --border-hover: rgba(255, 255, 255, 0.18);
 
-  /* scrollbar + hover helper — referenced in reset; tokenised so light
-     theme can override without duplicating scrollbar rules. */
-  --scrollbar-thumb: rgba(255, 255, 255, 0.08);
-  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.15);
-
   /* hook colors — mirrors HOOKS map in app.js */
   --hook-injury: #ff4d6d;
   --hook-team_news: #4fb2ff;
@@ -45,59 +40,6 @@
   --hook-article: #a1a1aa;
   --hook-price_move: #c6ff3d;
   --hook-live_moment: #ff2d87;
-}
-
-/* Light theme — user toggles via header button; stored in localStorage.
-   Token-level override only — no duplicated layout rules. Hook colours
-   darken slightly so they contrast on white. */
-[data-theme="light"] {
-  --bg-app: #f5f5f8;
-  --bg-app-crown: radial-gradient(80% 50% at 50% 0%, #ecebf3 0%, #f1f1f6 60%, #f5f5f8 100%);
-  --surface-card: #ffffff;
-  --surface-card-alt: #fafbfc;
-  --odds-tile-bg: #f3f3f7;
-
-  --accent: #5b3df5;
-  --accent-soft: rgba(91, 61, 245, 0.10);
-  --win: #5fa800;
-  --danger: #d91e3c;
-  --live: #d7005c;
-
-  --text-primary: #141419;
-  --text-secondary: rgba(0, 0, 0, 0.70);
-  --text-muted: rgba(0, 0, 0, 0.52);
-  --text-dim: rgba(0, 0, 0, 0.36);
-
-  --border-subtle: rgba(0, 0, 0, 0.08);
-  --border-hover: rgba(0, 0, 0, 0.18);
-
-  --scrollbar-thumb: rgba(0, 0, 0, 0.14);
-  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.24);
-
-  /* hook colours — darker / more saturated versions for contrast on white */
-  --hook-injury: #d91e3c;
-  --hook-team_news: #2a78d0;
-  --hook-transfer: #d17d00;
-  --hook-manager_quote: #7a50e0;
-  --hook-tactical: #1b9d5d;
-  --hook-preview: #1391ad;
-  --hook-article: #60606a;
-  --hook-price_move: #5fa800;
-  --hook-live_moment: #d7005c;
-}
-
-/* Smooth the switch — don't animate layout or transforms, just colour/bg. */
-body,
-.card-hero,
-.pulse-header,
-.filter-strip .chip,
-.cta-button,
-.odds-tile,
-time.card-timestamp {
-  transition:
-    background-color 180ms ease,
-    color 180ms ease,
-    border-color 180ms ease;
 }
 
 /* ── reset ── */
@@ -123,8 +65,8 @@ button { font: inherit; cursor: pointer; }
 /* scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 99px; }
-::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.08); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.15); }
 
 .no-scroll::-webkit-scrollbar { display: none; }
 .no-scroll { scrollbar-width: none; }
@@ -252,8 +194,7 @@ time.card-timestamp {
   text-transform: uppercase;
 }
 
-.refresh-btn,
-.theme-toggle {
+.refresh-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -266,21 +207,7 @@ time.card-timestamp {
   transition: color 120ms, border-color 120ms;
 }
 
-.refresh-btn:hover,
-.theme-toggle:hover { color: var(--text-primary); border-color: var(--border-hover); }
-
-.header-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-/* Show the "opposite" icon — i.e. in dark mode, show the sun so the user
-   knows clicking switches to light; in light mode, show the moon. */
-.theme-toggle .icon-sun { display: inline-block; }
-.theme-toggle .icon-moon { display: none; }
-[data-theme="light"] .theme-toggle .icon-sun { display: none; }
-[data-theme="light"] .theme-toggle .icon-moon { display: inline-block; }
+.refresh-btn:hover { color: var(--text-primary); border-color: var(--border-hover); }
 
 /* ── filter strip ── */
 
