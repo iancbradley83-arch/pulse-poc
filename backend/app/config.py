@@ -72,6 +72,16 @@ def _parse_mix(s: str) -> dict[str, int]:
 
 PULSE_BET_TYPE_MIX = _parse_mix(os.getenv("PULSE_BET_TYPE_MIX", "singles=40,bb=30,combos=30"))
 
+# Hook-variety guard (post-mix-quota rank pass). When true, the feed ranker
+# walks the ordered list and, if two consecutive cards share hook_type
+# regardless of league, tries to swap the second with a later card whose
+# hook_type differs from both neighbours. Budget-capped at 5 swaps per
+# rank pass. Default on; flip to "false" to revert to the prior league+
+# hook demotion only, without a redeploy.
+PULSE_HOOK_VARIETY_GUARD_ENABLED = os.getenv(
+    "PULSE_HOOK_VARIETY_GUARD_ENABLED", "true",
+).lower() == "true"
+
 # ── Per-hook BB/single preference (supply policy) ──────────────────────
 # Optional JSON override of the hardcoded `HOOK_BET_TYPE_PREFERENCE` dict
 # in `engine/news_scorer.py`. Keys are HookType enum values (strings like
