@@ -1188,26 +1188,20 @@ async def _run_tier_once(tier: str) -> dict:
             logger.info("[tier:%s] expired %d prior published candidates", tier, n_expired)
         except Exception as exc:
             logger.warning("[tier:%s] expire_for_fixtures failed: %s", tier, exc)
-        # Drop existing feed cards for these fixtures (+ broadcast removal)
-        # so the re-scout's freshly-published cards don't duplicate them.
-        # Uses a set for lookup; cross-event combos have game_id pointing
-        # to a nominal primary fixture so those get swept alongside.
+        # NOTE: we intentionally do NOT pre-remove existing cards for this
+        # tier's fixtures. Pre-removing creates a visible gap (old cards
+        # vanish ~30-60s before the fresh scout's cards land — the feed
+        # looks empty mid-cycle). Instead we snapshot pre-cycle card ids
+        # per fixture, let the engine publish fresh cards on top, then
+        # sweep any pre-cycle ids that weren't re-emitted (deferred-
+        # replace, zero-gap).
         fixture_set = set(fixture_ids)
-        stale_cards = [
-            c for c in list(feed.prematch_cards)
-            if getattr(c, "game", None) and c.game.id in fixture_set
-        ]
-        for sc in stale_cards:
-            feed.remove_prematch_card(sc.id)
-            try:
-                await feed.broadcast_card_removed(sc.id)
-            except Exception as exc:
-                logger.warning("[tier:%s] stale broadcast_card_removed errored: %s", tier, exc)
-        if stale_cards:
-            logger.info(
-                "[tier:%s] removed %d stale cards for re-scout fixtures",
-                tier, len(stale_cards),
-            )
+        pre_cycle_ids_by_game: dict[str, list[str]] = {}
+        for c in list(feed.prematch_cards):
+            gid = getattr(getattr(c, "game", None), "id", None)
+            if gid in fixture_set:
+                pre_cycle_ids_by_game.setdefault(gid, []).append(c.id)
+        newly_emitted_ids: set[str] = set()
         # Spin a short-lived RogueClient for the cycle.
         client = None
         if ROGUE_CONFIG_JWT:
@@ -1221,6 +1215,7 @@ async def _run_tier_once(tier: str) -> dict:
             # is on (kill-switch PULSE_STAGGERED_PUBLISH_ENABLED).
             from app.config import PULSE_STAGGERED_PUBLISH_ENABLED
             async def _on_card(card: Card) -> None:
+                newly_emitted_ids.add(card.id)
                 if not PULSE_STAGGERED_PUBLISH_ENABLED:
                     return
                 try:
@@ -1244,6 +1239,26 @@ async def _run_tier_once(tier: str) -> dict:
         finally:
             if client is not None:
                 await client.close()
+        # Deferred sweep — now that the engine finished and any new cards
+        # have been added, drop any pre-cycle cards for these fixtures
+        # that the engine did NOT re-emit (the fixture no longer yielded
+        # a story, or the story deduped). Zero-gap: for replaced cards
+        # the new one is already visible before the old goes.
+        swept = 0
+        for gid, prev_ids in pre_cycle_ids_by_game.items():
+            for prev_id in prev_ids:
+                if prev_id in newly_emitted_ids:
+                    continue  # same id re-emitted → no-op
+                removed = feed.remove_prematch_card(prev_id)
+                if removed is None:
+                    continue
+                swept += 1
+                try:
+                    await feed.broadcast_card_removed(prev_id)
+                except Exception as exc:
+                    logger.warning("[tier:%s] sweep broadcast_card_removed errored: %s", tier, exc)
+        if swept:
+            logger.info("[tier:%s] swept %d replaced/orphaned cards", tier, swept)
         elapsed = _time.time() - t0
         logger.info("[tier:%s] cycle finish in %.1fs", tier, elapsed)
         return {"ok": True, "fixtures": len(fixture_ids), "elapsed_s": round(elapsed, 1)}
