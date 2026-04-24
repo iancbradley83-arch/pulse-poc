@@ -167,6 +167,23 @@ CREATE TABLE IF NOT EXISTS card_clicks (
 );
 CREATE INDEX IF NOT EXISTS idx_clicks_card ON card_clicks(card_id);
 CREATE INDEX IF NOT EXISTS idx_clicks_created ON card_clicks(created_at);
+
+-- U3 rewrite cache. NarrativeRewriter calls Sonnet for every published
+-- candidate every cycle; when the same fixture still has the same news
+-- items 4h later the inputs hash to the same key and the second run is
+-- free. TTL (default 24h) bounds how stale a cached rewrite can be
+-- before we pay Sonnet again. Key is a SHA256 over
+--   bet_type|hook_type|headline|legs_csv|total_odds
+-- computed by NarrativeRewriter so we don't have to reconstruct it on
+-- read. Additive table; does not touch candidates / news_items.
+CREATE TABLE IF NOT EXISTS rewrite_cache (
+    key TEXT PRIMARY KEY,
+    headline TEXT NOT NULL,
+    angle TEXT NOT NULL,
+    model TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rewrite_cache_created ON rewrite_cache(created_at);
 """
 
 
@@ -232,6 +249,17 @@ class CandidateStore:
                 )
                 await db.commit()
 
+            # rewrite_cache migration (U3 — 2026-04-23). Additive new table
+            # only; follows the storyline_items pattern (CREATE TABLE IF
+            # NOT EXISTS via executescript below is enough on first-run,
+            # but we probe table_info so a future column addition has a
+            # place to live without duplicating the whole block).
+            async with db.execute("PRAGMA table_info(rewrite_cache)") as cur:
+                _rc_cols = {row[1] for row in await cur.fetchall()}
+            # No columns to migrate yet — the table is created by the
+            # executescript(_SCHEMA) call below when missing. Probe exists
+            # so the next drift has a landing spot.
+            _ = _rc_cols
 
             await db.executescript(_SCHEMA)
             await db.commit()
@@ -617,6 +645,48 @@ class CandidateStore:
             ) as cur:
                 rows = await cur.fetchall()
         return {r["card_id"]: int(r["n"]) for r in rows}
+
+    # ── Rewrite cache (U3 — narrative rewriter memoisation) ──
+
+    async def get_rewrite_cache(
+        self, key: str, *, max_age_seconds: float,
+    ) -> Optional[dict[str, str]]:
+        """Read a cached rewrite by key. Returns None on miss or TTL expiry.
+
+        The hash is computed by NarrativeRewriter from
+        (bet_type, hook_type, headline, legs_csv, total_odds) so unchanged
+        candidates across reruns hit this path and skip the Sonnet call.
+        """
+        import time as _t
+        cutoff = _t.time() - max_age_seconds
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
+                """
+                SELECT headline, angle FROM rewrite_cache
+                WHERE key = ? AND created_at > ?
+                """,
+                (key, cutoff),
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"headline": row[0] or "", "angle": row[1] or ""}
+
+    async def save_rewrite_cache(
+        self, *, key: str, headline: str, angle: str, model: str,
+    ) -> None:
+        """Upsert a fresh rewrite into the cache. Idempotent via PK on key."""
+        import time as _t
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO rewrite_cache
+                    (key, headline, angle, model, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (key, headline, angle, model, _t.time()),
+            )
+            await db.commit()
 
     async def reaction_aggregates(self) -> list[dict[str, Any]]:
         """Aggregate reactions by (fixture, hook_type, bet_type, storyline).
