@@ -133,6 +133,25 @@ time.card-timestamp {
 .card-hero.card-suspended { opacity: 0.55; }
 .card-hero.card-suspended .cta-button { pointer-events: none; opacity: 0.6; }
 
+/* History mode — kickoff is in the past. Card stays in the feed (engine is
+   paused; this is the user's recent feed-as-history) but it's clearly
+   read-only: greyed, slight desaturation, CTA neutralised. Reactions still
+   work — the user can rate the call after the fact. */
+.card-hero.card-hero--expired {
+  opacity: 0.6;
+  filter: grayscale(0.4);
+}
+.card-hero.card-hero--expired .cta-button {
+  pointer-events: none;
+  cursor: default;
+  opacity: 0.55;
+  background: var(--surface-1, #1a1a22);
+  color: var(--text-dim, #888);
+}
+.card-hero.card-hero--expired .cta-button .cta-odds {
+  display: none;
+}
+
 /* ── app shell ── */
 
 #app {
