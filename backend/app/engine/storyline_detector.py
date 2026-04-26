@@ -476,9 +476,85 @@ def _submit_storyline_tool() -> dict[str, Any]:
 
 # Simple process-wide cache so a team's standings aren't re-looked-up on
 # every cycle. Key: (lowered_team_name, yyyy-mm-dd). Value:
-# (timestamp_seconds, standings_dict). 12h TTL per spec.
+# (timestamp_seconds, standings_dict). TTL configurable via
+# PULSE_STANDINGS_CACHE_TTL_SECONDS (default 12h).
 _STANDINGS_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
-_STANDINGS_CACHE_TTL_SECONDS = 12 * 3600
+
+
+def _standings_cache_ttl() -> float:
+    try:
+        from app.config import PULSE_STANDINGS_CACHE_TTL_SECONDS
+        return float(PULSE_STANDINGS_CACHE_TTL_SECONDS)
+    except Exception:
+        return 12 * 3600.0
+
+
+# Per-cycle hit/miss counters. Reset by `reset_standings_cache_counters`
+# at tier-cycle start; read by main.py at end-of-cycle to surface hit
+# rate alongside the cost log.
+_STANDINGS_CACHE_HITS = 0
+_STANDINGS_CACHE_MISSES = 0
+
+
+def reset_standings_cache_counters() -> None:
+    global _STANDINGS_CACHE_HITS, _STANDINGS_CACHE_MISSES
+    _STANDINGS_CACHE_HITS = 0
+    _STANDINGS_CACHE_MISSES = 0
+
+
+def get_standings_cache_counters() -> tuple[int, int]:
+    return _STANDINGS_CACHE_HITS, _STANDINGS_CACHE_MISSES
+
+
+# Per-(storyline_type, league) cooldown. Detectors that finished a scout
+# in the last cooldown window reuse the previously-detected participants
+# instead of paying for another LLM round-trip. Keyed by
+# (storyline_type.value, league_name_lower) so within-league and
+# cross-league passes are independent.
+_STORYLINE_LAST_SCOUT_AT: dict[tuple[str, str], float] = {}
+_STORYLINE_LAST_RESULT: dict[tuple[str, str], "Optional[StorylineItem]"] = {}
+
+
+def _storyline_cooldown_key(
+    storyline_type: "StorylineType", scope_label: str,
+) -> tuple[str, str]:
+    return (storyline_type.value, (scope_label or "").lower())
+
+
+def _storyline_cooldown_seconds(storyline_type: "StorylineType") -> float:
+    """Per-type override > global default. Env shape:
+    `PULSE_STORYLINE_<TYPE>_COOLDOWN_SECONDS=14400`.
+    """
+    import os as _os
+    per_type = _os.getenv(
+        f"PULSE_STORYLINE_{storyline_type.value.upper()}_COOLDOWN_SECONDS",
+    )
+    if per_type:
+        try:
+            return float(per_type)
+        except ValueError:
+            pass
+    try:
+        from app.config import PULSE_STORYLINE_COOLDOWN_SECONDS
+        return float(PULSE_STORYLINE_COOLDOWN_SECONDS)
+    except Exception:
+        return 6 * 3600.0
+
+
+# Per-cycle hit/miss counters for storyline cooldowns. Same shape as
+# the standings cache counters above.
+_STORYLINE_COOLDOWN_HITS = 0
+_STORYLINE_COOLDOWN_MISSES = 0
+
+
+def reset_storyline_cooldown_counters() -> None:
+    global _STORYLINE_COOLDOWN_HITS, _STORYLINE_COOLDOWN_MISSES
+    _STORYLINE_COOLDOWN_HITS = 0
+    _STORYLINE_COOLDOWN_MISSES = 0
+
+
+def get_storyline_cooldown_counters() -> tuple[int, int]:
+    return _STORYLINE_COOLDOWN_HITS, _STORYLINE_COOLDOWN_MISSES
 
 
 def _cache_key(team: str) -> tuple[str, str]:
@@ -487,14 +563,18 @@ def _cache_key(team: str) -> tuple[str, str]:
 
 
 def _cache_get(team: str) -> Optional[dict]:
+    global _STANDINGS_CACHE_HITS, _STANDINGS_CACHE_MISSES
     key = _cache_key(team)
     hit = _STANDINGS_CACHE.get(key)
     if not hit:
+        _STANDINGS_CACHE_MISSES += 1
         return None
     ts, payload = hit
-    if (time.time() - ts) > _STANDINGS_CACHE_TTL_SECONDS:
+    if (time.time() - ts) > _standings_cache_ttl():
         _STANDINGS_CACHE.pop(key, None)
+        _STANDINGS_CACHE_MISSES += 1
         return None
+    _STANDINGS_CACHE_HITS += 1
     return payload
 
 
@@ -832,7 +912,36 @@ class StorylineDetector:
         *,
         scope_label: str,
     ) -> Optional[StorylineItem]:
-        """Run one scout + verify pass over the given fixture subset."""
+        """Run one scout + verify pass over the given fixture subset.
+
+        Cooldown: if the same (storyline_type, scope_label) was scouted
+        within `PULSE_STORYLINE_COOLDOWN_SECONDS` (per-type override
+        respected), reuse the cached participants and skip the LLM call.
+        Standings only change once a day; scouting them every 30-60min
+        burns Haiku+web_search for zero new info. See feedback memory
+        on cost-leak fix (2026-04-26).
+        """
+        global _STORYLINE_COOLDOWN_HITS, _STORYLINE_COOLDOWN_MISSES
+        cooldown_key = _storyline_cooldown_key(storyline_type, scope_label)
+        cooldown_s = _storyline_cooldown_seconds(storyline_type)
+        last_at = _STORYLINE_LAST_SCOUT_AT.get(cooldown_key)
+        if last_at is not None and (time.time() - last_at) < cooldown_s:
+            _STORYLINE_COOLDOWN_HITS += 1
+            cached_item = _STORYLINE_LAST_RESULT.get(cooldown_key)
+            age_min = (time.time() - last_at) / 60.0
+            logger.info(
+                "[storylines] type=%s scope=%s cache_hit (cooldown %.0fm "
+                "remaining, last_scout %.0fm ago)",
+                storyline_type.value, scope_label,
+                (cooldown_s - (time.time() - last_at)) / 60.0,
+                age_min,
+            )
+            return cached_item
+        _STORYLINE_COOLDOWN_MISSES += 1
+        logger.info(
+            "[storylines] type=%s scope=%s scouted (cooldown expired or first run)",
+            storyline_type.value, scope_label,
+        )
         fixture_block = "\n".join(
             f"  - {g.home_team.name} vs {g.away_team.name} ({g.broadcast or 'league?'}, kickoff {g.start_time or '?'})"
             for g in fixtures[:25]
@@ -860,6 +969,11 @@ class StorylineDetector:
             + hint_rendered
         )
 
+        try:
+            from app.main import _bump_cycle_counter
+            _bump_cycle_counter("storyline_sonnet_websearch")
+        except Exception:
+            pass
         try:
             resp = await self._client.messages.create(
                 model=self._model,
@@ -928,6 +1042,10 @@ class StorylineDetector:
                 "StorylineDetector: 0 participants returned (type=%s, scope=%s)",
                 storyline_type.value, scope_label,
             )
+            # Record cooldown miss-result so we don't re-scout an empty
+            # outcome immediately next cycle.
+            _STORYLINE_LAST_SCOUT_AT[cooldown_key] = time.time()
+            _STORYLINE_LAST_RESULT[cooldown_key] = None
             return None
 
         # Standings verification — only for RELEGATION and EUROPE_CHASE,
@@ -960,6 +1078,8 @@ class StorylineDetector:
                 len(participants), self._min_participants,
                 storyline_type.value, scope_label,
             )
+            _STORYLINE_LAST_SCOUT_AT[cooldown_key] = time.time()
+            _STORYLINE_LAST_RESULT[cooldown_key] = None
             return None
 
         item = StorylineItem(
@@ -972,6 +1092,8 @@ class StorylineDetector:
             item.storyline_type.value, len(participants), scope_label,
             [p.player_name or p.team_name for p in participants],
         )
+        _STORYLINE_LAST_SCOUT_AT[cooldown_key] = time.time()
+        _STORYLINE_LAST_RESULT[cooldown_key] = item
         return item
 
     # ── Standings verification ─────────────────────────────────────────
@@ -1161,6 +1283,11 @@ class StorylineDetector:
             "answer for a given team, set confident=false for that row.\n\n"
             f"Teams:\n{team_list}\n"
         )
+        try:
+            from app.main import _bump_cycle_counter
+            _bump_cycle_counter("standings_haiku_websearch")
+        except Exception:
+            pass
         try:
             resp = await self._client.messages.create(
                 model=self._verify_model,
