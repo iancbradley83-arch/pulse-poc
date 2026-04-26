@@ -425,6 +425,43 @@ PULSE_COST_SONNET_PER_CALL = float(
     os.getenv("PULSE_COST_SONNET_PER_CALL", "0.05")
 )
 
+# ── Daily LLM-spend tripwire (cost-aware redesign, 2026-04-26) ─────────
+# Hard kill at threshold. Engine self-pauses when today_total + projected
+# would exceed budget × 0.99. Knobs are env-only so ops can flip on
+# Railway without a redeploy.
+#
+# The granular per-million-token rates live alongside the daily budget
+# so a CostTracker built without explicit overrides reads them from os
+# env at import time (see app/services/cost_tracker.py).
+PULSE_DAILY_LLM_BUDGET_USD = float(
+    os.getenv("PULSE_DAILY_LLM_BUDGET_USD", "3")
+)
+PULSE_DAILY_WEBSEARCH_BUDGET = int(
+    os.getenv("PULSE_DAILY_WEBSEARCH_BUDGET", "100")
+)
+
+# Anthropic Haiku 4.5 published rates (as of 2026-04). Per million
+# tokens. Cache writes split by TTL: 5m default, 1h variant for the
+# storyline narrative path that fires less than once per hour.
+PULSE_COST_HAIKU_INPUT_PER_MTOKEN_USD = float(
+    os.getenv("PULSE_COST_HAIKU_INPUT_PER_MTOKEN_USD", "1.0")
+)
+PULSE_COST_HAIKU_OUTPUT_PER_MTOKEN_USD = float(
+    os.getenv("PULSE_COST_HAIKU_OUTPUT_PER_MTOKEN_USD", "5.0")
+)
+PULSE_COST_HAIKU_CACHE_READ_PER_MTOKEN_USD = float(
+    os.getenv("PULSE_COST_HAIKU_CACHE_READ_PER_MTOKEN_USD", "0.10")
+)
+PULSE_COST_HAIKU_CACHE_WRITE_PER_MTOKEN_USD = float(
+    os.getenv("PULSE_COST_HAIKU_CACHE_WRITE_PER_MTOKEN_USD", "1.25")
+)
+PULSE_COST_HAIKU_CACHE_WRITE_1H_PER_MTOKEN_USD = float(
+    os.getenv("PULSE_COST_HAIKU_CACHE_WRITE_1H_PER_MTOKEN_USD", "2.0")
+)
+PULSE_COST_WEBSEARCH_PER_CALL_USD = float(
+    os.getenv("PULSE_COST_WEBSEARCH_PER_CALL_USD", "0.025")
+)
+
 # Hook-diversity release buffer (social-feed stream ordering rule).
 # Candidates that pass gates are buffered for up to this many seconds
 # instead of broadcasting immediately. A single release scheduler wakes

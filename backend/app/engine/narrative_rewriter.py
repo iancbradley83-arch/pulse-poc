@@ -6,15 +6,17 @@ Two-step pipeline:
                           — headline/summary/hook_type/mentions. Prioritises
                           speed + recall, not voice.
 
-  Copywriter (here):      Sonnet rewrites the raw scout output into card-ready
+  Copywriter (here):      Haiku rewrites the raw scout output into card-ready
                           copy with a strong journalist voice: punchy headline,
                           one-sentence betting angle, active verbs, no
                           wire-service tics. Runs on published candidates only
                           so below-threshold candidates don't burn tokens.
 
-The rewriter's system prompt is prompt-cached; a typical run rewrites ~50
-candidates and most requests hit the cache. On failure we fall back to the
-scout's raw headline/summary so the pipeline never blocks.
+The rewriter's system prompt is prompt-cached (`cache_control: ephemeral`).
+A typical run rewrites ~50 candidates and most requests hit the cache. On
+failure we fall back to the scout's raw headline/summary so the pipeline
+never blocks. Cost-aware redesign (2026-04-26) moved this from Sonnet to
+Haiku — voice quality is good enough for the POC at 1/15th the price.
 """
 from __future__ import annotations
 
@@ -40,20 +42,30 @@ def _cache_key(
     hook_type: str,
     headline: str,
     legs: Optional[list[CardLeg]],
-    total_odds: Optional[float],
+    news_mentions: Optional[list[str]] = None,
 ) -> str:
-    """SHA256 over the canonicalised inputs that feed the Sonnet prompt.
+    """SHA256 over the canonicalised inputs that feed the rewriter prompt.
 
-    legs_csv is the sorted selection_ids pipe-joined so leg order doesn't
-    affect the hash. total_odds is rounded to 2dp because tiny price jitter
-    shouldn't bust the cache — the prompt already ignores small moves.
+    Keyed on the THESIS (bet_type, hook_type, scout headline, leg market
+    identities, news player mentions), NOT the price. Total odds was the
+    cache-busting bug pre-redesign — SSE pricing ticks change total_odds on
+    every leg-odds update so the key never matched across cycles. The
+    rewriter prompt already bans odds in copy, so the price genuinely is
+    irrelevant to what the model produces.
+
+    `legs_csv` is sorted selection_ids pipe-joined so leg order doesn't
+    affect the hash. `news_mentions` is sorted-lower-cased to harden the
+    key against trivial casing churn.
     """
     if legs:
         legs_csv = "|".join(sorted(str(leg.selection_id) for leg in legs))
     else:
         legs_csv = ""
-    odds_str = f"{total_odds:.2f}" if total_odds is not None else ""
-    raw = f"{bet_type}|{hook_type}|{headline}|{legs_csv}|{odds_str}"
+    if news_mentions:
+        mentions_csv = "|".join(sorted(m.strip().lower() for m in news_mentions if m))
+    else:
+        mentions_csv = ""
+    raw = f"{bet_type}|{hook_type}|{headline}|{legs_csv}|{mentions_csv}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -61,6 +73,13 @@ VOICE_BRIEF = """You are the senior copywriter for Pulse, a news-driven sports
 betting feed. You rewrite scout-gathered news into punchy, voice-forward card
 copy that feels like a sharp sports journalist wrote it — not a wire service,
 not a corporate sportsbook, not a tabloid.
+
+HAIKU VOICE GUIDANCE (READ FIRST)
+  Be direct. Short, punchy lines. Headlines are 1 sentence, 6-10 words.
+  Angles are 1 sentence, max 25 words / 200 characters. Active voice
+  always. Subject-verb-object. Pick a real fact and lean on it; do not
+  hedge. If you are tempted to qualify ("perhaps", "may", "could"),
+  delete the qualifier and commit to the line.
 
 PULSE IS AN ANGLE, NOT A PICK
 Pulse is NOT a tipster service. Each card frames a market as the natural way
@@ -242,31 +261,39 @@ REWRITE_TOOL: dict[str, Any] = {
 class NarrativeRewriter:
     """Rewrites scouted news into journalist-voice card copy.
 
-    Uses Sonnet by default (cost per rewrite ~$0.002, prose quality is the
-    bottleneck). Haiku works in a pinch — override `model` at construction.
+    Defaults to Haiku 4.5 with prompt caching (cost-aware redesign,
+    2026-04-26). Sonnet is OFF for the POC; the system prompt is heavy
+    enough (~2k tokens) for Anthropic prompt caching to absorb the input
+    cost across the cycle.
 
-    When `store` and `cache_enabled` are both set, rewrites are memoised by
-    SHA256(bet_type|hook_type|headline|legs_csv|total_odds) for
+    When `store` and `cache_enabled` are both set, rewrites are memoised
+    by SHA256(bet_type|hook_type|headline|legs_csv|mentions_csv) for
     `cache_ttl_seconds` (default 24h). Identical candidates across reruns
-    then skip the Sonnet call entirely (U3, 2026-04-23). `cache_hits` /
-    `cache_misses` are per-instance counters the orchestrator reads at
-    end-of-cycle for the summary log line.
+    skip the LLM call entirely. `cache_hits` / `cache_misses` are
+    per-instance counters the orchestrator reads at end-of-cycle for the
+    summary log line.
+
+    Optional `cost_tracker` short-circuits the LLM call when the daily
+    LLM budget is exhausted; on short-circuit `rewrite()` returns None
+    and the caller falls back to the scout's raw copy.
     """
 
     def __init__(
         self,
         client: AsyncAnthropic,
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-haiku-4-5",
         *,
         store: "Optional[CandidateStore]" = None,
         cache_enabled: bool = True,
         cache_ttl_seconds: float = 86400.0,
+        cost_tracker: "Optional[Any]" = None,
     ):
         self._client = client
         self._model = model
         self._store = store
         self._cache_enabled = bool(cache_enabled and store is not None)
         self._cache_ttl_seconds = float(cache_ttl_seconds)
+        self._cost_tracker = cost_tracker
         self.cache_hits = 0
         self.cache_misses = 0
 
@@ -285,15 +312,24 @@ class NarrativeRewriter:
         legs: Optional[list[CardLeg]] = None,
         total_odds: Optional[float] = None,
     ) -> Optional[dict[str, str]]:
-        # ── Cache lookup (U3). Hash the same inputs that determine the
-        # Sonnet output; on hit, return the cached pair without touching
-        # the API. Keep the hash computation cheap — no network calls.
+        # ── Cache lookup. Hash the same THESIS inputs that determine the
+        # rewriter output; on hit, return the cached pair without touching
+        # the API. total_odds is NOT in the key (cost-aware redesign):
+        # SSE pricing ticks bumped it on every cycle, the cache never
+        # matched, and Sonnet ran every time. The thesis is what matters.
+        mentions: list[str] = []
+        try:
+            for m in (news.mentions or []):
+                if isinstance(m, str) and m.strip():
+                    mentions.append(m)
+        except Exception:
+            mentions = []
         cache_key = _cache_key(
             bet_type=candidate.bet_type.value,
             hook_type=candidate.hook_type.value,
             headline=news.headline or "",
             legs=legs,
-            total_odds=total_odds,
+            news_mentions=mentions,
         )
         if self._cache_enabled and self._store is not None:
             try:
@@ -361,10 +397,28 @@ class NarrativeRewriter:
             f"{legs_block}"
         )
 
+        # Cost-tripwire short-circuit. Pre-call estimate uses the
+        # configured Haiku rates with conservative input-token estimate
+        # (system prompt is cached, but assume worst-case cache miss).
+        if self._cost_tracker is not None:
+            try:
+                projected = self._cost_tracker.estimate_haiku_call(
+                    input_tokens=2200, max_output_tokens=400, web_search=False,
+                )
+                if not await self._cost_tracker.can_spend(projected):
+                    logger.info(
+                        "[cost] rewrite skipped — daily LLM budget exhausted"
+                    )
+                    return None
+            except Exception as exc:
+                logger.warning(
+                    "NarrativeRewriter cost-tracker check failed: %s", exc,
+                )
+
         try:
             resp = await self._client.messages.create(
                 model=self._model,
-                max_tokens=400,
+                max_tokens=300,
                 system=[{
                     "type": "text",
                     "text": VOICE_BRIEF,
@@ -377,6 +431,20 @@ class NarrativeRewriter:
         except Exception as exc:
             logger.warning("NarrativeRewriter call failed: %s", exc)
             return None
+
+        # Post-call cost accounting based on actual usage.
+        if self._cost_tracker is not None:
+            try:
+                actual = self._cost_tracker.cost_from_usage(
+                    getattr(resp, "usage", None), web_search=False,
+                )
+                await self._cost_tracker.record_call(
+                    model=self._model, kind="rewrite", cost_usd=actual,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "NarrativeRewriter cost-tracker record failed: %s", exc,
+                )
 
         for block in resp.content:
             if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "submit_rewrite":

@@ -496,6 +496,26 @@ from typing import Optional as _Optional
 candidate_store = CandidateStore(PULSE_DB_PATH)
 candidate_engine: _Optional[CandidateEngine] = None  # initialised in startup
 
+# Daily-cost tripwire (cost-aware redesign, 2026-04-26). Tracks
+# accumulated USD spend per UTC day and short-circuits LLM calls when
+# the configured budget is exhausted. Constructed lazily on first
+# `_run_candidate_engine` invocation so tests + mock-mode don't pay the
+# import cost.
+from app.services.cost_tracker import CostTracker as _CostTracker
+_cost_tracker: _Optional[_CostTracker] = None
+
+
+def _get_cost_tracker() -> _CostTracker:
+    """Lazily build (and cache) the module-level CostTracker.
+
+    Single instance per process; holds the SQLite-backed daily counter
+    and the env-knobbed pricing coefficients.
+    """
+    global _cost_tracker
+    if _cost_tracker is None:
+        _cost_tracker = _CostTracker(store=candidate_store)
+    return _cost_tracker
+
 # ── Mount routes ──
 router = create_routes(catalog, feed, simulator)
 app.include_router(router)
@@ -861,6 +881,23 @@ async def admin_rerun():
 
 @app.get("/admin/rerun/status")
 async def admin_rerun_status():
+    # Pull the SQLite-backed cost-tripwire snapshot. Cheap (one-row read);
+    # safe when the engine has never run (returns zeros). Surfaced here
+    # so the leak is visible without log scraping. The legacy
+    # `cost_telemetry` block stays for backwards compat with the cycle-
+    # log frontend; `cost_today` is the new authoritative source.
+    try:
+        cost_today = await _get_cost_tracker().snapshot()
+    except Exception as exc:
+        logger.warning("[cost] snapshot for /admin/rerun/status failed: %s", exc)
+        cost_today = {
+            "day_utc": _today_utc(),
+            "total_usd": 0.0,
+            "budget_usd": 0.0,
+            "remaining_usd": 0.0,
+            "calls": 0,
+            "percent_used": 0.0,
+        }
     return {
         "in_flight": _ondemand_rerun_inflight,
         "started_at": _ondemand_rerun_started_at if _ondemand_rerun_inflight else None,
@@ -869,8 +906,10 @@ async def admin_rerun_status():
             if _ondemand_rerun_inflight else None
         ),
         "last_result": _ondemand_rerun_last_result or None,
-        # Daily rolling cost telemetry (UTC bucket, resets at day-boundary).
-        # Surfaced here so a leak is visible without log scraping.
+        # New canonical cost block. Fed by the SQLite-persisted CostTracker
+        # so two engine processes can't both blow past budget.
+        "cost_today": cost_today,
+        # Legacy cycle-only block. Kept for parity with the previous shape.
         "cost_telemetry": {
             "day_utc": _daily_cost_day or _today_utc(),
             "daily_total_usd": round(_daily_cost_usd, 4),
@@ -878,6 +917,70 @@ async def admin_rerun_status():
             "last_cycle_breakdown_usd": _cycle_cost_breakdown(),
         },
     }
+
+
+@app.get("/admin/cost", response_class=HTMLResponse)
+async def admin_cost_page():
+    """7-day cost-history page. Read-only, no auth (POC convention)."""
+    try:
+        history = await candidate_store.get_daily_cost_history(days=7)
+    except Exception as exc:
+        logger.warning("[cost] /admin/cost history read failed: %s", exc)
+        history = []
+    try:
+        snap = await _get_cost_tracker().snapshot()
+    except Exception:
+        snap = {"day_utc": _today_utc(), "total_usd": 0.0, "budget_usd": 0.0,
+                "remaining_usd": 0.0, "calls": 0, "percent_used": 0.0}
+
+    rows_html = []
+    for row in history:
+        rows_html.append(
+            f"<tr><td>{row['date']}</td>"
+            f"<td>${row['accumulated_usd']:.4f}</td>"
+            f"<td>{row['calls']}</td></tr>"
+        )
+    if not rows_html:
+        rows_html.append("<tr><td colspan='3'><em>no data yet</em></td></tr>")
+
+    html = f"""
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>Pulse — daily cost</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif;
+         max-width: 720px; margin: 32px auto; padding: 0 16px; color: #222; }}
+  h1 {{ margin-bottom: 0.2em; }}
+  .sub {{ color: #666; margin-top: 0; }}
+  table {{ border-collapse: collapse; width: 100%; margin-top: 16px; }}
+  th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; }}
+  th {{ background: #fafafa; }}
+  .summary {{ background: #f5f7fa; padding: 16px; border-radius: 8px; margin-top: 16px; }}
+  .summary div {{ margin: 4px 0; }}
+  .pct {{ font-weight: 600; }}
+</style>
+</head>
+<body>
+<h1>Pulse cost — last 7 days</h1>
+<p class="sub">Daily LLM spend tripwire. Engine self-pauses at the budget ceiling.</p>
+<div class="summary">
+  <div><strong>Today (UTC):</strong> {snap['day_utc']}</div>
+  <div><strong>Spent today:</strong> ${snap['total_usd']:.4f}</div>
+  <div><strong>Daily budget:</strong> ${snap['budget_usd']:.2f}</div>
+  <div><strong>Remaining:</strong> ${snap['remaining_usd']:.4f}</div>
+  <div><strong>Calls today:</strong> {snap['calls']}</div>
+  <div class="pct">{snap['percent_used']:.1f}% of budget used</div>
+</div>
+<table>
+  <thead><tr><th>UTC date</th><th>Accumulated USD</th><th>Calls</th></tr></thead>
+  <tbody>
+    {''.join(rows_html)}
+  </tbody>
+</table>
+</body></html>
+"""
+    return HTMLResponse(content=html)
 
 
 async def _load_rogue_prematch(
@@ -1755,12 +1858,14 @@ async def _run_candidate_engine(
             from app.engine.narrative_rewriter import NarrativeRewriter
 
             anth = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            _cost_tracker = _get_cost_tracker()
             ingester = NewsIngester(
                 client=anth,
                 store=candidate_store,
                 model=PULSE_NEWS_MODEL,
                 max_searches=PULSE_NEWS_MAX_SEARCHES,
                 cache_ttl_seconds=PULSE_NEWS_CACHE_TTL_HOURS * 3600,
+                cost_tracker=_cost_tracker,
             )
             # Copywriter pass — rewrites scout output into journalist voice
             # before the card hits the feed. Sonnet by default; override via env.
@@ -1773,16 +1878,17 @@ async def _run_candidate_engine(
                 _cache_ttl = 86400.0
             rewriter = NarrativeRewriter(
                 anth,
-                model=os.getenv("PULSE_REWRITER_MODEL", "claude-sonnet-4-6"),
+                model=os.getenv("PULSE_REWRITER_MODEL", "claude-haiku-4-5"),
                 store=candidate_store,
                 cache_enabled=_cache_enabled,
                 cache_ttl_seconds=_cache_ttl,
+                cost_tracker=_cost_tracker,
             )
             rewriter.reset_cache_counters()
             logger.info(
                 "[PULSE] Candidate engine: scout=%s, rewriter=%s, rewrite_cache=%s (ttl=%.0fs)",
                 PULSE_NEWS_MODEL,
-                os.getenv("PULSE_REWRITER_MODEL", "claude-sonnet-4-6"),
+                os.getenv("PULSE_REWRITER_MODEL", "claude-haiku-4-5"),
                 "on" if _cache_enabled else "off",
                 _cache_ttl,
             )
@@ -1857,13 +1963,19 @@ async def _run_candidate_engine(
                 StorylineType as _SType,
             )
             _anth = _AsyncAnth(api_key=ANTHROPIC_API_KEY)
+            _cost_tracker_storyline = _get_cost_tracker()
             detector = StorylineDetector(
                 _anth,
-                model=os.getenv("PULSE_STORYLINE_MODEL", "claude-sonnet-4-6"),
+                model=os.getenv("PULSE_STORYLINE_MODEL", "claude-haiku-4-5"),
                 min_participants=PULSE_STORYLINE_MIN_PARTICIPANTS,
+                cost_tracker=_cost_tracker_storyline,
             )
             xbuilder = CrossEventBuilder(catalog)
-            author = CombinedNarrativeAuthor(_anth, model=os.getenv("PULSE_STORYLINE_MODEL", "claude-sonnet-4-6"))
+            author = CombinedNarrativeAuthor(
+                _anth,
+                model=os.getenv("PULSE_STORYLINE_MODEL", "claude-haiku-4-5"),
+                cost_tracker=_cost_tracker_storyline,
+            )
 
             try:
                 story_cap = int(os.getenv("PULSE_STORYLINE_COMBOS_MAX", "5"))

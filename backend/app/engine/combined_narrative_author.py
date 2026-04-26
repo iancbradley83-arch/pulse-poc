@@ -18,7 +18,9 @@ form_last_5, league}. The angle MUST reference at least one standings
 number per participant when this block is present. NEVER invent numbers
 the scout didn't supply.
 
-Sonnet by default — volume is low (1-3 cross-event combos per cycle).
+Haiku 4.5 with prompt caching (cost-aware redesign, 2026-04-26). Volume
+is low (1-3 cross-event combos per cycle) and the system prompt sits at
+~2.2k tokens, well above Anthropic's caching minimum.
 """
 from __future__ import annotations
 
@@ -44,6 +46,12 @@ PLAY a real-world story — never as a prediction or a pick.
 
 PULSE IS AN ANGLE, NOT A PICK. Audience is engaged-casual: knows the
 league, follows the news, places a few bets a weekend.
+
+HAIKU VOICE GUIDANCE (READ FIRST)
+  Be direct and short. Headline is one short sentence (40-60 chars
+  ideally; 70 max). Angle is one sentence (140-180 chars ideally; 200
+  max). Active voice. Subject-verb-object. Pick a real fact and lean
+  on it; do not hedge. If you reach for a qualifier, drop it.
 
 YOU ARE WRITING A CROSS-EVENT STORYLINE CARD
 -------------------------------------------
@@ -261,11 +269,23 @@ def _find_banned(text: str) -> list[str]:
 
 
 class CombinedNarrativeAuthor:
-    """Author fresh cross-event copy from a storyline + its resolved legs."""
+    """Author fresh cross-event copy from a storyline + its resolved legs.
 
-    def __init__(self, client: AsyncAnthropic, model: str = "claude-sonnet-4-6"):
+    Defaults to Haiku 4.5 with prompt caching (cost-aware redesign,
+    2026-04-26). Optional `cost_tracker` short-circuits the LLM call
+    when the daily LLM budget is exhausted.
+    """
+
+    def __init__(
+        self,
+        client: AsyncAnthropic,
+        model: str = "claude-haiku-4-5",
+        *,
+        cost_tracker: Optional[Any] = None,
+    ):
         self._client = client
         self._model = model
+        self._cost_tracker = cost_tracker
 
     async def author(
         self,
@@ -297,14 +317,34 @@ class CombinedNarrativeAuthor:
             f"angle <= {_ANGLE_MAX} chars. Count before submitting.\n"
         )
 
+        # Cost-tripwire short-circuit. Storyline narrative authoring runs
+        # less than once per hour per type — use the 1h cache TTL so the
+        # cache survives between tier loops.
+        if self._cost_tracker is not None:
+            try:
+                projected = self._cost_tracker.estimate_haiku_call(
+                    input_tokens=2400, max_output_tokens=300, web_search=False,
+                )
+                if not await self._cost_tracker.can_spend(projected):
+                    logger.info(
+                        "[cost] storyline narrative skipped — daily LLM "
+                        "budget exhausted"
+                    )
+                    return None
+            except Exception as exc:
+                logger.warning(
+                    "CombinedNarrativeAuthor cost-tracker check failed: %s",
+                    exc,
+                )
+
         try:
             resp = await self._client.messages.create(
                 model=self._model,
-                max_tokens=400,
+                max_tokens=300,
                 system=[{
                     "type": "text",
                     "text": _VOICE,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
                 }],
                 tools=[_TOOL],
                 tool_choice={"type": "tool", "name": "submit_storyline_copy"},
@@ -313,6 +353,21 @@ class CombinedNarrativeAuthor:
         except Exception as exc:
             logger.warning("CombinedNarrativeAuthor: LLM call failed: %s", exc)
             return None
+
+        if self._cost_tracker is not None:
+            try:
+                actual = self._cost_tracker.cost_from_usage(
+                    getattr(resp, "usage", None), web_search=False,
+                )
+                await self._cost_tracker.record_call(
+                    model=self._model, kind="storyline_narrative",
+                    cost_usd=actual,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "CombinedNarrativeAuthor cost-tracker record failed: %s",
+                    exc,
+                )
 
         for block in resp.content:
             if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "submit_storyline_copy":
