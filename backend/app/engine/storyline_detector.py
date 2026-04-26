@@ -643,7 +643,7 @@ class StorylineDetector:
         self,
         client: AsyncAnthropic,
         *,
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-haiku-4-5",
         max_searches: int = 6,
         min_participants: int = 2,
         verify_enabled: Optional[bool] = None,
@@ -653,9 +653,11 @@ class StorylineDetector:
         europe_chase_min_position: Optional[int] = None,
         europe_chase_max_position: Optional[int] = None,
         europe_chase_max_points_from_spot: Optional[int] = None,
+        cost_tracker: Optional[Any] = None,
     ):
         self._client = client
         self._model = model
+        self._cost_tracker = cost_tracker
         self._max_searches = max_searches
         # Minimum participants required for a storyline to be considered
         # viable. 2 is the supply-friendly floor — a Golden Boot race with
@@ -974,6 +976,27 @@ class StorylineDetector:
             _bump_cycle_counter("storyline_sonnet_websearch")
         except Exception:
             pass
+        # Cost-tripwire short-circuit. Storyline scout uses web_search,
+        # so the projected cost includes the websearch addon. If the
+        # tracker says we're past budget, return cached/empty.
+        if self._cost_tracker is not None:
+            try:
+                projected = self._cost_tracker.estimate_haiku_call(
+                    input_tokens=900, max_output_tokens=2048,
+                    web_search=True,
+                    web_search_calls=self._max_searches,
+                )
+                if not await self._cost_tracker.can_spend(projected):
+                    logger.info(
+                        "[cost] storyline scout skipped — daily LLM "
+                        "budget exhausted (type=%s)",
+                        storyline_type.value,
+                    )
+                    return None
+            except Exception as exc:
+                logger.warning(
+                    "StorylineDetector cost-tracker check failed: %s", exc,
+                )
         try:
             resp = await self._client.messages.create(
                 model=self._model,
@@ -995,6 +1018,22 @@ class StorylineDetector:
                 storyline_type.value, scope_label, exc,
             )
             return None
+
+        if self._cost_tracker is not None:
+            try:
+                actual = self._cost_tracker.cost_from_usage(
+                    getattr(resp, "usage", None),
+                    web_search=True,
+                    web_search_calls=self._max_searches,
+                )
+                await self._cost_tracker.record_call(
+                    model=self._model, kind="storyline_scout",
+                    cost_usd=actual,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "StorylineDetector cost-tracker record failed: %s", exc,
+                )
 
         participants: list[StorylineParticipant] = []
         headline_hint = ""
@@ -1288,6 +1327,26 @@ class StorylineDetector:
             _bump_cycle_counter("standings_haiku_websearch")
         except Exception:
             pass
+        # Cost-tripwire short-circuit. The verify call hits web_search per
+        # team — bound it by the configured per-call budget.
+        ws_calls = max(self._max_searches, len(teams) + 2)
+        if self._cost_tracker is not None:
+            try:
+                projected = self._cost_tracker.estimate_haiku_call(
+                    input_tokens=600, max_output_tokens=1500,
+                    web_search=True, web_search_calls=ws_calls,
+                )
+                if not await self._cost_tracker.can_spend(projected):
+                    logger.info(
+                        "[cost] standings verify skipped — daily LLM "
+                        "budget exhausted"
+                    )
+                    return {}
+            except Exception as exc:
+                logger.warning(
+                    "StorylineDetector.verify cost-tracker check failed: %s",
+                    exc,
+                )
         try:
             resp = await self._client.messages.create(
                 model=self._verify_model,
@@ -1297,7 +1356,7 @@ class StorylineDetector:
                     {
                         "type": "web_search_20250305",
                         "name": "web_search",
-                        "max_uses": max(self._max_searches, len(teams) + 2),
+                        "max_uses": ws_calls,
                     },
                     self._standings_tool,
                 ],
@@ -1309,6 +1368,22 @@ class StorylineDetector:
                 storyline_type.value, exc,
             )
             return {}
+
+        if self._cost_tracker is not None:
+            try:
+                actual = self._cost_tracker.cost_from_usage(
+                    getattr(resp, "usage", None),
+                    web_search=True, web_search_calls=ws_calls,
+                )
+                await self._cost_tracker.record_call(
+                    model=self._verify_model, kind="standings_verify",
+                    cost_usd=actual,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "StorylineDetector.verify cost-tracker record failed: %s",
+                    exc,
+                )
 
         out: dict[str, dict] = {}
         for block in resp.content:

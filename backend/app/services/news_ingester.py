@@ -235,6 +235,7 @@ class NewsIngester:
         model: str,
         max_searches: int,
         cache_ttl_seconds: float,
+        cost_tracker: "Optional[Any]" = None,
     ):
         self._client = client
         self._store = store
@@ -242,6 +243,7 @@ class NewsIngester:
         self._max_searches = max_searches
         self._cache_ttl_seconds = cache_ttl_seconds
         self._submit_tool = _submit_tool_schema()
+        self._cost_tracker = cost_tracker
 
     async def ingest_for_fixture(
         self,
@@ -352,6 +354,25 @@ class NewsIngester:
             _bump_cycle_counter("scout_haiku_websearch")
         except Exception:
             pass
+        # Cost-tripwire short-circuit. Scout uses web_search; without
+        # it we cannot do useful research, so when the budget is gone
+        # we silently skip and return [] (no new candidates this cycle).
+        if self._cost_tracker is not None:
+            try:
+                projected = self._cost_tracker.estimate_haiku_call(
+                    input_tokens=1500, max_output_tokens=4096,
+                    web_search=True, web_search_calls=self._max_searches,
+                )
+                if not await self._cost_tracker.can_spend(projected):
+                    logger.info(
+                        "[cost] news scout skipped — daily LLM budget "
+                        "exhausted (fixture=%s)", home,
+                    )
+                    return []
+            except Exception as exc:
+                logger.warning(
+                    "NewsIngester cost-tracker check failed: %s", exc,
+                )
         try:
             response = await self._client.messages.create(
                 model=self._model,
@@ -374,6 +395,21 @@ class NewsIngester:
         except Exception as exc:
             logger.warning("News ingest LLM call failed: %s", exc)
             return []
+
+        if self._cost_tracker is not None:
+            try:
+                actual = self._cost_tracker.cost_from_usage(
+                    getattr(response, "usage", None),
+                    web_search=True, web_search_calls=self._max_searches,
+                )
+                await self._cost_tracker.record_call(
+                    model=self._model, kind="news_scout",
+                    cost_usd=actual,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "NewsIngester cost-tracker record failed: %s", exc,
+                )
 
         usage = getattr(response, "usage", None)
         if usage is not None:

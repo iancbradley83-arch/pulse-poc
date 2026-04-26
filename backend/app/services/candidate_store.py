@@ -186,6 +186,18 @@ CREATE TABLE IF NOT EXISTS rewrite_cache (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rewrite_cache_created ON rewrite_cache(created_at);
+
+-- Daily LLM spend tripwire (cost-aware redesign, 2026-04-26). One row
+-- per UTC day. `accumulated_usd` is monotonic-increasing within a day;
+-- `calls` is the count of LLM messages-create invocations counted
+-- against the budget. The CostTracker upserts via
+-- `INSERT ... ON CONFLICT(date) DO UPDATE` (see add_daily_cost).
+CREATE TABLE IF NOT EXISTS daily_cost (
+    date TEXT PRIMARY KEY,
+    accumulated_usd REAL NOT NULL DEFAULT 0,
+    calls INTEGER NOT NULL DEFAULT 0,
+    last_call_at REAL
+);
 """
 
 
@@ -848,8 +860,10 @@ class CandidateStore:
         """Read a cached rewrite by key. Returns None on miss or TTL expiry.
 
         The hash is computed by NarrativeRewriter from
-        (bet_type, hook_type, headline, legs_csv, total_odds) so unchanged
-        candidates across reruns hit this path and skip the Sonnet call.
+        (bet_type, hook_type, headline, legs_csv, news_mentions) — pure
+        thesis, no price. Pre-redesign the key included `total_odds`,
+        which churned on every SSE pricing tick and made the cache miss
+        every cycle (the $407/6d leak). See cost-aware-redesign.md.
         """
         import time as _t
         cutoff = _t.time() - max_age_seconds
@@ -881,6 +895,93 @@ class CandidateStore:
                 (key, headline, angle, model, _t.time()),
             )
             await db.commit()
+
+    # ── Daily LLM cost tripwire (cost-aware redesign, 2026-04-26) ──
+
+    async def get_daily_cost_total(self, date: str) -> float:
+        """Return accumulated USD cost for a UTC day (`YYYY-MM-DD`).
+
+        Returns 0.0 if the day has no row yet (first call of the day).
+        """
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT accumulated_usd FROM daily_cost WHERE date = ?",
+                (date,),
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            return 0.0
+        try:
+            return float(row[0] or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def get_daily_cost_calls(self, date: str) -> int:
+        """Return the call counter for a UTC day. 0 if no row."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT calls FROM daily_cost WHERE date = ?",
+                (date,),
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row[0] or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def add_daily_cost(
+        self, date: str, usd_delta: float, *, calls_delta: int = 1,
+    ) -> None:
+        """Atomically add a cost delta to today's row. Creates the row on
+        first call of the day.
+
+        Uses `INSERT ... ON CONFLICT DO UPDATE` so two concurrent tier
+        loops don't race-overwrite each other's deltas — the upsert is a
+        single statement.
+        """
+        import time as _t
+        usd = max(0.0, float(usd_delta or 0.0))
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO daily_cost (date, accumulated_usd, calls, last_call_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    accumulated_usd = accumulated_usd + excluded.accumulated_usd,
+                    calls = calls + excluded.calls,
+                    last_call_at = excluded.last_call_at
+                """,
+                (date, usd, int(calls_delta), _t.time()),
+            )
+            await db.commit()
+
+    async def get_daily_cost_history(self, days: int = 7) -> list[dict[str, Any]]:
+        """Return the most recent `days` rows of daily cost telemetry.
+
+        Powers the `/admin/cost` page. Sorted newest-first.
+        """
+        async with self._connect() as db:
+            async with db.execute(
+                """
+                SELECT date, accumulated_usd, calls, last_call_at
+                FROM daily_cost
+                ORDER BY date DESC
+                LIMIT ?
+                """,
+                (max(1, int(days)),),
+            ) as cur:
+                rows = await cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows or []:
+            out.append({
+                "date": r[0],
+                "accumulated_usd": float(r[1] or 0.0),
+                "calls": int(r[2] or 0),
+                "last_call_at": float(r[3]) if r[3] is not None else None,
+            })
+        return out
 
     async def reaction_aggregates(self) -> list[dict[str, Any]]:
         """Aggregate reactions by (fixture, hook_type, bet_type, storyline) for
