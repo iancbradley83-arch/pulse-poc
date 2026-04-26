@@ -112,6 +112,62 @@ const PULSE = (() => {
     return m ? `${m[1]} · ${m[2]}` : raw;
   }
 
+  // History mode: parse a card's kickoff string ("24 Apr 18:45 UTC") into a
+  // unix-seconds epoch so we can decide whether the match has already started.
+  // Falls back to card.game.start_time_unix if the engine ever emits one.
+  // Returns null if we can't make sense of the value — caller must treat
+  // unparseable kickoffs as NOT-yet-started (don't grey out wrongly).
+  const _MONTHS = {
+    Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+    Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+  };
+  function parseKickoffEpoch(card) {
+    if (!card || !card.game) return null;
+    if (typeof card.game.start_time_unix === 'number') {
+      return card.game.start_time_unix;
+    }
+    const raw = card.game.start_time;
+    if (!raw || typeof raw !== 'string') return null;
+    // Format: "24 Apr 18:45 UTC" — assume current year (catalogue is rolling
+    // and never carries cards more than a few weeks out). UTC suffix is
+    // implicit; we assemble an ISO-like Date.UTC(...) call.
+    const m = raw.match(/^(\d{1,2})\s+(\w{3})\s+(\d{1,2}):(\d{2})/);
+    if (!m) return null;
+    const day = parseInt(m[1], 10);
+    const monthIdx = _MONTHS[m[2]];
+    const hour = parseInt(m[3], 10);
+    const minute = parseInt(m[4], 10);
+    if (monthIdx == null || !Number.isFinite(day) || !Number.isFinite(hour) || !Number.isFinite(minute)) {
+      return null;
+    }
+    const year = new Date().getUTCFullYear();
+    const ms = Date.UTC(year, monthIdx, day, hour, minute, 0);
+    if (!Number.isFinite(ms)) return null;
+    return Math.floor(ms / 1000);
+  }
+
+  function isCardExpired(card) {
+    const ts = parseKickoffEpoch(card);
+    if (ts == null) return false;
+    return ts < (Date.now() / 1000);
+  }
+
+  // For expired cards, swap "3m ago" for a kickoff-relative label like
+  // "kicked off 2h ago" / "started". Falls back to publishedAt-driven
+  // formatting when the card is still upcoming or has no kickoff.
+  function formatCardTimestamp(card, publishedAt) {
+    if (isCardExpired(card)) {
+      const ts = parseKickoffEpoch(card);
+      if (ts == null) return formatRelativeTime(publishedAt);
+      const deltaSec = (Date.now() / 1000) - ts;
+      if (deltaSec < 60) return 'started';
+      if (deltaSec < 3600) return `kicked off ${Math.floor(deltaSec / 60)}m ago`;
+      if (deltaSec < 86400) return `kicked off ${Math.floor(deltaSec / 3600)}h ago`;
+      return `kicked off ${Math.floor(deltaSec / 86400)}d ago`;
+    }
+    return formatRelativeTime(publishedAt);
+  }
+
   function selectionsFromMarket(market) {
     // Design expects legs: [{label, sub?, odds, recommended?, drift?}]
     // Our API serves Market.selections: [{label, odds: "1.85", ...}]
@@ -210,10 +266,12 @@ const PULSE = (() => {
     ].join(';');
 
     const publishedAt = (typeof card.published_at === 'number') ? card.published_at : null;
-    const relTime = formatRelativeTime(publishedAt);
+    const expired = isCardExpired(card);
+    const relTime = formatCardTimestamp(card, publishedAt);
+    const kickoffEpoch = parseKickoffEpoch(card);
 
     return `
-      <article class="card-hero${card.suspended ? ' card-suspended' : ''}" data-card-id="${escape(card.id || '')}" data-published-at="${publishedAt || ''}" style="${style}">
+      <article class="card-hero${card.suspended ? ' card-suspended' : ''}${expired ? ' card-hero--expired' : ''}" data-card-id="${escape(card.id || '')}" data-published-at="${publishedAt || ''}" data-kickoff-epoch="${kickoffEpoch || ''}" style="${style}">
         <div class="card-glyph">${hookGlyph(hook.icon, 40, hook.color)}</div>
         <div class="card-body">
           <div class="card-head">
@@ -276,14 +334,16 @@ const PULSE = (() => {
 
           ${angle ? `<p class="card-angle">${escape(angle)}</p>` : ''}
 
-          <button class="cta-button" type="button" data-card-id="${escape(card.id || '')}">
+          <button class="cta-button" type="button" data-card-id="${escape(card.id || '')}"${expired ? ' disabled aria-disabled="true"' : ''}>
             <span class="cta-left">
-              ${isMultiLeg ? multiLegCTA : 'Tap to bet'}
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+              ${expired ? 'Match started' : (isMultiLeg ? multiLegCTA : 'Tap to bet')}
+              ${expired ? '' : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>'}
             </span>
-            ${hasTotal
-              ? `<span class="cta-odds">${(Number(totalOdds) || 0).toFixed(2)}</span>`
-              : (isBB ? `<span class="cta-odds cta-odds--note">Price in slip</span>` : '')}
+            ${expired
+              ? ''
+              : (hasTotal
+                  ? `<span class="cta-odds">${(Number(totalOdds) || 0).toFixed(2)}</span>`
+                  : (isBB ? `<span class="cta-odds cta-odds--note">Price in slip</span>` : ''))}
           </button>
 
           <div class="card-foot">
@@ -456,6 +516,11 @@ const PULSE = (() => {
     feed.addEventListener('click', (ev) => {
       const cta = ev.target.closest('.cta-button');
       if (cta) {
+        // History mode: expired cards (kickoff in the past) are read-only.
+        // The `disabled` attr + pointer-events:none in CSS already block
+        // most paths; this is a belt-and-braces guard for browsers that
+        // still fire the delegated click.
+        if (cta.disabled || cta.closest('.card-hero--expired')) return;
         cta.animate([{ transform: 'scale(0.98)' }, { transform: 'scale(1)' }], { duration: 120 });
         const cardId = cta.getAttribute('data-card-id');
         const card = allCards.find(c => c.id === cardId);
@@ -748,13 +813,40 @@ const PULSE = (() => {
   // re-render of the whole card.
   function startTimestampTicker() {
     setInterval(() => {
+      const nowSec = Date.now() / 1000;
       document.querySelectorAll('article.card-hero').forEach(article => {
-        const stamp = parseFloat(article.getAttribute('data-published-at') || '');
-        if (!Number.isFinite(stamp)) return;
+        const cardId = article.getAttribute('data-card-id');
+        const card = cardId ? allCards.find(c => c.id === cardId) : null;
+
+        // Re-check expired status on every tick. If a match has just kicked
+        // off while the user is watching, flip the card to history mode in
+        // place (no full re-render needed for the simple case).
+        const kickoffEpoch = parseFloat(article.getAttribute('data-kickoff-epoch') || '');
+        const wasExpired = article.classList.contains('card-hero--expired');
+        const nowExpired = Number.isFinite(kickoffEpoch) && kickoffEpoch < nowSec;
+        if (nowExpired && !wasExpired && card) {
+          // Card just crossed kickoff — re-render this article so the CTA
+          // copy and disabled state are applied. Cheaper than re-rendering
+          // the whole feed; preserves scroll position.
+          const fresh = document.createElement('div');
+          fresh.innerHTML = renderHeroCard(card);
+          const replacement = fresh.firstElementChild;
+          if (replacement) {
+            article.replaceWith(replacement);
+            if (window.PulseReactions) window.PulseReactions.injectInto(replacement);
+          }
+          return; // article is detached; skip further updates this tick
+        }
+
+        // Refresh the relative-time label using the card-aware formatter
+        // so expired cards switch to "kicked off Xh ago".
         const node = article.querySelector('time.card-timestamp');
         if (!node) return;
-        const next = formatRelativeTime(stamp);
-        if (node.textContent !== next) node.textContent = next;
+        const stamp = parseFloat(article.getAttribute('data-published-at') || '');
+        const next = card
+          ? formatCardTimestamp(card, Number.isFinite(stamp) ? stamp : null)
+          : (Number.isFinite(stamp) ? formatRelativeTime(stamp) : '');
+        if (next && node.textContent !== next) node.textContent = next;
       });
     }, 30 * 1000);
   }
