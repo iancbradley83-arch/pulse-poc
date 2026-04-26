@@ -390,12 +390,11 @@ class CandidateStore:
         1. `news_items.ingested_at` — set when items are INSERTed (cache
            miss path, i.e. genuinely-new stories).
         2. `ingest_cache.ingested_at` — set whenever the per-fixture cache
-           row is written. Captures "we refreshed this fixture's news
-           snapshot" even if the specific items were already known.
-           Without this a fixture whose news was ingested weeks ago and
-           served from cache ever since would report stale
-           `latest_ingested_at` and never skip — the bugfix shipped post
-           PR #53 (verified in prod: zero skips until this was added).
+           row is written OR touched by `touch_ingest_cache` on a cache
+           hit (PR fix/cost-leak-freshness-cooldowns). Captures every
+           scout pass, including pure cache-hit replays — without this
+           the timestamp only advances when the LLM is actually called,
+           and `skipped_fresh` stays at 0 forever in the tier loop.
 
         Returns None if neither table has a record for this fixture.
         """
@@ -422,6 +421,52 @@ class CandidateStore:
             return float(row[0])
         except (TypeError, ValueError):
             return None
+
+    async def is_fixture_news_fresh(
+        self, fixture_id: str, ttl_seconds: float,
+    ) -> tuple[bool, Optional[float]]:
+        """Single source of truth for "is this fixture's news fresh?".
+
+        Reads from `ingest_cache.ingested_at` (always-bumped on every scout
+        pass, including cache-hit replays via `touch_ingest_cache`) and
+        compares to `now() - ttl_seconds`. Falls back to
+        `news_items.ingested_at` for fixtures whose ingest_cache row
+        somehow predates the touch fix.
+
+        Returns (is_fresh, age_seconds). age is None when there's no record.
+        """
+        latest = await self.latest_news_ingested_at(fixture_id)
+        if latest is None:
+            return False, None
+        import time as _t
+        age = _t.time() - latest
+        return (age < ttl_seconds), age
+
+    async def touch_ingest_cache(
+        self, fixture_id: str, cache_key: str,
+    ) -> None:
+        """Bump `ingest_cache.ingested_at` for an existing row without
+        rewriting the payload. Called from the news ingester's cache-hit
+        path so the freshness timestamp advances on EVERY scout pass, not
+        just LLM-call ones.
+
+        No-op if the row doesn't exist (defensive — UPDATE without an
+        INSERT preserves the contract that the cache write path is the
+        only thing that creates rows).
+        """
+        if not fixture_id or not cache_key:
+            return
+        import time as _t
+        async with self._connect() as db:
+            await db.execute(
+                """
+                UPDATE ingest_cache
+                SET ingested_at = ?
+                WHERE fixture_id = ? AND cache_key = ?
+                """,
+                (_t.time(), fixture_id, cache_key),
+            )
+            await db.commit()
 
     # ── Candidates ──
 

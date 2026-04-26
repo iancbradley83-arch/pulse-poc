@@ -259,6 +259,20 @@ class NewsIngester:
         )
         if cached is not None:
             logger.info("News cache hit: %s (%s)", fixture_id, cache_key)
+            # Bump ingest_cache.ingested_at so the tier-loop freshness
+            # check sees this scout pass. Without this the timestamp
+            # only advances on LLM-call paths, and `skipped_fresh` stays
+            # at 0 forever in the tier loop (cost leak: every cycle
+            # re-runs the engine even though nothing changed). See
+            # candidate_store.is_fixture_news_fresh + the
+            # freshness_timestamp_trap memory.
+            try:
+                await self._store.touch_ingest_cache(fixture_id, cache_key)
+            except Exception as exc:
+                logger.warning(
+                    "News ingest: touch_ingest_cache failed for %s: %s",
+                    fixture_id, exc,
+                )
             return [NewsItem(**row) for row in cached]
 
         raw_items = await self._call_llm(home=home, away=away, league=league, kickoff_iso=kickoff_iso)
@@ -329,6 +343,15 @@ class NewsIngester:
             f"Kickoff: {kickoff_iso}\n\n"
             "Research the latest news. Call submit_news_items when done."
         )
+        # Cycle-cost telemetry: bump scout counter before the call so a
+        # crashed/timed-out call still shows up as a paid invocation.
+        # Lazy import keeps the ingester importable when main.py isn't
+        # loaded (tests / scripts).
+        try:
+            from app.main import _bump_cycle_counter
+            _bump_cycle_counter("scout_haiku_websearch")
+        except Exception:
+            pass
         try:
             response = await self._client.messages.create(
                 model=self._model,

@@ -383,6 +383,48 @@ PULSE_BOOT_FRESHNESS_SKIP_ENABLED = os.getenv(
     "PULSE_BOOT_FRESHNESS_SKIP_ENABLED", "true",
 ).lower() == "true"
 
+# Freshness slack window. The tier-loop freshness check compares
+# (now - latest_ingested_at) against (tier_cadence + slack). Without
+# slack, a fixture scouted T seconds ago when cadence is also T seconds
+# never qualifies as "fresh" (the comparison is on the boundary), so
+# `skipped_fresh` stays at 0 even when the cache is hot. Default 300s
+# (5min) covers boundary jitter + scout duration.
+PULSE_TIER_FRESHNESS_SLACK_SECONDS = int(
+    os.getenv("PULSE_TIER_FRESHNESS_SLACK_SECONDS", "300")
+)
+
+# ── Storyline cooldowns ────────────────────────────────────────────────
+# Per (storyline_type, league) cooldown to avoid re-scouting standings
+# every tier cycle. Standings change at most once a day; scouting them
+# every 30-60 minutes burns Haiku+web_search calls for zero new info.
+# Default 6h. Per-type override:
+#   PULSE_STORYLINE_<TYPE>_COOLDOWN_SECONDS   (e.g. _GOLDEN_BOOT_=14400)
+PULSE_STORYLINE_COOLDOWN_SECONDS = int(
+    os.getenv("PULSE_STORYLINE_COOLDOWN_SECONDS", "21600")
+)
+
+# Standings-verify cache TTL. The (team, today) keyed cache in
+# storyline_detector held a hard-coded 12h TTL — env-knobbed here so
+# we can tune without a redeploy. 12h default unchanged.
+PULSE_STANDINGS_CACHE_TTL_SECONDS = int(
+    os.getenv("PULSE_STANDINGS_CACHE_TTL_SECONDS", "43200")
+)
+
+# ── Cycle cost telemetry ───────────────────────────────────────────────
+# Rough per-call USD cost estimates used for the end-of-cycle
+# `[cost] cycle total: ...` log line and the daily rolling cost in
+# /admin/rerun/status. Approximate but auditable — directional, not
+# billable. Real telemetry would come from Anthropic's usage API.
+PULSE_COST_HAIKU_PER_CALL = float(
+    os.getenv("PULSE_COST_HAIKU_PER_CALL", "0.01")
+)
+PULSE_COST_HAIKU_WEBSEARCH_PER_CALL = float(
+    os.getenv("PULSE_COST_HAIKU_WEBSEARCH_PER_CALL", "0.025")
+)
+PULSE_COST_SONNET_PER_CALL = float(
+    os.getenv("PULSE_COST_SONNET_PER_CALL", "0.05")
+)
+
 # Hook-diversity release buffer (social-feed stream ordering rule).
 # Candidates that pass gates are buffered for up to this many seconds
 # instead of broadcasting immediately. A single release scheduler wakes

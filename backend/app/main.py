@@ -819,7 +819,8 @@ async def admin_rerun():
                     "scouted": sum(int(v.get("scouted", 0) or 0) for v in tier_results.values() if isinstance(v, dict)),
                     "skipped_fresh": sum(int(v.get("skipped_fresh", 0) or 0) for v in tier_results.values() if isinstance(v, dict)),
                     "candidates": sum(int(v.get("candidates", 0) or 0) for v in tier_results.values() if isinstance(v, dict)),
-                    "cost_estimate_usd": round(sum(float(v.get("cost_estimate_usd", 0) or 0) for v in tier_results.values() if isinstance(v, dict)), 3),
+                    "cost_estimate_usd": round(sum(float(v.get("cost_estimate_usd", 0) or 0) for v in tier_results.values() if isinstance(v, dict)), 4),
+                    "daily_total_usd": round(_daily_cost_usd, 4),
                 }
                 _ondemand_rerun_last_result = {
                     "ok": True,
@@ -868,6 +869,14 @@ async def admin_rerun_status():
             if _ondemand_rerun_inflight else None
         ),
         "last_result": _ondemand_rerun_last_result or None,
+        # Daily rolling cost telemetry (UTC bucket, resets at day-boundary).
+        # Surfaced here so a leak is visible without log scraping.
+        "cost_telemetry": {
+            "day_utc": _daily_cost_day or _today_utc(),
+            "daily_total_usd": round(_daily_cost_usd, 4),
+            "last_cycle_calls": dict(_cycle_call_counts),
+            "last_cycle_breakdown_usd": _cycle_cost_breakdown(),
+        },
     }
 
 
@@ -1281,6 +1290,86 @@ async def _release_loop() -> None:
 # Per-tier reentry guard so a long-running cycle can't overlap itself.
 _tier_inflight: dict[str, bool] = {t: False for t in _TIER_ORDER}
 _tier_tasks: list = []
+
+# Process-level cost-telemetry counters. Incremented during a cycle,
+# read at end-of-cycle for the `[cost] cycle total: ...` log line and
+# the daily rolling total in `/admin/rerun/status`. Reset at the top of
+# each tier cycle (so per-cycle log is honest) and aggregated daily.
+_cycle_call_counts: dict[str, int] = {
+    "scout_haiku_websearch": 0,
+    "storyline_sonnet_websearch": 0,  # storyline detector LLM call
+    "standings_haiku_websearch": 0,
+    "rewrite_sonnet": 0,
+}
+_daily_cost_usd: float = 0.0
+_daily_cost_day: str = ""  # 'YYYY-MM-DD' UTC; resets the bucket on rollover
+
+
+def _today_utc() -> str:
+    import time as _t
+    return _t.strftime("%Y-%m-%d", _t.gmtime())
+
+
+def _reset_cycle_counters() -> None:
+    for k in _cycle_call_counts:
+        _cycle_call_counts[k] = 0
+
+
+def _bump_cycle_counter(name: str, by: int = 1) -> None:
+    if name in _cycle_call_counts:
+        _cycle_call_counts[name] += by
+
+
+def _accumulate_daily_cost(usd: float) -> None:
+    global _daily_cost_usd, _daily_cost_day
+    today = _today_utc()
+    if today != _daily_cost_day:
+        _daily_cost_day = today
+        _daily_cost_usd = 0.0
+    _daily_cost_usd += float(usd or 0.0)
+
+
+def _cycle_cost_breakdown() -> dict[str, float]:
+    """Compute per-bucket USD cost from current cycle counters.
+
+    Uses env-knobbed per-call estimates from app.config — directional,
+    not billable. Real telemetry lives in Anthropic's usage API.
+    """
+    try:
+        from app.config import (
+            PULSE_COST_HAIKU_PER_CALL,
+            PULSE_COST_HAIKU_WEBSEARCH_PER_CALL,
+            PULSE_COST_SONNET_PER_CALL,
+        )
+    except Exception:
+        PULSE_COST_HAIKU_PER_CALL = 0.01
+        PULSE_COST_HAIKU_WEBSEARCH_PER_CALL = 0.025
+        PULSE_COST_SONNET_PER_CALL = 0.05
+    scout_usd = (
+        _cycle_call_counts.get("scout_haiku_websearch", 0)
+        * float(PULSE_COST_HAIKU_WEBSEARCH_PER_CALL)
+    )
+    storyline_usd = (
+        _cycle_call_counts.get("storyline_sonnet_websearch", 0)
+        * float(PULSE_COST_SONNET_PER_CALL)
+    )
+    verify_usd = (
+        _cycle_call_counts.get("standings_haiku_websearch", 0)
+        * float(PULSE_COST_HAIKU_WEBSEARCH_PER_CALL)
+    )
+    rewrite_usd = (
+        _cycle_call_counts.get("rewrite_sonnet", 0)
+        * float(PULSE_COST_SONNET_PER_CALL)
+    )
+    total = scout_usd + storyline_usd + verify_usd + rewrite_usd
+    return {
+        "scout_usd": round(scout_usd, 4),
+        "storylines_usd": round(storyline_usd, 4),
+        "verify_usd": round(verify_usd, 4),
+        "rewrite_usd": round(rewrite_usd, 4),
+        "total_usd": round(total, 4),
+    }
+
 # Cross-tier mutex — the candidate engine sets a module-global
 # `candidate_engine` singleton during `_run_candidate_engine`, so two
 # tier cycles running concurrently would race it. Serialise the work
@@ -1332,31 +1421,57 @@ async def _run_tier_once(tier: str) -> dict:
             "[tier:%s] cycle start — %d fixtures (cap=%d)",
             tier, len(fixture_ids), max_fixtures,
         )
+        # Reset cycle cost-telemetry counters BEFORE any LLM calls fire.
+        # End-of-cycle log + daily total read these.
+        _reset_cycle_counters()
+        # Reset storyline / standings counters (process-level in
+        # storyline_detector). These survive across cycles otherwise.
+        try:
+            from app.engine.storyline_detector import (
+                reset_standings_cache_counters,
+                reset_storyline_cooldown_counters,
+            )
+            reset_standings_cache_counters()
+            reset_storyline_cooldown_counters()
+        except Exception as exc:
+            logger.warning("[tier:%s] counter reset failed: %s", tier, exc)
         # Boot-freshness skip (2026-04-24 volume-up PR). For each fixture
-        # in this tier, check the DB for the freshest news_items.ingested_at.
-        # If newer than this tier's cadence, skip the scout for that
-        # fixture — candidates + prices still rebuild from cached news
-        # (no LLM cost) via calculate_bets + rewriter cache downstream.
-        # Fixtures with no news yet scout normally.
+        # in this tier, check the DB freshness via the centralised
+        # `is_fixture_news_fresh` helper (which reads from
+        # ingest_cache.ingested_at — the timestamp that's now bumped on
+        # EVERY scout pass including cache hits). The TTL is the tier's
+        # own cadence + slack, where slack covers boundary jitter (a
+        # fixture scouted T seconds ago when cadence is also T seconds
+        # was previously never "fresh" because the comparison sat on
+        # the boundary — that bug had `skipped_fresh=0` in every cycle
+        # log, see fix/cost-leak-freshness-cooldowns PR).
         from app.config import PULSE_BOOT_FRESHNESS_SKIP_ENABLED as _FRESH_SKIP
+        # Read slack from env at runtime so a Railway env flip takes
+        # effect on the next cycle without redeploy.
+        try:
+            _FRESH_SLACK = int(os.getenv("PULSE_TIER_FRESHNESS_SLACK_SECONDS", "300"))
+        except ValueError:
+            _FRESH_SLACK = 300
         tier_cadence_s, _ = _TIER_CONFIG[tier]()
+        freshness_ttl = float(tier_cadence_s) + float(_FRESH_SLACK)
         skipped_fresh_ids: list[str] = []
         if _FRESH_SKIP:
             still_scout: dict[str, Game] = {}
             for gid, g in tier_games.items():
                 try:
-                    latest = await candidate_store.latest_news_ingested_at(gid)
+                    is_fresh, age_s = await candidate_store.is_fixture_news_fresh(
+                        gid, freshness_ttl,
+                    )
                 except Exception as exc:
                     logger.warning(
                         "[tier:%s] freshness probe failed for %s: %s",
                         tier, gid, exc,
                     )
-                    latest = None
-                if latest is not None and (now - latest) < tier_cadence_s:
-                    age_min = (now - latest) / 60.0
+                    is_fresh, age_s = False, None
+                if is_fresh and age_s is not None:
                     logger.info(
-                        "[tier:%s] fixture %s skipped — news fresh (%.0fm ago)",
-                        tier, gid, age_min,
+                        "[tier:%s] fixture %s fresh (%.0fs old) — skipped",
+                        tier, gid, age_s,
                     )
                     skipped_fresh_ids.append(gid)
                 else:
@@ -1366,8 +1481,10 @@ async def _run_tier_once(tier: str) -> dict:
             scouted_games = dict(tier_games)
         scouted_ids = list(scouted_games.keys())
         logger.info(
-            "[tier:%s] freshness filter — %d to scout, %d skipped_fresh",
+            "[tier:%s] freshness filter — %d to scout, %d skipped_fresh "
+            "(ttl=%.0fs = cadence %.0fs + slack %ds)",
             tier, len(scouted_ids), len(skipped_fresh_ids),
+            freshness_ttl, float(tier_cadence_s), int(_FRESH_SLACK),
         )
         # Expire prior published candidates for ONLY the fixtures we're
         # actually scouting this tick. Skipped-fresh fixtures keep their
@@ -1457,18 +1574,45 @@ async def _run_tier_once(tier: str) -> dict:
         if swept:
             logger.info("[tier:%s] swept %d replaced/orphaned cards", tier, swept)
         elapsed = _time.time() - t0
-        # Rough per-fixture cost estimate: Haiku scout w/ web_search runs
-        # ~$0.01/fixture at PULSE_NEWS_MAX_SEARCHES=5. Skipped-fresh
-        # fixtures cost ~$0 (rebuild from cached news, no LLM). Real
-        # telemetry would come from Anthropic's usage API; this is a
-        # directional dashboard value, not billable.
-        est_cost = round(len(scouted_ids) * 0.01, 3)
+        # Honest per-cycle cost: tally every Haiku/Sonnet call that
+        # actually fired during the cycle (scout, storylines, standings
+        # verify, rewriter Sonnet) using env-knobbed per-call estimates.
+        # Replaces the old per-scouted-fixture * $0.01 approximation,
+        # which undercounted by ignoring storylines + verify + rewriter.
+        cost = _cycle_cost_breakdown()
+        est_cost = cost["total_usd"]
+        _accumulate_daily_cost(est_cost)
         scouted_count = len(scouted_ids)
         skipped_count = len(skipped_fresh_ids)
         candidates_emitted = len(newly_emitted_ids)
+        # Cooldown / cache hit-rates from the storyline detector. Read
+        # post-cycle so the values reflect what just happened.
+        try:
+            from app.engine.storyline_detector import (
+                get_standings_cache_counters,
+                get_storyline_cooldown_counters,
+            )
+            std_hits, std_misses = get_standings_cache_counters()
+            sl_hits, sl_misses = get_storyline_cooldown_counters()
+        except Exception:
+            std_hits = std_misses = sl_hits = sl_misses = 0
         logger.info(
-            "[tier:%s] cycle: scouted=%d skipped_fresh=%d candidates=%d cost_estimate=$%.2f",
+            "[tier:%s] cycle: scouted=%d skipped_fresh=%d candidates=%d cost_estimate=$%.4f",
             tier, scouted_count, skipped_count, candidates_emitted, est_cost,
+        )
+        logger.info(
+            "[cost] cycle total: scout=$%.4f storylines=$%.4f verify=$%.4f "
+            "rewrite=$%.4f total=$%.4f calls=(scout=%d storyline=%d verify=%d rewrite=%d) "
+            "standings_cache=(hit=%d miss=%d) storyline_cooldown=(hit=%d miss=%d) "
+            "daily_total=$%.4f",
+            cost["scout_usd"], cost["storylines_usd"], cost["verify_usd"],
+            cost["rewrite_usd"], cost["total_usd"],
+            _cycle_call_counts.get("scout_haiku_websearch", 0),
+            _cycle_call_counts.get("storyline_sonnet_websearch", 0),
+            _cycle_call_counts.get("standings_haiku_websearch", 0),
+            _cycle_call_counts.get("rewrite_sonnet", 0),
+            std_hits, std_misses, sl_hits, sl_misses,
+            _daily_cost_usd,
         )
         logger.info("[tier:%s] cycle finish in %.1fs", tier, elapsed)
         return {
@@ -1478,6 +1622,10 @@ async def _run_tier_once(tier: str) -> dict:
             "skipped_fresh": skipped_count,
             "candidates": candidates_emitted,
             "cost_estimate_usd": est_cost,
+            "cost_breakdown_usd": cost,
+            "calls": dict(_cycle_call_counts),
+            "standings_cache": {"hits": std_hits, "misses": std_misses},
+            "storyline_cooldown": {"hits": sl_hits, "misses": sl_misses},
             "elapsed_s": round(elapsed, 1),
         }
     except Exception as exc:
@@ -2299,6 +2447,12 @@ async def _run_candidate_engine(
         # above (which track whether a Sonnet response was successfully
         # applied). cache_hits here = rewrites served from SQLite without
         # calling Sonnet at all.
+        # cache_misses here = real Sonnet rewrite calls; feed it into the
+        # cycle cost telemetry.
+        try:
+            _bump_cycle_counter("rewrite_sonnet", int(rewriter.cache_misses))
+        except Exception:
+            pass
         logger.info(
             "[PULSE] rewrite cache: %d hits, %d misses this cycle",
             rewriter.cache_hits, rewriter.cache_misses,
