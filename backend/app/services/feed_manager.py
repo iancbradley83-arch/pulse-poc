@@ -1,13 +1,17 @@
 """Feed Manager — manages feed state, ranking, and card lifecycle."""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
 from app.models.schemas import Card, CardType
 
+logger = logging.getLogger(__name__)
+
 
 class FeedManager:
-    def __init__(self):
+    def __init__(self, store=None):
         self.prematch_cards: list[Card] = []
         self.live_cards: list[Card] = []
         self._websocket_clients: list = []
@@ -17,6 +21,13 @@ class FeedManager:
         # the baseline/engine/featured/mock paths). Callers set this once
         # after instantiation; None means pass-through.
         self._decorator: "callable | None" = None
+        # Optional CandidateStore reference for snapshotting published
+        # cards (PR fix/published-cards-snapshot, 2026-04-27). When set,
+        # every `add_prematch_card(...)` upserts a serialized Card snapshot
+        # so cold-start rehydrate can repopulate the feed without touching
+        # the catalog or LLM. None => snapshot hook is a no-op (unit tests
+        # without a real store still work).
+        self._store = store
 
     def set_decorator(self, decorator) -> None:
         """Install a per-card decorator called on every insert. The callable
@@ -32,7 +43,7 @@ class FeedManager:
                 return card
         return card
 
-    def add_prematch_card(self, card: Card):
+    def add_prematch_card(self, card: Card, _skip_snapshot: bool = False):
         # Stamp published_at on first insert so tiered freshness + TTL
         # sweeps have a stable reference (card.created_at is set when the
         # Card object is built, which can be earlier when a rerun re-uses
@@ -45,6 +56,43 @@ class FeedManager:
                 pass
         self.prematch_cards.append(decorated)
         self._sort_prematch()
+        # Best-effort snapshot for cold-start rehydrate. No catalog and
+        # no LLM cost — just serialize the already-built Card. The
+        # `_skip_snapshot` flag lets the rehydrate path itself avoid a
+        # pointless re-write of the row it just read from. Fire-and-
+        # forget so the existing sync signature is preserved (there are
+        # 9 callers across main.py and the engine).
+        if self._store is not None and not _skip_snapshot:
+            try:
+                snapshot_json = decorated.model_dump_json()
+            except Exception:
+                logger.exception(
+                    "snapshot serialize failed for %s", getattr(decorated, "id", "?"),
+                )
+                return
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            coro = self._store.upsert_published_card(
+                card_id=decorated.id,
+                snapshot_json=snapshot_json,
+                candidate_id=getattr(decorated, "candidate_id", None),
+                expires_at=getattr(decorated, "expires_at", None),
+                bet_type=getattr(decorated, "bet_type", None),
+                storyline_id=getattr(decorated, "storyline_id", None),
+            )
+            if loop is not None and loop.is_running():
+                # Fire-and-forget; failures get logged via _snapshot_done.
+                task = loop.create_task(coro)
+                task.add_done_callback(_snapshot_done)
+            else:
+                # No running loop (sync test context). Drop the coroutine
+                # cleanly to avoid "coroutine was never awaited" warnings.
+                try:
+                    coro.close()
+                except Exception:
+                    pass
 
     def remove_prematch_card(self, card_id: str) -> Card | None:
         """Drop a card by id and return it (or None if absent)."""
@@ -260,3 +308,14 @@ class FeedManager:
             c for c in self.live_cards
             if now - c.created_at < c.ttl_seconds
         ]
+
+
+def _snapshot_done(task: "asyncio.Task") -> None:
+    """Done-callback for the fire-and-forget snapshot upsert. Logs any
+    exception that bubbled out of the coroutine — without this, a failed
+    snapshot is swallowed silently and the rehydrate table goes stale."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("[FeedManager] snapshot upsert failed: %r", exc)
