@@ -653,21 +653,6 @@ _sse_rogue_client: _Optional[RogueClient] = None
 _sse_manager: _Optional[SSEPricingManager] = None
 
 
-def _boot_engine_enabled() -> bool:
-    """Cold-start gate for the candidate engine.
-
-    The boot scout (and any startup-spawned tier / scheduled-rerun loops)
-    only fire when BOTH kill switches are explicitly on. Either flipped off
-    pauses the engine — including the once-at-boot run that fires after
-    every Railway redeploy regardless of the scheduled-loop cadence.
-
-    Read via os.getenv (not config.py) for PULSE_RERUN_ENABLED so the gate
-    is checked fresh on every boot — no module-level cache to flush.
-    """
-    rerun = os.getenv("PULSE_RERUN_ENABLED", "true").lower() == "true"
-    return bool(rerun and PULSE_NEWS_INGEST_ENABLED)
-
-
 @app.on_event("startup")
 async def generate_prematch_cards():
     """Generate pre-match cards.
@@ -685,35 +670,12 @@ async def generate_prematch_cards():
     except Exception as exc:
         logger.exception("[PULSE] candidate_store.init failed at startup: %s", exc)
     if PULSE_DATA_SOURCE == "rogue":
-        # Kill-switch gate: when EITHER PULSE_RERUN_ENABLED or
-        # PULSE_NEWS_INGEST_ENABLED is false, skip the boot scout (no LLM
-        # ingest, no rewriter, no storyline detector). We still rehydrate
-        # the in-memory feed from previously-persisted candidates so a
-        # cold start doesn't blank the user-facing feed for hours.
-        _engine_on = _boot_engine_enabled()
-        if not _engine_on:
-            _rerun_flag = os.getenv("PULSE_RERUN_ENABLED", "true").lower() == "true"
-            logger.info(
-                "[PULSE] engine paused (rerun=%s news_ingest=%s) — skipping boot scout",
-                _rerun_flag, PULSE_NEWS_INGEST_ENABLED,
-            )
-            await _load_rogue_prematch(publish_only=True)
-        else:
-            await _load_rogue_prematch()
+        await _load_rogue_prematch()
         # Kick off the periodic rerun loop AFTER initial load completes.
         # The loop sleeps first, so it doesn't compete with the boot pass.
         import asyncio as _asyncio
         from app.config import PULSE_TIERED_FRESHNESS_ENABLED as _TIERED
-        if not _engine_on:
-            # Engine is paused — don't spawn tier loops or the scheduled
-            # rerun loop. They'd just no-op on every tick (the per-tier
-            # PULSE_NEWS_INGEST_ENABLED check is already in place), but
-            # not creating them at all is cleaner and saves one timer per
-            # tier sleeping in the background.
-            logger.info(
-                "[PULSE] engine paused — skipping tier loops + scheduled rerun spawn"
-            )
-        elif _TIERED:
+        if _TIERED:
             # New (2026-04-24) tiered freshness + staggered publish. Each
             # tier schedules itself; cards stream into the live feed one at
             # a time via the per-card broadcaster hook.
@@ -1025,7 +987,6 @@ async def _load_rogue_prematch(
     target_feed: _Optional[FeedManager] = None,
     *,
     is_rerun: bool = False,
-    publish_only: bool = False,
 ) -> None:
     """Build the Rogue-sourced pre-match feed.
 
@@ -1038,14 +999,6 @@ async def _load_rogue_prematch(
     re-running the engine. Without this, each rerun's freshly-generated
     candidates stack on top of prior runs (publish loop reads ALL
     status='published' rows, not just the latest cycle).
-
-    publish_only: when True, skip every LLM-spending step (news ingest,
-    storyline detection, narrative rewriter) and just rebuild Cards from
-    already-persisted PUBLISHED candidates in SQLite. Used by the boot
-    rehydrate path so a cold start doesn't blank the feed when the engine
-    kill switches are off. Still fetches the Rogue catalogue (cheap, no
-    LLM) because the publish loop needs games + markets in memory to
-    materialize Cards.
     """
     if target_feed is None:
         target_feed = feed
@@ -1108,20 +1061,7 @@ async def _load_rogue_prematch(
         # Railway to stop ALL Anthropic-spending engine calls. Featured BBs
         # still load (no LLM). Useful when iterating without a demo, or
         # when the API key is bouncing on credits.
-        if publish_only:
-            # Boot rehydrate path: skip the LLM-spending engine entirely
-            # and rebuild Cards from previously-persisted PUBLISHED
-            # candidates only. Zero scout/rewriter/storyline calls.
-            n_loaded = await _publish_persisted_candidates(
-                simulator._games,
-                rogue_client=client,
-                target_feed=target_feed,
-            )
-            logger.info(
-                "[PULSE] feed rehydrated — %d published candidates loaded",
-                n_loaded,
-            )
-        elif not PULSE_NEWS_INGEST_ENABLED:
+        if not PULSE_NEWS_INGEST_ENABLED:
             logger.info(
                 "[PULSE] Candidate engine SKIPPED (PULSE_NEWS_INGEST_ENABLED=false). "
                 "Feed will show only featured BBs."
@@ -2233,33 +2173,6 @@ async def _run_candidate_engine(
             logger.info("[PULSE] calculate_bets combo pricing applied to %d candidates", combo_priced)
 
     # Promote published candidates into the public feed
-    await _publish_loop(
-        games_by_id=games_by_id,
-        target_feed=target_feed,
-        rewriter=rewriter,
-        per_card_publish_hook=per_card_publish_hook,
-        tier_prefix=_tier_prefix,
-    )
-
-
-async def _publish_loop(
-    *,
-    games_by_id: dict[str, Game],
-    target_feed: FeedManager,
-    rewriter: _Optional[object] = None,
-    per_card_publish_hook=None,
-    tier_prefix: str = "",
-) -> int:
-    """Materialize PUBLISHED candidates from SQLite into the live feed.
-
-    Pure read-from-store + assemble-Card path. Hits no LLM. Optionally calls
-    `rewriter.rewrite()` per candidate when a rewriter is supplied — the
-    boot rehydrate path passes None, so a cold start can rebuild the visible
-    feed from persistent storage without re-spending Anthropic credits.
-
-    Returns the number of cards added to `target_feed`.
-    """
-    _tier_prefix = tier_prefix
     published = await candidate_store.list_candidates(
         above_threshold_only=True, status="published", limit=100,
     )
@@ -2273,7 +2186,6 @@ async def _publish_loop(
     gate_reject_reasons: dict[str, int] = {}
     gated_updates: list = []
     bscode_updates: list = []  # candidates that got a fresh bscode this cycle
-    cards_added = 0
     for cand in published:
         game = games_by_id.get(cand.game_id)
         # Cross-event combos use game_id as a "primary fixture" pointer only;
@@ -2627,7 +2539,6 @@ async def _publish_loop(
                 cand.bscode = card.bscode
                 bscode_updates.append(cand)
         target_feed.add_prematch_card(card)
-        cards_added += 1
         # Staggered publish hook — fires on every successful insert. Tier
         # loops wire this to `feed.broadcast_card_added` so the frontend
         # drops each new card into the feed one-by-one rather than waiting
@@ -2676,40 +2587,6 @@ async def _publish_loop(
             # Persistence is best-effort — a failed save just means we
             # re-mint next cycle.
             logger.warning("[PULSE] Failed to persist bscodes: %s", exc)
-    return cards_added
-
-
-async def _publish_persisted_candidates(
-    games_by_id: dict[str, Game],
-    *,
-    rogue_client: _Optional[RogueClient] = None,
-    target_feed: _Optional[FeedManager] = None,
-) -> int:
-    """Boot rehydrate path: rebuild the in-memory feed from PUBLISHED rows
-    in `candidate_store` without spending any LLM credits.
-
-    Triggered from the startup hook when the engine kill switches are off
-    (`PULSE_RERUN_ENABLED=false` or `PULSE_NEWS_INGEST_ENABLED=false`).
-    A cold start would otherwise leave `feed.prematch_cards` empty for
-    hours until the next scheduled rerun — and even THAT is gated when
-    the kill switches are flipped.
-
-    Pure SQL → memory load. The candidate's `narrative` was authored by
-    the rewriter on the cycle that originally published it (or by
-    CombinedNarrativeAuthor for cross-event combos), so passing
-    `rewriter=None` reuses that copy verbatim — no Sonnet call.
-
-    Returns the number of cards rehydrated into `target_feed`.
-    """
-    if target_feed is None:
-        target_feed = feed
-    return await _publish_loop(
-        games_by_id=games_by_id,
-        target_feed=target_feed,
-        rewriter=None,
-        per_card_publish_hook=None,
-        tier_prefix="rehydrate",
-    )
 
 
 async def _load_mock_prematch():
