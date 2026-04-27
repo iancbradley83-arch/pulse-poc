@@ -873,8 +873,16 @@ async def admin_rerun():
                     "skipped_fresh": sum(int(v.get("skipped_fresh", 0) or 0) for v in tier_results.values() if isinstance(v, dict)),
                     "candidates": sum(int(v.get("candidates", 0) or 0) for v in tier_results.values() if isinstance(v, dict)),
                     "cost_estimate_usd": round(sum(float(v.get("cost_estimate_usd", 0) or 0) for v in tier_results.values() if isinstance(v, dict)), 4),
-                    "daily_total_usd": round(_daily_cost_usd, 4),
                 }
+                # Daily total reads from the cost_tracker snapshot — the
+                # SQLite-persisted authoritative figure (PR #62 follow-up
+                # 2026-04-27 removed the parallel process-local counter).
+                try:
+                    _snap = await _get_cost_tracker().snapshot()
+                    totals["daily_total_usd"] = round(float(_snap.get("total_usd") or 0.0), 4)
+                except Exception as exc:
+                    logger.warning("[PULSE] daily_total_usd snapshot failed: %s", exc)
+                    totals["daily_total_usd"] = 0.0
                 _ondemand_rerun_last_result = {
                     "ok": True,
                     "tiers": tier_results,
@@ -943,11 +951,20 @@ async def admin_rerun_status():
         # so two engine processes can't both blow past budget.
         "cost_today": cost_today,
         # Legacy cycle-only block. Kept for parity with the previous shape.
+        # `daily_total_usd` now mirrors cost_today.total_usd (the SQLite-
+        # persisted authoritative figure); `last_cycle_breakdown_usd`
+        # carries only the just-finished cycle's actual delta as a single
+        # `total_usd` field (per-bucket breakdown was removed when the
+        # legacy per-call coefficients went away — bucket-level cost
+        # arithmetic now lives inside `cost_tracker` per real
+        # response.usage tokens).
         "cost_telemetry": {
-            "day_utc": _daily_cost_day or _today_utc(),
-            "daily_total_usd": round(_daily_cost_usd, 4),
+            "day_utc": _last_cycle_cost_day or _today_utc(),
+            "daily_total_usd": round(float(cost_today.get("total_usd") or 0.0), 4),
             "last_cycle_calls": dict(_cycle_call_counts),
-            "last_cycle_breakdown_usd": _cycle_cost_breakdown(),
+            "last_cycle_breakdown_usd": {
+                "total_usd": round(_last_cycle_cost_usd, 4),
+            },
         },
     }
 
@@ -1447,8 +1464,12 @@ _cycle_call_counts: dict[str, int] = {
     "standings_haiku_websearch": 0,
     "rewrite_sonnet": 0,
 }
-_daily_cost_usd: float = 0.0
-_daily_cost_day: str = ""  # 'YYYY-MM-DD' UTC; resets the bucket on rollover
+# Last-cycle cost snapshot. Populated at end-of-cycle from the actual
+# delta in cost_tracker.today_total_usd() across the cycle, NOT from
+# legacy per-call estimates. Legacy estimates were removed 2026-04-27
+# after they leaked Sonnet rates into Haiku-only cycles (PR #62).
+_last_cycle_cost_usd: float = 0.0
+_last_cycle_cost_day: str = ""
 
 
 def _today_utc() -> str:
@@ -1466,55 +1487,18 @@ def _bump_cycle_counter(name: str, by: int = 1) -> None:
         _cycle_call_counts[name] += by
 
 
-def _accumulate_daily_cost(usd: float) -> None:
-    global _daily_cost_usd, _daily_cost_day
-    today = _today_utc()
-    if today != _daily_cost_day:
-        _daily_cost_day = today
-        _daily_cost_usd = 0.0
-    _daily_cost_usd += float(usd or 0.0)
+def _record_last_cycle_cost(usd: float) -> None:
+    """Stash the just-finished cycle's actual cost (from cost_tracker delta).
 
-
-def _cycle_cost_breakdown() -> dict[str, float]:
-    """Compute per-bucket USD cost from current cycle counters.
-
-    Uses env-knobbed per-call estimates from app.config — directional,
-    not billable. Real telemetry lives in Anthropic's usage API.
+    Read by /admin/rerun/status to fill the legacy `cost_telemetry`
+    block. The authoritative daily total lives in CostTracker (SQLite-
+    persisted); this is just a transient cycle echo.
     """
-    try:
-        from app.config import (
-            PULSE_COST_HAIKU_PER_CALL,
-            PULSE_COST_HAIKU_WEBSEARCH_PER_CALL,
-            PULSE_COST_SONNET_PER_CALL,
-        )
-    except Exception:
-        PULSE_COST_HAIKU_PER_CALL = 0.01
-        PULSE_COST_HAIKU_WEBSEARCH_PER_CALL = 0.025
-        PULSE_COST_SONNET_PER_CALL = 0.05
-    scout_usd = (
-        _cycle_call_counts.get("scout_haiku_websearch", 0)
-        * float(PULSE_COST_HAIKU_WEBSEARCH_PER_CALL)
-    )
-    storyline_usd = (
-        _cycle_call_counts.get("storyline_sonnet_websearch", 0)
-        * float(PULSE_COST_SONNET_PER_CALL)
-    )
-    verify_usd = (
-        _cycle_call_counts.get("standings_haiku_websearch", 0)
-        * float(PULSE_COST_HAIKU_WEBSEARCH_PER_CALL)
-    )
-    rewrite_usd = (
-        _cycle_call_counts.get("rewrite_sonnet", 0)
-        * float(PULSE_COST_SONNET_PER_CALL)
-    )
-    total = scout_usd + storyline_usd + verify_usd + rewrite_usd
-    return {
-        "scout_usd": round(scout_usd, 4),
-        "storylines_usd": round(storyline_usd, 4),
-        "verify_usd": round(verify_usd, 4),
-        "rewrite_usd": round(rewrite_usd, 4),
-        "total_usd": round(total, 4),
-    }
+    global _last_cycle_cost_usd, _last_cycle_cost_day
+    today = _today_utc()
+    if today != _last_cycle_cost_day:
+        _last_cycle_cost_day = today
+    _last_cycle_cost_usd = max(0.0, float(usd or 0.0))
 
 # Cross-tier mutex — the candidate engine sets a module-global
 # `candidate_engine` singleton during `_run_candidate_engine`, so two
@@ -1554,14 +1538,30 @@ async def _run_tier_once(tier: str) -> dict:
         if not tier_games:
             logger.info("[tier:%s] no fixtures in window", tier)
             return {"skipped": "no_fixtures"}
-        # Respect per-tier cap — sort by earliest kickoff so we always
-        # pick the most imminent within-window fixtures first.
-        tier_games = dict(
-            sorted(
-                tier_games.items(),
-                key=lambda kv: _parse_kickoff_to_epoch(kv[1].start_time or "") or 9e18,
-            )[:max_fixtures]
-        )
+        if tier == _TIER_HOT:
+            # Smart HOT-tier classifier: kickoff window, top-league
+            # allowlist, BB-enabled, capped by PULSE_TIER_HOT_MAX_FIXTURES.
+            # Each filter is kill-switchable (see app.config). Logs the
+            # funnel so we can see total -> eligible -> top.
+            from app.services.candidate_engine import classify_hot_fixtures
+            shortlist = classify_hot_fixtures(
+                list(tier_games.values()), now,
+            )
+            shortlist_ids = {g.id for g in shortlist}
+            tier_games = {gid: g for gid, g in tier_games.items() if gid in shortlist_ids}
+            # Preserve soonest-first ordering from the classifier.
+            tier_games = {
+                g.id: g for g in shortlist if g.id in tier_games
+            }
+        else:
+            # Respect per-tier cap — sort by earliest kickoff so we always
+            # pick the most imminent within-window fixtures first.
+            tier_games = dict(
+                sorted(
+                    tier_games.items(),
+                    key=lambda kv: _parse_kickoff_to_epoch(kv[1].start_time or "") or 9e18,
+                )[:max_fixtures]
+            )
         fixture_ids = list(tier_games.keys())
         logger.info(
             "[tier:%s] cycle start — %d fixtures (cap=%d)",
@@ -1570,6 +1570,16 @@ async def _run_tier_once(tier: str) -> dict:
         # Reset cycle cost-telemetry counters BEFORE any LLM calls fire.
         # End-of-cycle log + daily total read these.
         _reset_cycle_counters()
+        # Snapshot pre-cycle daily cost from the cost_tracker. The cycle
+        # cost is the post-cycle delta — actual recorded usage, not a
+        # per-call estimate. (Pre-PR-66 path multiplied counters by
+        # legacy per-call coefficients which leaked Sonnet rates; now
+        # gone.)
+        try:
+            _pre_cycle_cost_usd = await _get_cost_tracker().today_total_usd()
+        except Exception as exc:
+            logger.warning("[tier:%s] pre-cycle cost snapshot failed: %s", tier, exc)
+            _pre_cycle_cost_usd = 0.0
         # Reset storyline / standings counters (process-level in
         # storyline_detector). These survive across cycles otherwise.
         try:
@@ -1720,14 +1730,21 @@ async def _run_tier_once(tier: str) -> dict:
         if swept:
             logger.info("[tier:%s] swept %d replaced/orphaned cards", tier, swept)
         elapsed = _time.time() - t0
-        # Honest per-cycle cost: tally every Haiku/Sonnet call that
-        # actually fired during the cycle (scout, storylines, standings
-        # verify, rewriter Sonnet) using env-knobbed per-call estimates.
-        # Replaces the old per-scouted-fixture * $0.01 approximation,
-        # which undercounted by ignoring storylines + verify + rewriter.
-        cost = _cycle_cost_breakdown()
-        est_cost = cost["total_usd"]
-        _accumulate_daily_cost(est_cost)
+        # Honest per-cycle cost: post-cycle delta on cost_tracker.today_total_usd
+        # — every Haiku call site (scout, storyline scout, standings
+        # verify, rewriter, combined narrative) records actual usage via
+        # `cost_tracker.record_call` with cost computed from real
+        # response.usage tokens. The delta across this cycle is what
+        # actually got billed. Replaces the legacy per-call coefficient
+        # path (which leaked Sonnet rates after the Haiku 4.5 migration
+        # in PR #62).
+        try:
+            _post_cycle_cost_usd = await _get_cost_tracker().today_total_usd()
+        except Exception as exc:
+            logger.warning("[tier:%s] post-cycle cost snapshot failed: %s", tier, exc)
+            _post_cycle_cost_usd = _pre_cycle_cost_usd
+        est_cost = max(0.0, float(_post_cycle_cost_usd) - float(_pre_cycle_cost_usd))
+        _record_last_cycle_cost(est_cost)
         scouted_count = len(scouted_ids)
         skipped_count = len(skipped_fresh_ids)
         candidates_emitted = len(newly_emitted_ids)
@@ -1743,22 +1760,21 @@ async def _run_tier_once(tier: str) -> dict:
         except Exception:
             std_hits = std_misses = sl_hits = sl_misses = 0
         logger.info(
-            "[tier:%s] cycle: scouted=%d skipped_fresh=%d candidates=%d cost_estimate=$%.4f",
+            "[tier:%s] cycle: scouted=%d skipped_fresh=%d candidates=%d cost_actual=$%.4f",
             tier, scouted_count, skipped_count, candidates_emitted, est_cost,
         )
         logger.info(
-            "[cost] cycle total: scout=$%.4f storylines=$%.4f verify=$%.4f "
-            "rewrite=$%.4f total=$%.4f calls=(scout=%d storyline=%d verify=%d rewrite=%d) "
+            "[cost] cycle total: actual=$%.4f "
+            "calls=(scout=%d storyline=%d verify=%d rewrite=%d) "
             "standings_cache=(hit=%d miss=%d) storyline_cooldown=(hit=%d miss=%d) "
             "daily_total=$%.4f",
-            cost["scout_usd"], cost["storylines_usd"], cost["verify_usd"],
-            cost["rewrite_usd"], cost["total_usd"],
+            est_cost,
             _cycle_call_counts.get("scout_haiku_websearch", 0),
             _cycle_call_counts.get("storyline_sonnet_websearch", 0),
             _cycle_call_counts.get("standings_haiku_websearch", 0),
             _cycle_call_counts.get("rewrite_sonnet", 0),
             std_hits, std_misses, sl_hits, sl_misses,
-            _daily_cost_usd,
+            _post_cycle_cost_usd,
         )
         logger.info("[tier:%s] cycle finish in %.1fs", tier, elapsed)
         return {
@@ -1767,8 +1783,8 @@ async def _run_tier_once(tier: str) -> dict:
             "scouted": scouted_count,
             "skipped_fresh": skipped_count,
             "candidates": candidates_emitted,
-            "cost_estimate_usd": est_cost,
-            "cost_breakdown_usd": cost,
+            "cost_estimate_usd": round(est_cost, 4),
+            "cost_breakdown_usd": {"total_usd": round(est_cost, 4)},
             "calls": dict(_cycle_call_counts),
             "standings_cache": {"hits": std_hits, "misses": std_misses},
             "storyline_cooldown": {"hits": sl_hits, "misses": sl_misses},
