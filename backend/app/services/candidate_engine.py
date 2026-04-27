@@ -17,7 +17,7 @@ lives in main.py / a background task.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 from app.engine.candidate_builder import CandidateBuilder
 from app.engine.combo_builder import ComboBuilder
@@ -28,6 +28,201 @@ from app.models.schemas import Game
 from app.services.candidate_store import CandidateStore
 
 logger = logging.getLogger(__name__)
+
+
+# ── HOT-tier classifier ────────────────────────────────────────────────
+# Smart filter for the HOT tier (kickoff <6h). Replaces the previous
+# "first N by kickoff" heuristic. Cheap chain (no LLM):
+#
+#   1. Kickoff window: now + min_minutes < kickoff < now + max_hours
+#      (drops already-started fixtures and far-out ones).
+#   2. Top-league allowlist: league name matches one of the
+#      INTERNATIONAL_LEAGUE_PATTERNS in catalogue_loader. Soft —
+#      controlled by PULSE_HOT_TOP_LEAGUE_ONLY kill switch.
+#   3. BetBuilder-eligible: keep only fixtures with `IsBetBuilderEnabled=true`
+#      on the catalogue row. Soft — controlled by
+#      PULSE_HOT_REQUIRE_BB_ENABLED. Falls back to "pass" when the catalogue
+#      doesn't carry the flag (e.g. mock data) so we don't starve the tier.
+#   4. Cap at PULSE_TIER_HOT_MAX_FIXTURES, sorted by soonest kickoff first.
+#
+# Kept here (not a separate module) so the HOT tier loop can `from
+# app.services.candidate_engine import classify_hot_fixtures` without a
+# new file.
+
+def _kickoff_to_epoch(raw: str) -> Optional[float]:
+    """Parse catalogue_loader's kickoff string ("23 Apr 20:00 UTC") to unix ts.
+
+    Mirrors `_parse_kickoff_to_epoch` in main.py — kept inline so the
+    classifier doesn't import main.py (circular).
+    """
+    if not raw:
+        return None
+    try:
+        from datetime import datetime, timedelta, timezone
+        txt = raw.strip()
+        if txt.endswith(" UTC"):
+            txt = txt[:-4]
+        now = datetime.now(timezone.utc)
+        parsed = datetime.strptime(txt, "%d %b %H:%M").replace(
+            year=now.year, tzinfo=timezone.utc,
+        )
+        if (now - parsed) > timedelta(days=180):
+            parsed = parsed.replace(year=now.year + 1)
+        return parsed.timestamp()
+    except Exception:
+        return None
+
+
+def _is_top_league(league_name: str) -> bool:
+    """Return True if the league matches the international top-league allowlist."""
+    try:
+        from app.services.catalogue_loader import _league_matches
+        return _league_matches(league_name or "")
+    except Exception:
+        # Fallback hard-coded allowlist (matches catalogue_loader patterns).
+        n = (league_name or "").lower()
+        for p in (
+            "premier league", "english premier",
+            "laliga", "la liga",
+            "bundesliga",
+            "serie a",
+            "ligue 1",
+            "champions league", "europa league", "europa conference",
+        ):
+            if p in n:
+                return True
+        return False
+
+
+def _bb_enabled(fixture: Any) -> bool:
+    """Best-effort BetBuilder-enabled check on a fixture / catalogue row.
+
+    The Pulse Game model doesn't currently carry IsBetBuilderEnabled; the
+    flag, if surfaced, lives on a sibling dict-shaped catalogue row. Falls
+    back to True (don't filter out) when the flag is absent — we don't
+    want to starve the tier on legitimate data we just don't yet
+    annotate.
+    """
+    if isinstance(fixture, dict):
+        for key in ("IsBetBuilderEnabled", "is_bet_builder_enabled", "bb_enabled"):
+            if key in fixture:
+                return bool(fixture[key])
+        return True
+    for attr in ("IsBetBuilderEnabled", "is_bet_builder_enabled", "bb_enabled"):
+        if hasattr(fixture, attr):
+            return bool(getattr(fixture, attr))
+    return True
+
+
+def classify_hot_fixtures(
+    fixtures: list,
+    now_ts: float,
+    *,
+    min_kickoff_minutes: Optional[int] = None,
+    max_kickoff_hours: Optional[int] = None,
+    require_bb_enabled: Optional[bool] = None,
+    top_league_only: Optional[bool] = None,
+    max_fixtures: Optional[int] = None,
+) -> list:
+    """Filter a fixtures list down to HOT-tier-eligible candidates.
+
+    Reads defaults from `app.config` env knobs at call time so a Railway
+    env flip takes effect on the next cycle without redeploy. All knobs
+    are kill-switchable.
+
+    Returns: ordered list (soonest kickoff first), capped at
+    `PULSE_TIER_HOT_MAX_FIXTURES`.
+    """
+    try:
+        from app.config import (
+            PULSE_HOT_MAX_KICKOFF_HOURS,
+            PULSE_HOT_MIN_KICKOFF_MINUTES,
+            PULSE_HOT_REQUIRE_BB_ENABLED,
+            PULSE_HOT_TOP_LEAGUE_ONLY,
+            PULSE_TIER_HOT_MAX_FIXTURES,
+        )
+    except Exception:
+        PULSE_HOT_MIN_KICKOFF_MINUTES = 90
+        PULSE_HOT_MAX_KICKOFF_HOURS = 6
+        PULSE_HOT_REQUIRE_BB_ENABLED = True
+        PULSE_HOT_TOP_LEAGUE_ONLY = True
+        PULSE_TIER_HOT_MAX_FIXTURES = 5
+
+    min_min = int(
+        min_kickoff_minutes if min_kickoff_minutes is not None
+        else PULSE_HOT_MIN_KICKOFF_MINUTES
+    )
+    max_hr = int(
+        max_kickoff_hours if max_kickoff_hours is not None
+        else PULSE_HOT_MAX_KICKOFF_HOURS
+    )
+    require_bb = bool(
+        require_bb_enabled if require_bb_enabled is not None
+        else PULSE_HOT_REQUIRE_BB_ENABLED
+    )
+    top_only = bool(
+        top_league_only if top_league_only is not None
+        else PULSE_HOT_TOP_LEAGUE_ONLY
+    )
+    cap = int(
+        max_fixtures if max_fixtures is not None
+        else PULSE_TIER_HOT_MAX_FIXTURES
+    )
+
+    total = len(fixtures)
+    lower = float(now_ts) + (min_min * 60.0)
+    upper = float(now_ts) + (max_hr * 3600.0)
+
+    # 1. Kickoff window
+    in_window: list[tuple[float, Any]] = []
+    for f in fixtures:
+        # Game has `start_time` (str). Dict catalogue rows may carry
+        # `StartDate`/`kickoff_iso` instead — fail-soft.
+        ko_raw = (
+            getattr(f, "start_time", None)
+            or (f.get("start_time") if isinstance(f, dict) else None)
+            or (f.get("kickoff_iso") if isinstance(f, dict) else None)
+            or ""
+        )
+        ko = _kickoff_to_epoch(str(ko_raw or ""))
+        if ko is None:
+            continue
+        if ko <= lower or ko >= upper:
+            continue
+        in_window.append((ko, f))
+    after_window = len(in_window)
+
+    # 2. Top-league
+    after_league = in_window
+    if top_only:
+        after_league = []
+        for ko, f in in_window:
+            league = (
+                getattr(f, "broadcast", None)
+                or (f.get("broadcast") if isinstance(f, dict) else None)
+                or (f.get("league_name") if isinstance(f, dict) else None)
+                or (f.get("LeagueName") if isinstance(f, dict) else None)
+                or ""
+            )
+            if _is_top_league(str(league or "")):
+                after_league.append((ko, f))
+
+    # 3. BetBuilder-eligible
+    after_bb = after_league
+    if require_bb:
+        after_bb = [(ko, f) for ko, f in after_league if _bb_enabled(f)]
+
+    # 4. Sort + cap
+    after_bb.sort(key=lambda kv: kv[0])
+    eligible = [f for _, f in after_bb[:max(0, cap)]]
+
+    logger.info(
+        "[tier:HOT] classified — total=%d -> eligible=%d -> top=%d "
+        "(kickoff_window=%dm..%dh, top_league_only=%s, bb_enabled=%s)",
+        total, len(after_bb), len(eligible),
+        min_min, max_hr, str(top_only).lower(), str(require_bb).lower(),
+    )
+    return eligible
 
 
 class NewsIngesterLike(Protocol):

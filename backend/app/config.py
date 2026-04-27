@@ -358,10 +358,31 @@ PULSE_TIER_HOT_MIN_SECONDS = int(os.getenv("PULSE_TIER_HOT_MIN_SECONDS", "1800")
 PULSE_TIER_WARM_MIN_SECONDS = int(os.getenv("PULSE_TIER_WARM_MIN_SECONDS", "3600"))
 PULSE_TIER_COOL_MIN_SECONDS = int(os.getenv("PULSE_TIER_COOL_MIN_SECONDS", "21600"))
 PULSE_TIER_COLD_MIN_SECONDS = int(os.getenv("PULSE_TIER_COLD_MIN_SECONDS", "43200"))
-PULSE_TIER_HOT_MAX_FIXTURES = int(os.getenv("PULSE_TIER_HOT_MAX_FIXTURES", "10"))
+PULSE_TIER_HOT_MAX_FIXTURES = int(os.getenv("PULSE_TIER_HOT_MAX_FIXTURES", "5"))
 PULSE_TIER_WARM_MAX_FIXTURES = int(os.getenv("PULSE_TIER_WARM_MAX_FIXTURES", "10"))
 PULSE_TIER_COOL_MAX_FIXTURES = int(os.getenv("PULSE_TIER_COOL_MAX_FIXTURES", "6"))
 PULSE_TIER_COLD_MAX_FIXTURES = int(os.getenv("PULSE_TIER_COLD_MAX_FIXTURES", "4"))
+
+# ── HOT-tier classifier (smart fixture filter) ─────────────────────────
+# The HOT tier (kickoff <6h) used to scoop the first N fixtures by
+# kickoff time. The classifier narrows this to: (a) fixtures with
+# kickoff in a usable window (skip already-started, skip far-out),
+# (b) top-league only — see catalogue_loader.INTERNATIONAL_LEAGUE_PATTERNS,
+# (c) BetBuilder-eligible only (fail-soft if the catalogue row doesn't
+# carry the flag), (d) cap at PULSE_TIER_HOT_MAX_FIXTURES sorted by
+# soonest kickoff first. Filters are cheap (no LLM), each kill-switched.
+PULSE_HOT_MIN_KICKOFF_MINUTES = int(
+    os.getenv("PULSE_HOT_MIN_KICKOFF_MINUTES", "90")
+)
+PULSE_HOT_MAX_KICKOFF_HOURS = int(
+    os.getenv("PULSE_HOT_MAX_KICKOFF_HOURS", "6")
+)
+PULSE_HOT_REQUIRE_BB_ENABLED = os.getenv(
+    "PULSE_HOT_REQUIRE_BB_ENABLED", "true",
+).lower() == "true"
+PULSE_HOT_TOP_LEAGUE_ONLY = os.getenv(
+    "PULSE_HOT_TOP_LEAGUE_ONLY", "true",
+).lower() == "true"
 
 # Per-fixture candidate cap (applies inside PolicyLayer). Old implicit
 # default was 3; raising to 5 so high-conviction fixtures (Premier League
@@ -411,19 +432,14 @@ PULSE_STANDINGS_CACHE_TTL_SECONDS = int(
 )
 
 # ── Cycle cost telemetry ───────────────────────────────────────────────
-# Rough per-call USD cost estimates used for the end-of-cycle
-# `[cost] cycle total: ...` log line and the daily rolling cost in
-# /admin/rerun/status. Approximate but auditable — directional, not
-# billable. Real telemetry would come from Anthropic's usage API.
-PULSE_COST_HAIKU_PER_CALL = float(
-    os.getenv("PULSE_COST_HAIKU_PER_CALL", "0.01")
-)
-PULSE_COST_HAIKU_WEBSEARCH_PER_CALL = float(
-    os.getenv("PULSE_COST_HAIKU_WEBSEARCH_PER_CALL", "0.025")
-)
-PULSE_COST_SONNET_PER_CALL = float(
-    os.getenv("PULSE_COST_SONNET_PER_CALL", "0.05")
-)
+# Per-MTOKEN coefficients (HAIKU_INPUT/OUTPUT/CACHE_*) live in the
+# "Anthropic Haiku 4.5 published rates" block below. The legacy
+# per-call estimates (PULSE_COST_HAIKU_PER_CALL / PULSE_COST_SONNET_PER_CALL
+# / PULSE_COST_HAIKU_WEBSEARCH_PER_CALL) were removed 2026-04-27 — they
+# leaked Sonnet rates into the cycle-cost log after the Haiku 4.5
+# migration in PR #62 (e.g. `$0.275 / 5 calls = $0.055/call`). All cost
+# logging now reads actual recorded spend from `cost_tracker`, which
+# in turn computes cost from real `response.usage` token counts.
 
 # ── Daily LLM-spend tripwire (cost-aware redesign, 2026-04-26) ─────────
 # Hard kill at threshold. Engine self-pauses when today_total + projected

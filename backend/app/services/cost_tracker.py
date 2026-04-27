@@ -88,6 +88,61 @@ def today_utc() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
+def estimate_cost_from_usage(
+    response_usage: Any,
+    *,
+    web_search_count: int = 0,
+    cache_write_ttl: str = "5m",
+) -> float:
+    """Module-level helper — compute USD cost from an Anthropic usage block.
+
+    Mirrors `CostTracker.cost_from_usage` but uses the module-level
+    Haiku 4.5 default rates so callers without a tracker instance can
+    still produce an honest cost number from `response.usage` token
+    counts (input/output/cache_read/cache_creation) plus a
+    `web_search_count` add-on. The default-rates path is what every
+    Haiku call site uses post-PR #62.
+
+    `response_usage` may be the SDK's Usage object or a dict with the
+    same fields. Missing fields default to 0 — partial responses still
+    produce a sensible (lower-bound) cost.
+    """
+    if response_usage is None:
+        return 0.0
+
+    def _g(name: str) -> int:
+        if isinstance(response_usage, dict):
+            v = response_usage.get(name)
+        else:
+            v = getattr(response_usage, name, None)
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _g("input_tokens")
+    output_tokens = _g("output_tokens")
+    cache_read = _g("cache_read_input_tokens")
+    cache_write = _g("cache_creation_input_tokens")
+
+    cost = (
+        input_tokens * DEFAULT_HAIKU_INPUT_PER_MTOKEN_USD / 1_000_000.0
+        + output_tokens * DEFAULT_HAIKU_OUTPUT_PER_MTOKEN_USD / 1_000_000.0
+        + cache_read * DEFAULT_HAIKU_CACHE_READ_PER_MTOKEN_USD / 1_000_000.0
+    )
+    if cache_write:
+        rate = (
+            DEFAULT_HAIKU_CACHE_WRITE_1H_PER_MTOKEN_USD
+            if str(cache_write_ttl).lower() == "1h"
+            else DEFAULT_HAIKU_CACHE_WRITE_5M_PER_MTOKEN_USD
+        )
+        cost += cache_write * rate / 1_000_000.0
+    n_search = max(0, int(web_search_count or 0))
+    if n_search > 0:
+        cost += n_search * DEFAULT_WEBSEARCH_PER_CALL_USD
+    return cost
+
+
 class CostTracker:
     """Per-process daily-cost tracker backed by the candidate_store."""
 
