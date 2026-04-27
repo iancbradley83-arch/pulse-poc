@@ -257,6 +257,12 @@ async def _mint_and_stamp(card: Card) -> None:
 
 # ── Initialize services ──
 catalog = MarketCatalog()
+# CandidateStore is instantiated below at line ~496 (after CostTracker
+# import). FeedManager wants the store reference at construction time so
+# every `add_prematch_card(...)` snapshots the rendered Card for cold-
+# start rehydrate. Forward-declare the store via a deferred attribute on
+# the FeedManager: we set `feed._store = candidate_store` once the store
+# exists. Until then the snapshot hook is a no-op (store is None).
 feed = FeedManager()
 detector = EventDetector()
 resolver = EntityResolver()
@@ -496,6 +502,13 @@ from typing import Optional as _Optional
 candidate_store = CandidateStore(PULSE_DB_PATH)
 candidate_engine: _Optional[CandidateEngine] = None  # initialised in startup
 
+# Wire the snapshot hook on the live feed (PR fix/published-cards-snapshot).
+# Every subsequent `feed.add_prematch_card(card)` upserts a serialized
+# Card into `published_cards` so cold-start rehydrate can repopulate
+# without touching the catalog or LLM. Staging FeedManagers used by the
+# rerun loop also get the store wired below at construction time.
+feed._store = candidate_store
+
 # Daily-cost tripwire (cost-aware redesign, 2026-04-26). Tracks
 # accumulated USD spend per UTC day and short-circuits LLM calls when
 # the configured budget is exhausted. Constructed lazily on first
@@ -670,7 +683,27 @@ async def generate_prematch_cards():
     except Exception as exc:
         logger.exception("[PULSE] candidate_store.init failed at startup: %s", exc)
     if PULSE_DATA_SOURCE == "rogue":
+        # _load_rogue_prematch always pulls the Rogue catalog (free) and
+        # always tries to load operator-curated featured BBs (free Rogue
+        # call). The candidate engine inside it is gated on
+        # PULSE_NEWS_INGEST_ENABLED *and* PULSE_RERUN_ENABLED so a paused
+        # deploy never spends LLM money — see the gate comment inside
+        # _load_rogue_prematch.
         await _load_rogue_prematch()
+        # Rehydrate previously-published cards from the snapshot table.
+        # No catalog dependency, no LLM cost — pure JSON → pydantic. This
+        # is what PR #63 tried to do via _publish_loop and crash-looped
+        # because the catalog was empty during rehydrate; the snapshot
+        # carries every render field so this path never touches the
+        # catalog. Wrapped in a try/except: a rehydrate bug must NOT
+        # prevent the app from booting (PR #63's mistake → PR #64 revert).
+        try:
+            from app.services.feed_rehydrate import rehydrate_feed_from_snapshots
+            await rehydrate_feed_from_snapshots(candidate_store, feed)
+        except Exception:
+            logger.exception(
+                "[PULSE] rehydrate failed — feed may be sparse until next cycle"
+            )
         # Kick off the periodic rerun loop AFTER initial load completes.
         # The loop sleeps first, so it doesn't compete with the boot pass.
         import asyncio as _asyncio
@@ -740,7 +773,7 @@ async def _do_ondemand_rerun():
     global _ondemand_rerun_inflight, _ondemand_rerun_last_result
     t0 = time.time()
     try:
-        staging = FeedManager()
+        staging = FeedManager(store=candidate_store)
         staging.set_decorator(_attach_deep_link)
         await _load_rogue_prematch(target_feed=staging, is_rerun=True)
         new_cards = list(staging.prematch_cards)
@@ -1061,10 +1094,20 @@ async def _load_rogue_prematch(
         # Railway to stop ALL Anthropic-spending engine calls. Featured BBs
         # still load (no LLM). Useful when iterating without a demo, or
         # when the API key is bouncing on credits.
-        if not PULSE_NEWS_INGEST_ENABLED:
+        # Boot-scout kill-switch gate (PR fix/published-cards-snapshot,
+        # 2026-04-27). The engine path is gated on BOTH:
+        #   - PULSE_NEWS_INGEST_ENABLED  (existing cost guard)
+        #   - PULSE_RERUN_ENABLED        (new: full-pause kill switch)
+        # Either flipped to false skips the engine entirely. Catalog is
+        # already loaded above (free); featured BBs run below (free); a
+        # snapshot rehydrate runs in the startup hook so the feed stays
+        # populated across redeploys without any LLM call.
+        _rerun_enabled = os.getenv("PULSE_RERUN_ENABLED", "true").lower() == "true"
+        if not (PULSE_NEWS_INGEST_ENABLED and _rerun_enabled):
             logger.info(
-                "[PULSE] Candidate engine SKIPPED (PULSE_NEWS_INGEST_ENABLED=false). "
-                "Feed will show only featured BBs."
+                "[PULSE] engine paused (rerun=%s news_ingest=%s) — skipping boot scout",
+                str(_rerun_enabled).lower(),
+                str(bool(PULSE_NEWS_INGEST_ENABLED)).lower(),
             )
         else:
             # Real correlated BB + combo prices come from the same
@@ -1155,7 +1198,7 @@ async def _scheduled_rerun_loop():
         logger.info("[PULSE] Scheduled rerun starting…")
         # Build into a fresh staging FeedManager — atomic swap at end means
         # the visible feed never goes empty.
-        staging = FeedManager()
+        staging = FeedManager(store=candidate_store)
         staging.set_decorator(_attach_deep_link)
         try:
             await _load_rogue_prematch(target_feed=staging, is_rerun=True)

@@ -198,6 +198,31 @@ CREATE TABLE IF NOT EXISTS daily_cost (
     calls INTEGER NOT NULL DEFAULT 0,
     last_call_at REAL
 );
+
+-- Published-card snapshot table (PR fix/published-cards-snapshot,
+-- 2026-04-27). Each row is a fully-rendered Card serialized to JSON at
+-- the moment it lands in FeedManager. Cold-start rehydrate reads these
+-- rows directly so the feed survives a redeploy WITHOUT having to call
+-- the catalog or LLM again — which was PR #63's crash mode (catalog was
+-- empty during rehydrate, `catalog.get(...).market_type` AttributeErrored
+-- and crash-looped the app for 30 min). The snapshot carries every
+-- field the frontend needs (legs, market labels, deep_link, etc.) so the
+-- rehydrate path is pure JSON → pydantic, no network, no LLM cost.
+--
+-- Additive new table only — no changes to existing tables. `candidate_id`
+-- is nullable because featured BBs bypass the candidate_store (built at
+-- runtime in services/featured_bb.py).
+CREATE TABLE IF NOT EXISTS published_cards (
+    card_id TEXT PRIMARY KEY,
+    candidate_id TEXT,
+    snapshot_json TEXT NOT NULL,
+    snapshotted_at REAL NOT NULL,
+    expires_at REAL,
+    bet_type TEXT,
+    storyline_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_published_cards_expires ON published_cards(expires_at);
+CREATE INDEX IF NOT EXISTS idx_published_cards_storyline ON published_cards(storyline_id);
 """
 
 
@@ -1087,6 +1112,91 @@ class CandidateStore:
             ) as cur:
                 rows = await cur.fetchall()
         return {r["card_id"]: int(r["n"]) for r in rows}
+
+    # ── Published-card snapshots (cold-start rehydrate) ──
+
+    async def upsert_published_card(
+        self,
+        *,
+        card_id: str,
+        snapshot_json: str,
+        candidate_id: Optional[str] = None,
+        expires_at: Optional[float] = None,
+        bet_type: Optional[str] = None,
+        storyline_id: Optional[str] = None,
+    ) -> None:
+        """Persist a fully-rendered Card snapshot.
+
+        Idempotent on `card_id` (PRIMARY KEY) — repeated upserts of the
+        same card simply refresh `snapshotted_at`. Called on every
+        `feed.add_prematch_card(...)` so rehydrate after a redeploy can
+        read serialized Card JSON directly with no catalog dependency.
+        Best-effort: callers wrap this in a try/except so a snapshot
+        failure never blocks the publish path.
+        """
+        import time as _t
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO published_cards (
+                    card_id, candidate_id, snapshot_json, snapshotted_at,
+                    expires_at, bet_type, storyline_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    card_id,
+                    candidate_id,
+                    snapshot_json,
+                    _t.time(),
+                    expires_at,
+                    bet_type,
+                    storyline_id,
+                ),
+            )
+            await db.commit()
+
+    async def list_published_cards(
+        self, limit: int = 200,
+    ) -> list[tuple[str, str, Optional[float]]]:
+        """Return `(card_id, snapshot_json, expires_at)` rows ordered by
+        snapshotted_at DESC. Powers cold-start rehydrate."""
+        async with self._connect() as db:
+            async with db.execute(
+                """
+                SELECT card_id, snapshot_json, expires_at
+                FROM published_cards
+                ORDER BY snapshotted_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ) as cur:
+                rows = await cur.fetchall()
+        out: list[tuple[str, str, Optional[float]]] = []
+        for r in rows or []:
+            try:
+                exp = float(r[2]) if r[2] is not None else None
+            except (TypeError, ValueError):
+                exp = None
+            out.append((r[0], r[1], exp))
+        return out
+
+    async def delete_expired_published_cards(self, now_ts: float) -> int:
+        """Drop snapshot rows whose `expires_at` is in the past.
+
+        TTL sweeper hook — not wired into a periodic task in this PR,
+        but kept here so a future sweep loop can call it directly.
+        Rows with NULL expires_at never expire by this method.
+        """
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                DELETE FROM published_cards
+                WHERE expires_at IS NOT NULL AND expires_at < ?
+                """,
+                (float(now_ts),),
+            )
+            await db.commit()
+            return cur.rowcount or 0
 
 
 # ── Row <-> model helpers ──
