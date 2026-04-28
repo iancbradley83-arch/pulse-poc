@@ -38,9 +38,9 @@ def _make_game(
 ):
     """Build a minimal Game-shaped object the classifier can read.
 
-    The classifier reads `start_time` (formatted "23 Apr 20:00 UTC")
-    and `broadcast` (league name) from the fixture, plus an optional
-    `IsBetBuilderEnabled` attribute.
+    The classifier reads `start_time` (formatted "23 Apr 20:00 UTC"),
+    `broadcast` (league name), and `is_bet_builder_enabled` from the
+    fixture.
     """
     from app.models.schemas import Game, GameStatus, Sport, Team
 
@@ -56,11 +56,8 @@ def _make_game(
         broadcast=league,
         start_time=kickoff_dt.strftime("%d %b %H:%M UTC"),
         status=GameStatus.SCHEDULED,
+        is_bet_builder_enabled=bool(bb_enabled) if bb_enabled is not None else False,
     )
-    if bb_enabled is not None:
-        # Pydantic models are immutable by default; attach via __dict__
-        # since the classifier reads via getattr fallback.
-        object.__setattr__(g, "IsBetBuilderEnabled", bb_enabled)
     return g
 
 
@@ -225,10 +222,23 @@ def test_full_filter_chain_funnel():
             kickoff_dt=now_dt + timedelta(hours=3),
             bb_enabled=False,
         ),
-        # eligible
-        _make_game(fixture_id="g-eligible-1", kickoff_dt=now_dt + timedelta(hours=2)),
-        _make_game(fixture_id="g-eligible-2", kickoff_dt=now_dt + timedelta(hours=3)),
-        _make_game(fixture_id="g-eligible-3", kickoff_dt=now_dt + timedelta(hours=4)),
+        # eligible — bb_enabled=True now required since the filter is no
+        # longer fail-soft.
+        _make_game(
+            fixture_id="g-eligible-1",
+            kickoff_dt=now_dt + timedelta(hours=2),
+            bb_enabled=True,
+        ),
+        _make_game(
+            fixture_id="g-eligible-2",
+            kickoff_dt=now_dt + timedelta(hours=3),
+            bb_enabled=True,
+        ),
+        _make_game(
+            fixture_id="g-eligible-3",
+            kickoff_dt=now_dt + timedelta(hours=4),
+            bb_enabled=True,
+        ),
     ]
     out = classify_hot_fixtures(
         fixtures, now_ts,
