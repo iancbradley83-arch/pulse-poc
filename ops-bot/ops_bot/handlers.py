@@ -10,7 +10,9 @@ import logging
 import time
 from typing import Optional
 
-from aiogram import Router
+import re
+
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -30,6 +32,7 @@ from .formatting import (
     format_embed,
     format_logs,
     format_env_var,
+    _team_name,
 )
 from .feed_audit import build_feed_summary, get_page
 from .pulse_client import PulseClient, PulseError
@@ -216,6 +219,22 @@ async def cmd_feed(message: Message) -> None:
     await message.answer(text)
 
 
+async def _do_cards(message: Message, page: int) -> None:
+    """Shared body for /cards, /cards N, /cards_N."""
+    feed_data = None
+    try:
+        feed_data = await _pulse_client.feed()
+    except PulseError as exc:
+        logger.warning("cards: fetch failed: %s", exc)
+        await message.answer("(Pulse unreachable)")
+        return
+
+    cards = feed_data.get("cards", [])
+    page_cards, total_pages = get_page(cards, page)
+    out = format_feed_page(page_cards, page, total_pages, len(cards))
+    await message.answer(out)
+
+
 @router.message(Command("cards"))
 async def cmd_cards(message: Message) -> None:
     """/cards [page] — paginated card list (5 per page)."""
@@ -230,19 +249,23 @@ async def cmd_cards(message: Message) -> None:
         except ValueError:
             await message.answer("usage: /cards [page]  — page must be a number")
             return
+    await _do_cards(message, page)
 
-    feed_data = None
-    try:
-        feed_data = await _pulse_client.feed()
-    except PulseError as exc:
-        logger.warning("cards: fetch failed: %s", exc)
-        await message.answer("(Pulse unreachable)")
+
+# Telegram makes /cards_2-style tokens tappable as commands. Match them via
+# a regex on message.text since aiogram's Command filter doesn't accept the
+# underscore-suffix form.
+_CARDS_UNDERSCORE_RE = re.compile(r"^/cards_(\d+)(?:@\w+)?(?:\s|$)")
+
+
+@router.message(F.text.regexp(_CARDS_UNDERSCORE_RE))
+async def cmd_cards_underscore(message: Message) -> None:
+    """Match /cards_2, /cards_3, etc. — tappable pagination from the footer."""
+    m = _CARDS_UNDERSCORE_RE.match(message.text or "")
+    if not m:
         return
-
-    cards = feed_data.get("cards", [])
-    page_cards, total_pages = get_page(cards, page)
-    out = format_feed_page(page_cards, page, total_pages, len(cards))
-    await message.answer(out)
+    page = int(m.group(1)) or 1
+    await _do_cards(message, page)
 
 
 # ---------------------------------------------------------------------------
@@ -268,13 +291,15 @@ async def cmd_card(message: Message) -> None:
         rows = []
         for c in cards:
             cid = (c.get("id") or "")[:8]
+            hook = c.get("hook_type") or c.get("bet_type") or "?"
             game = c.get("game") or {}
-            home = game.get("home_team") or game.get("home") or ""
-            away = game.get("away_team") or game.get("away") or ""
-            rows.append(f"  {cid}  {home} vs {away}".rstrip())
+            home = _team_name(game.get("home_team") or game.get("home"))
+            away = _team_name(game.get("away_team") or game.get("away"))
+            game_str = f"{home} vs {away}" if home != "?" or away != "?" else ""
+            rows.append(f"  {cid}  {hook}  {game_str}".rstrip())
         body = "\n".join(rows)
         await message.answer(
-            f"usage: /card <id>\n\nrecent cards:\n{body}\n\nor see /cards for the full list"
+            f"usage: /card <id>\n\nrecent cards:\n{body}\n\nor /cards for the full list"
         )
         return
 
