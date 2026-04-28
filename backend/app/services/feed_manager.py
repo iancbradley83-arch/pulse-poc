@@ -4,10 +4,64 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
+from typing import Optional
+
 from app.models.schemas import Card, CardType
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_kickoff_to_epoch(raw: str) -> Optional[float]:
+    """Parse catalogue_loader's formatted kickoff string into a unix ts.
+
+    Mirrors `_parse_kickoff_to_epoch` in app/main.py — duplicated here to
+    avoid pulling main into feed_manager's import graph (main imports
+    feed_manager). Input shape: "23 Apr 20:00 UTC". Missing year — fill
+    with the current UTC year, bump forward a year if the result lands
+    >6 months in the past (Dec fixture viewed from Jan).
+    """
+    if not raw:
+        return None
+    try:
+        from datetime import datetime, timezone, timedelta
+        txt = raw.strip()
+        if txt.endswith(" UTC"):
+            txt = txt[:-4]
+        now = datetime.now(timezone.utc)
+        parsed = datetime.strptime(txt, "%d %b %H:%M").replace(
+            year=now.year, tzinfo=timezone.utc,
+        )
+        if (now - parsed) > timedelta(days=180):
+            parsed = parsed.replace(year=now.year + 1)
+        return parsed.timestamp()
+    except Exception:
+        return None
+
+
+def _derive_expires_at(card: Card, *, now: float) -> float:
+    """Compute the snapshot expiry timestamp for a published card.
+
+    Primary path: `kickoff + PULSE_POSTKICKOFF_TTL_SECONDS` (default 1h
+    post-kickoff). The /api/feed endpoint filters out cards past kickoff
+    plus a small grace window anyway, so persisting beyond this just
+    wastes disk + memory.
+
+    Fallback when `game.start_time` is missing or unparseable:
+    `now + PULSE_CARD_TTL_SECONDS` (default 6h) — matches the in-memory
+    feed sweep so storage and feed stay in lockstep.
+    """
+    post_ttl = int(os.getenv("PULSE_POSTKICKOFF_TTL_SECONDS", "3600") or "3600")
+    fallback_ttl = int(os.getenv("PULSE_CARD_TTL_SECONDS", "21600") or "21600")
+    try:
+        raw_kickoff = getattr(getattr(card, "game", None), "start_time", "") or ""
+    except Exception:
+        raw_kickoff = ""
+    ko = _parse_kickoff_to_epoch(raw_kickoff)
+    if ko is not None:
+        return float(ko) + float(post_ttl)
+    return float(now) + float(fallback_ttl)
 
 
 class FeedManager:
@@ -74,11 +128,24 @@ class FeedManager:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 loop = None
+            # Always stamp expires_at on insert. Prefer the kickoff-based
+            # value (card useful for ~1h after kickoff for live engagement,
+            # then stale and filtered out of /api/feed). Falls back to
+            # `now + PULSE_CARD_TTL_SECONDS` when the kickoff string can't
+            # be parsed, matching the in-memory feed sweep so storage stays
+            # in sync with the feed. Without this, every row landed with
+            # NULL expires_at and the TTL sweep wired in PR #92 dropped
+            # zero rows on every boot.
+            card_expires_at = getattr(decorated, "expires_at", None)
+            if not card_expires_at:
+                card_expires_at = _derive_expires_at(
+                    decorated, now=time.time()
+                )
             coro = self._store.upsert_published_card(
                 card_id=decorated.id,
                 snapshot_json=snapshot_json,
                 candidate_id=getattr(decorated, "candidate_id", None),
-                expires_at=getattr(decorated, "expires_at", None),
+                expires_at=card_expires_at,
                 bet_type=getattr(decorated, "bet_type", None),
                 storyline_id=getattr(decorated, "storyline_id", None),
             )
