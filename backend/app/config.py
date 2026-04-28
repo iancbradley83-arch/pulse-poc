@@ -88,6 +88,33 @@ PULSE_HOOK_VARIETY_GUARD_ENABLED = os.getenv(
     "PULSE_HOOK_VARIETY_GUARD_ENABLED", "true",
 ).lower() == "true"
 
+# Publish-everything-paid-for kill switch (2026-04-28, item 1 in
+# docs/follow-ups-from-ops-session-2026-04-28.md).
+#
+# Today's evidence: engine generated 13 unique cards (LLM cost paid for
+# every one) but only 11 made it into /api/feed. The leak was the
+# feed-ranker `_dedupe_by_fixture_market` filter — when a fixture has
+# both a single and a BB whose first leg sits on the same `market_type`,
+# the ranker drops the lower-scored one at every /api/feed render. Cards
+# stay in `feed.prematch_cards` but are never visible to the user. We've
+# already paid the LLM cost; hiding the output is pure waste.
+#
+# Default behaviour (this var unset / false): every card we paid LLM
+# cost for is visible in the feed until kickoff or TTL expiry. Pruning
+# is a NO-OP. Same-fixture+same-market_type dedupe is downgraded so
+# both cards survive (sorting still favours the higher-scored one).
+#
+# Kill switch (`PULSE_PRUNE_PAID_CARDS=true`): restores prior pruning
+# (drop the lower-scored same-fixture+same-market card). Use ONLY if
+# audience signal shows pruning improves engagement.
+#
+# Correctness rules (kickoff-passed drops, suspended drops, sort order,
+# variety guards) are NOT gated — those are not pruning, they're feed
+# hygiene the user actually wants.
+PULSE_PRUNE_PAID_CARDS = os.getenv(
+    "PULSE_PRUNE_PAID_CARDS", "false",
+).lower() == "true"
+
 # ── Per-hook BB/single preference (supply policy) ──────────────────────
 # Optional JSON override of the hardcoded `HOOK_BET_TYPE_PREFERENCE` dict
 # in `engine/news_scorer.py`. Keys are HookType enum values (strings like
