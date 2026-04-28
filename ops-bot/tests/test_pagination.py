@@ -23,17 +23,14 @@ def test_page_1_of_n_shows_footer():
     cards = _cards(10)
     text = format_feed_page(cards[:5], page=1, total_pages=2, total_cards=10)
     assert "page 1 of 2" in text
-    assert "10 cards total" in text
+    assert "10 cards" in text
 
 
 def test_last_page_partial():
     cards = _cards(3)
     text = format_feed_page(cards, page=2, total_pages=2, total_cards=8)
     assert "page 2 of 2" in text
-    assert "8 cards total" in text
-    # 3 card rows + empty line + footer
-    lines = [l for l in text.split("\n") if l.strip()]
-    assert len(lines) == 4  # 3 cards + footer
+    assert "8 cards" in text
 
 
 def test_out_of_range_page_message():
@@ -42,26 +39,82 @@ def test_out_of_range_page_message():
     assert "2 page" in text
 
 
-def test_card_row_contains_id_prefix():
+def test_card_block_contains_id_prefix():
     cards = _cards(1)
     text = format_feed_page(cards, page=1, total_pages=1, total_cards=1)
-    # id is abcdefgh00 — first 8 chars = abcdefgh
-    assert "abcdefgh" in text
+    # id is abcdefgh00 — first 8 chars = abcdefgh, wrapped in [ ]
+    assert "[abcdefgh]" in text
 
 
-def test_narrative_truncated_at_60():
-    long_narrative = "A" * 80
+def test_narrative_truncated_at_word_boundary():
+    long_narrative = (
+        "Saka starts in Madrid; Arsenal's width reopens against a "
+        "back four that has conceded twice in the past three games "
+        "across all competitions, with substitutions tactical."
+    )
     cards = [
         {
             "id": "abc12345",
             "hook_type": "news",
-            "game": {"league": {"name": "La Liga"}},
+            "game": {
+                "home_team": "Arsenal",
+                "away_team": "Real Madrid",
+                "league": {"name": "Champions League"},
+            },
             "narrative_hook": long_narrative,
             "total_odds": 1.95,
         }
     ]
     text = format_feed_page(cards, page=1, total_pages=1, total_cards=1)
-    # Should contain truncated narrative with ellipsis
-    assert "..." in text
-    # The full 80-char string should not appear
+    # Should contain ellipsis (…) marker on truncation
+    assert "…" in text
+    # The full long narrative should not appear verbatim
     assert long_narrative not in text
+
+
+def test_block_includes_game_and_league_lines():
+    cards = [
+        {
+            "id": "abc12345",
+            "hook_type": "tactical",
+            "game": {
+                "home_team": "PSG",
+                "away_team": "Bayern Munich",
+                "league": {"name": "Champions League"},
+            },
+            "narrative_hook": "Short narrative",
+            "total_odds": 4.10,
+        }
+    ]
+    text = format_feed_page(cards, page=1, total_pages=1, total_cards=1)
+    assert "PSG vs Bayern Munich" in text
+    assert "Champions League" in text
+
+
+def test_no_price_renders_as_no_price():
+    cards = [
+        {
+            "id": "abc12345",
+            "hook_type": "news",
+            "game": {"home_team": "Arsenal", "away_team": "Real Madrid"},
+            "narrative_hook": "test",
+            "total_odds": None,
+        }
+    ]
+    text = format_feed_page(cards, page=1, total_pages=1, total_cards=1)
+    assert "no price" in text
+
+
+def test_suspended_card_flagged():
+    cards = [
+        {
+            "id": "abc12345",
+            "hook_type": "tactical",
+            "game": {"home_team": "Arsenal", "away_team": "Real Madrid"},
+            "narrative_hook": "test",
+            "total_odds": 2.0,
+            "suspended": True,
+        }
+    ]
+    text = format_feed_page(cards, page=1, total_pages=1, total_cards=1)
+    assert "[SUSPENDED]" in text
