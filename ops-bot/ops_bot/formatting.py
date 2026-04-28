@@ -297,25 +297,86 @@ def format_feed_audit(summary: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _team_name(team: Any) -> str:
+    """Extract a usable string from a team field that may be dict-or-string."""
+    if isinstance(team, dict):
+        return team.get("name") or team.get("short_name") or "?"
+    return str(team) if team else "?"
+
+
+def _truncate_at_word(text: str, max_len: int) -> str:
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    cut = text[: max_len - 1]
+    space = cut.rfind(" ")
+    if space > max_len * 0.6:
+        cut = cut[:space]
+    return cut.rstrip(" ,;.") + "…"
+
+
+def _card_block(card: Dict[str, Any]) -> str:
+    """Render a single feed card as a 3- to 4-line block, phone-readable."""
+    cid = (card.get("id") or "")[:8] or "????????"
+    hook = card.get("hook_type") or card.get("bet_type") or "?"
+
+    odds = card.get("total_odds")
+    odds_str = f"{odds:.2f}" if odds is not None else "no price"
+
+    suspended = card.get("suspended", False)
+    flag = "  [SUSPENDED]" if suspended else ""
+
+    game = card.get("game") or {}
+    home = _team_name(game.get("home_team") or game.get("home"))
+    away = _team_name(game.get("away_team") or game.get("away"))
+    league_obj = game.get("league") or {}
+    league = (
+        (league_obj.get("name") if isinstance(league_obj, dict) else None)
+        or card.get("league")
+        or game.get("league_name")
+        or ""
+    )
+    game_line = f"{home} vs {away}"
+    if league:
+        game_line += f" · {league}"
+
+    narrative = (card.get("narrative_hook") or card.get("headline") or "").strip()
+    narrative = _truncate_at_word(narrative, 110)
+
+    lines = [
+        f"[{cid}] · {hook} · {odds_str}{flag}",
+        game_line,
+    ]
+    if narrative:
+        lines.append(narrative)
+    return "\n".join(lines)
+
+
 def format_feed_page(
     cards: List[Dict[str, Any]],
     page: int,
     total_pages: int,
     total_cards: int,
 ) -> str:
-    """Format a single page of feed cards."""
-    from .feed_audit import _card_row  # local import to avoid circular
-
+    """Format a single page of feed cards as multi-line blocks separated by blank lines."""
     if not cards:
         return f"no such page (feed has {total_pages} page(s))"
 
-    lines: List[str] = []
-    for card in cards:
-        lines.append(_card_row(card))
+    blocks = [_card_block(c) for c in cards]
+    body = "\n\n".join(blocks)
 
-    lines.append("")
-    lines.append(f"page {page} of {total_pages}  ({total_cards} cards total)")
-    return "\n".join(lines)
+    # Footer with tappable nav commands (Telegram makes /commands in message
+    # text tappable on iOS / Android / desktop).
+    nav_parts: List[str] = []
+    if page > 1:
+        nav_parts.append(f"prev: /cards {page - 1}")
+    nav_parts.append(f"page {page} of {total_pages}")
+    if page < total_pages:
+        nav_parts.append(f"next: /cards {page + 1}")
+    nav = "  ·  ".join(nav_parts)
+
+    footer = f"\n\n— {nav} —\n{total_cards} cards in feed · /card <id> for detail"
+    return body + footer
 
 
 # ---------------------------------------------------------------------------
@@ -331,17 +392,17 @@ def format_card_detail(card: Dict[str, Any]) -> str:
     lines.append(f"Card {card_id[:8]} — {bet_type}")
 
     game = card.get("game") or {}
-    home = game.get("home_team") or game.get("home") or ""
-    away = game.get("away_team") or game.get("away") or ""
+    home = _team_name(game.get("home_team") or game.get("home"))
+    away = _team_name(game.get("away_team") or game.get("away"))
     league_obj = game.get("league") or {}
     league = (
-        league_obj.get("name")
+        (league_obj.get("name") if isinstance(league_obj, dict) else None)
         or card.get("league")
         or game.get("league_name")
         or ""
     )
     kickoff = game.get("kickoff_time") or game.get("start_time") or ""
-    if home or away:
+    if home != "?" or away != "?":
         game_line = f"Game: {home} vs {away}"
         if league or kickoff:
             parts = []
