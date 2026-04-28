@@ -20,6 +20,7 @@ from app.models.news import (
     BetType,
     CandidateCard,
     CandidateStatus,
+    Embed,
     HookType,
     NewsItem,
     StorylineItem,
@@ -223,6 +224,28 @@ CREATE TABLE IF NOT EXISTS published_cards (
 );
 CREATE INDEX IF NOT EXISTS idx_published_cards_expires ON published_cards(expires_at);
 CREATE INDEX IF NOT EXISTS idx_published_cards_storyline ON published_cards(storyline_id);
+
+-- Per-operator embed contract (PR feat/embed-token-contract, 2026-04-28).
+-- One row per operator-environment. The widget loaded inside an operator
+-- iframe sends `embed_token` on every /api/feed request; the
+-- verify_embed_token middleware looks the token up here, checks `active`,
+-- and verifies the request's Origin / Referer host matches one of
+-- `allowed_origins`. Plain opaque tokens — NOT JWT, NOT OAuth.
+--
+-- `theme_overrides` is provisioned for wave 4 (CSS-vars per brand) but
+-- not consumed yet — the column persists whatever the admin form posts.
+CREATE TABLE IF NOT EXISTS embeds (
+    token TEXT PRIMARY KEY,
+    slug TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    allowed_origins TEXT NOT NULL,    -- JSON list of host patterns; "*.foo.com" wildcard supported
+    theme_overrides TEXT,             -- nullable JSON map; wave-4 reserved
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,         -- ISO-8601 UTC
+    notes TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_embeds_slug ON embeds(slug);
+CREATE INDEX IF NOT EXISTS idx_embeds_active ON embeds(active);
 """
 
 
@@ -366,6 +389,14 @@ class CandidateStore:
             # executescript(_SCHEMA) call below when missing. Probe exists
             # so the next drift has a landing spot.
             _ = _rc_cols
+
+            # embeds migration (PR feat/embed-token-contract, 2026-04-28).
+            # Additive new table; probe exists so future column additions
+            # have a landing spot. CREATE TABLE IF NOT EXISTS in
+            # executescript below handles first-run install.
+            async with db.execute("PRAGMA table_info(embeds)") as cur:
+                _embed_cols = {row[1] for row in await cur.fetchall()}
+            _ = _embed_cols
 
             await db.executescript(_SCHEMA)
             await db.commit()
@@ -1180,6 +1211,181 @@ class CandidateStore:
             out.append((r[0], r[1], exp))
         return out
 
+    # ── Embeds (per-operator widget registration) ──
+
+    async def list_embeds(self, active_only: bool = False) -> list[Embed]:
+        """All embeds, newest-first by created_at. `active_only` drops
+        soft-deleted rows."""
+        sql = "SELECT * FROM embeds"
+        args: list[Any] = []
+        if active_only:
+            sql += " WHERE active = 1"
+        sql += " ORDER BY created_at DESC"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, args) as cur:
+                rows = await cur.fetchall()
+        return [_row_to_embed(r) for r in rows]
+
+    async def get_embed_by_token(self, token: str) -> Optional[Embed]:
+        """Lookup by primary-key token. Returns inactive rows too — the
+        middleware checks `.active` itself so a clear 401 reason is
+        possible. None on miss."""
+        if not token:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM embeds WHERE token = ?", (token,),
+            ) as cur:
+                row = await cur.fetchone()
+        return _row_to_embed(row) if row else None
+
+    async def get_embed_by_slug(self, slug: str) -> Optional[Embed]:
+        """Lookup by the human-handle slug. None on miss."""
+        if not slug:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM embeds WHERE slug = ?", (slug,),
+            ) as cur:
+                row = await cur.fetchone()
+        return _row_to_embed(row) if row else None
+
+    async def create_embed(
+        self,
+        *,
+        slug: str,
+        display_name: str,
+        allowed_origins: list[str],
+        token: Optional[str] = None,
+        theme_overrides: Optional[dict] = None,
+        notes: Optional[str] = None,
+        active: bool = True,
+    ) -> Embed:
+        """Insert a new embed row. Auto-generates a token if not supplied.
+
+        Raises sqlite3.IntegrityError on slug collision (UNIQUE index).
+        Caller surfaces the conflict — we don't swallow it here so the
+        admin form can render a clear "slug already exists" message.
+        """
+        import secrets as _secrets
+        from datetime import datetime, timezone
+        tok = token or _secrets.token_urlsafe(32)
+        created_at = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+        embed = Embed(
+            token=tok,
+            slug=slug,
+            display_name=display_name,
+            allowed_origins=list(allowed_origins or []),
+            theme_overrides=dict(theme_overrides or {}),
+            active=bool(active),
+            created_at=created_at,
+            notes=notes,
+        )
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO embeds (
+                    token, slug, display_name, allowed_origins,
+                    theme_overrides, active, created_at, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _embed_to_row(embed),
+            )
+            await db.commit()
+        return embed
+
+    async def update_embed(self, slug: str, **fields: Any) -> Embed:
+        """Patch an embed row in place. Only the keys present in `fields`
+        are touched. Returns the refreshed row.
+
+        Supported keys: display_name, allowed_origins, theme_overrides,
+        active, notes, token. Unknown keys are silently ignored.
+        """
+        existing = await self.get_embed_by_slug(slug)
+        if existing is None:
+            raise KeyError(f"embed slug not found: {slug!r}")
+        allowed = {
+            "display_name", "allowed_origins", "theme_overrides",
+            "active", "notes", "token",
+        }
+        sets: list[str] = []
+        args: list[Any] = []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            if key == "allowed_origins":
+                sets.append("allowed_origins = ?")
+                args.append(json.dumps(list(value or [])))
+            elif key == "theme_overrides":
+                sets.append("theme_overrides = ?")
+                args.append(json.dumps(dict(value or {})))
+            elif key == "active":
+                sets.append("active = ?")
+                args.append(1 if bool(value) else 0)
+            else:
+                sets.append(f"{key} = ?")
+                args.append(value)
+        if not sets:
+            return existing
+        args.append(slug)
+        async with self._connect() as db:
+            await db.execute(
+                f"UPDATE embeds SET {', '.join(sets)} WHERE slug = ?",
+                args,
+            )
+            await db.commit()
+        refreshed = await self.get_embed_by_slug(slug)
+        assert refreshed is not None
+        return refreshed
+
+    async def rotate_embed_token(self, slug: str) -> Embed:
+        """Generate a fresh urlsafe token for an embed. Old token is
+        invalidated immediately because token is the primary key."""
+        import secrets as _secrets
+        existing = await self.get_embed_by_slug(slug)
+        if existing is None:
+            raise KeyError(f"embed slug not found: {slug!r}")
+        new_token = _secrets.token_urlsafe(32)
+        # Token is the PK so we can't UPDATE it cleanly across rows; do
+        # delete + insert in a single connection so we don't leave the
+        # row missing if a crash hits between statements.
+        from datetime import datetime, timezone  # noqa — used by created_at preserve
+        async with self._connect() as db:
+            await db.execute("DELETE FROM embeds WHERE slug = ?", (slug,))
+            new_embed = Embed(
+                token=new_token,
+                slug=existing.slug,
+                display_name=existing.display_name,
+                allowed_origins=existing.allowed_origins,
+                theme_overrides=existing.theme_overrides,
+                active=existing.active,
+                created_at=existing.created_at,
+                notes=existing.notes,
+            )
+            await db.execute(
+                """
+                INSERT INTO embeds (
+                    token, slug, display_name, allowed_origins,
+                    theme_overrides, active, created_at, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _embed_to_row(new_embed),
+            )
+            await db.commit()
+        return new_embed
+
+    async def soft_delete_embed(self, slug: str) -> None:
+        """Set active=0. Row stays in the DB so the admin page can show
+        history; middleware rejects inactive tokens."""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE embeds SET active = 0 WHERE slug = ?", (slug,),
+            )
+            await db.commit()
+
     async def delete_expired_published_cards(self, now_ts: float) -> int:
         """Drop snapshot rows whose `expires_at` is in the past.
 
@@ -1321,6 +1527,58 @@ def _row_to_storyline(row: aiosqlite.Row) -> StorylineItem:
         headline_hint=row["summary"] or "",
         participants=participants,
         detected_at=row["generated_at"] or 0.0,
+    )
+
+
+def _embed_to_row(embed: Embed) -> tuple:
+    """Pydantic Embed → SQLite row tuple. Mirrors the column order in the
+    INSERT statements in `create_embed` / `rotate_embed_token`."""
+    return (
+        embed.token,
+        embed.slug,
+        embed.display_name,
+        json.dumps(list(embed.allowed_origins or [])),
+        json.dumps(dict(embed.theme_overrides or {})) if embed.theme_overrides else None,
+        1 if embed.active else 0,
+        embed.created_at,
+        embed.notes,
+    )
+
+
+def _row_to_embed(row: aiosqlite.Row) -> Embed:
+    """SQLite row → Embed. Tolerant of NULL/blank JSON columns."""
+    def _get(col, default=None):
+        try:
+            return row[col]
+        except (IndexError, KeyError):
+            return default
+    raw_origins = _get("allowed_origins")
+    origins: list[str] = []
+    if raw_origins:
+        try:
+            parsed = json.loads(raw_origins)
+            if isinstance(parsed, list):
+                origins = [str(x) for x in parsed if isinstance(x, str)]
+        except Exception:
+            origins = []
+    raw_theme = _get("theme_overrides")
+    theme: dict = {}
+    if raw_theme:
+        try:
+            parsed = json.loads(raw_theme)
+            if isinstance(parsed, dict):
+                theme = parsed
+        except Exception:
+            theme = {}
+    return Embed(
+        token=row["token"] or "",
+        slug=row["slug"] or "",
+        display_name=row["display_name"] or "",
+        allowed_origins=origins,
+        theme_overrides=theme,
+        active=bool(row["active"]),
+        created_at=row["created_at"] or "",
+        notes=_get("notes"),
     )
 
 

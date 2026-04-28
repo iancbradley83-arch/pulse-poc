@@ -205,3 +205,26 @@ class CandidateCard(BaseModel):
     # disabled or the mint call failed (caller falls back to the PR #36
     # selectionId URL).
     bscode: Optional[str] = None
+
+
+class Embed(BaseModel):
+    """Per-operator embed registration record.
+
+    Backs the `embeds` SQLite table. One row per operator-environment
+    (e.g. Apuesta Total Peru). The widget loaded inside the operator's
+    iframe presents the `token` on every /api/feed request; the
+    embed-token middleware verifies (a) the token matches an active
+    row and (b) the request's Origin (or Referer fallback) host
+    matches one of `allowed_origins`.
+
+    Wave 4 will consume `theme_overrides` (JSON map of brand colours /
+    typography). For now we just persist whatever the admin form posts.
+    """
+    token: str                                                # urlsafe, 32+ chars (PRIMARY KEY)
+    slug: str                                                 # human handle, e.g. "apuesta-total"
+    display_name: str                                         # rendered in /admin/embeds
+    allowed_origins: list[str] = Field(default_factory=list)  # ["*.example.com", "operator.com", "localhost"]
+    theme_overrides: dict = Field(default_factory=dict)       # wave-4 reserved (CSS vars)
+    active: bool = True
+    created_at: str = ""                                      # ISO-8601 UTC string
+    notes: Optional[str] = None

@@ -524,3 +524,25 @@ PULSE_DEEPLINK_TEMPLATE_BSCODE_DIRECT = os.getenv(
     "PULSE_DEEPLINK_TEMPLATE_BSCODE_DIRECT",
     "{kmianko_base}{spbkv3_path}?bscode={bscode}",
 )
+
+# ── Embed token + domain allowlist (PR feat/embed-token-contract) ──────
+# Per-operator widget gate. The /api/feed (and /api/feed/*) routes accept
+# an `embed_token` query param OR an X-Pulse-Embed-Token header; the
+# backend looks the token up in the `embeds` table and verifies the
+# request's Origin (or Referer fallback) host matches the embed's
+# `allowed_origins` list. /admin/embeds is the inspector + form-based
+# CRUD surface.
+#
+# Kill switch defaults to OFF (false) so the live widget keeps working
+# through the cutover. Flip to "true" on Railway after Apuesta Total has
+# the seeded token wired into their iframe; no redeploy needed.
+PULSE_EMBED_TOKEN_REQUIRED = os.getenv(
+    "PULSE_EMBED_TOKEN_REQUIRED", "false",
+).lower() == "true"
+
+# Reserved for a future TTL-based token expiry. 0 = never expire (current
+# behaviour). Knob is wired so wave-2 can introduce expiry without a
+# config-shape change.
+PULSE_EMBED_DEFAULT_TTL_SECONDS = int(
+    os.getenv("PULSE_EMBED_DEFAULT_TTL_SECONDS", "0")
+)
