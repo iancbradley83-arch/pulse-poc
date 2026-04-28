@@ -3,34 +3,93 @@
  *  Ported from claude.design handoff (2026-04-20).
  *  All colors / spacing / radii match the handoff spec exactly.
  *  No build step — plain CSS, served from FastAPI static.
+ *
+ *  THEME TOKENS (production MVP):
+ *  Every recurring color / font / spacing value is declared on :root
+ *  as a `--pulse-*` custom property so per-embed overrides are a
+ *  one-token swap. Operators can override a single token via the
+ *  iframe's inline style without touching this file:
+ *
+ *      <iframe style="--pulse-accent:#0d9aff; --pulse-bg:#0d0d10"></iframe>
+ *
+ *  Light theme placeholder — see docs/light-theme-brief.md
  * ===================================================================== */
 
 :root {
+  /* ── theme tokens (operator-overridable) ─────────────────────────── */
+
   /* surfaces */
-  --bg-app: #05050a;
-  --bg-app-crown: radial-gradient(80% 50% at 50% 0%, #17131f 0%, #080810 60%, #05050a 100%);
-  --surface-card: #0f0f14;
-  --surface-card-alt: #0e0e13;
-  --odds-tile-bg: #15151b;
+  --pulse-bg: #05050a;
+  --pulse-bg-crown: radial-gradient(80% 50% at 50% 0%, #17131f 0%, #080810 60%, #05050a 100%);
+  --pulse-bg-card: #0f0f14;
+  --pulse-bg-card-alt: #0e0e13;
+  --pulse-bg-tile: #15151b;
 
   /* accents */
-  --accent: #7c5cff;
-  --accent-soft: rgba(124, 92, 255, 0.12);
-  --win: #c6ff3d;
-  --danger: #ff4d6d;
-  --live: #ff2d87;
+  --pulse-accent: #7c5cff;
+  --pulse-accent-fg: #0a0a0f;
+  --pulse-accent-soft: rgba(124, 92, 255, 0.12);
+  --pulse-success: #c6ff3d;
+  --pulse-danger: #ff4d6d;
+  --pulse-warning: #ffb547;
+  --pulse-live: #ff2d87;
 
   /* text */
-  --text-primary: #f4f4f7;
-  --text-secondary: rgba(255, 255, 255, 0.68);
-  --text-muted: rgba(255, 255, 255, 0.5);
-  --text-dim: rgba(255, 255, 255, 0.35);
+  --pulse-text: #f4f4f7;
+  --pulse-text-secondary: rgba(255, 255, 255, 0.68);
+  --pulse-text-muted: rgba(255, 255, 255, 0.5);
+  --pulse-text-dim: rgba(255, 255, 255, 0.35);
 
   /* borders */
-  --border-subtle: rgba(255, 255, 255, 0.06);
-  --border-hover: rgba(255, 255, 255, 0.18);
+  --pulse-border: rgba(255, 255, 255, 0.06);
+  --pulse-border-hover: rgba(255, 255, 255, 0.18);
 
-  /* hook colors — mirrors HOOKS map in app.js */
+  /* radii */
+  --pulse-radius-sm: 6px;
+  --pulse-radius-md: 10px;
+  --pulse-radius-lg: 14px;
+  --pulse-radius-xl: 18px;
+  --pulse-radius-pill: 999px;
+
+  /* shadow */
+  --pulse-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
+  --pulse-shadow-cta: 0 8px 24px -8px rgba(124, 92, 255, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+
+  /* typography */
+  --pulse-font: -apple-system, "system-ui", "Segoe UI", Helvetica, Arial, sans-serif;
+  --pulse-font-mono: ui-monospace, "JetBrains Mono", Menlo, monospace;
+  --pulse-font-size-base: 14px;
+
+  /* spacing scale (4 / 8 / 12 / 16 / 20 / 24px) */
+  --pulse-space-1: 4px;
+  --pulse-space-2: 8px;
+  --pulse-space-3: 12px;
+  --pulse-space-4: 16px;
+  --pulse-space-5: 20px;
+  --pulse-space-6: 24px;
+
+  /* ── legacy aliases (kept temporarily for any inline `var(--...)` in JS-
+   *    generated styles that still reference the old names; safe to
+   *    remove once we audit all `style="..."` usages). ──────────────── */
+  --bg-app: var(--pulse-bg);
+  --bg-app-crown: var(--pulse-bg-crown);
+  --surface-card: var(--pulse-bg-card);
+  --surface-card-alt: var(--pulse-bg-card-alt);
+  --odds-tile-bg: var(--pulse-bg-tile);
+  --accent: var(--pulse-accent);
+  --accent-soft: var(--pulse-accent-soft);
+  --win: var(--pulse-success);
+  --danger: var(--pulse-danger);
+  --live: var(--pulse-live);
+  --text-primary: var(--pulse-text);
+  --text-secondary: var(--pulse-text-secondary);
+  --text-muted: var(--pulse-text-muted);
+  --text-dim: var(--pulse-text-dim);
+  --border-subtle: var(--pulse-border);
+  --border-hover: var(--pulse-border-hover);
+
+  /* hook colors — mirrors HOOKS map in app.js. Not theme-overridable;
+     these are content-type semantic colors and must stay stable. */
   --hook-injury: #ff4d6d;
   --hook-team_news: #4fb2ff;
   --hook-transfer: #ffb547;
@@ -42,6 +101,9 @@
   --hook-live_moment: #ff2d87;
 }
 
+/* Example operator override (paste into the embed iframe's style attr):
+   <iframe style="--pulse-bg:#0d0d10; --pulse-accent:#0d9aff"></iframe> */
+
 /* ── reset ── */
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -49,11 +111,12 @@
 html, body { margin: 0; padding: 0; }
 
 body {
-  font-family: -apple-system, "system-ui", "Segoe UI", Helvetica, Arial, sans-serif;
-  background: var(--bg-app);
-  background-image: var(--bg-app-crown);
+  font-family: var(--pulse-font);
+  font-size: var(--pulse-font-size-base);
+  background: var(--pulse-bg);
+  background-image: var(--pulse-bg-crown);
   background-attachment: fixed;
-  color: var(--text-primary);
+  color: var(--pulse-text);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   font-feature-settings: "ss01";
@@ -65,7 +128,7 @@ button { font: inherit; cursor: pointer; }
 /* scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.08); border-radius: 99px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.08); border-radius: var(--pulse-radius-pill); }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.15); }
 
 .no-scroll::-webkit-scrollbar { display: none; }
@@ -83,7 +146,7 @@ button { font: inherit; cursor: pointer; }
 /* SSE price update flash — pulses the card border briefly when total_odds
    or leg odds change, so users notice. */
 @keyframes priceFlash {
-  0%   { box-shadow: 0 0 0 0 var(--hook-color, var(--accent)); }
+  0%   { box-shadow: 0 0 0 0 var(--hook-color, var(--pulse-accent)); }
   30%  { box-shadow: 0 0 0 4px var(--hook-color-20, rgba(88,166,255,0.25)); }
   100% { box-shadow: 0 0 0 0 transparent; }
 }
@@ -94,7 +157,7 @@ button { font: inherit; cursor: pointer; }
    `card_added` WS event. Keeps the social-feed "something just arrived"
    signal without stealing attention from the whole list. */
 @keyframes newCardPulse {
-  0%   { box-shadow: 0 0 0 0 var(--hook-color, var(--accent)); }
+  0%   { box-shadow: 0 0 0 0 var(--hook-color, var(--pulse-accent)); }
   25%  { box-shadow: 0 0 0 6px var(--hook-color-20, rgba(124,92,255,0.28)); }
   75%  { box-shadow: 0 0 0 3px var(--hook-color-20, rgba(124,92,255,0.18)); }
   100% { box-shadow: 0 0 0 0 transparent; }
@@ -107,7 +170,7 @@ button { font: inherit; cursor: pointer; }
   animation:
     newCardIn 320ms ease-out,
     newCardPulse 2.4s ease-out;
-  border-color: var(--hook-color, var(--accent));
+  border-color: var(--hook-color, var(--pulse-accent));
 }
 
 /* Fade-out before DOM removal when a TTL sweep drops a card. */
@@ -123,7 +186,7 @@ button { font: inherit; cursor: pointer; }
    next to the existing .recency so the two live alongside the hook pill. */
 time.card-timestamp {
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--pulse-text-dim);
   font-variant-numeric: tabular-nums;
   margin-left: auto;
   letter-spacing: 0.02em;
@@ -145,8 +208,8 @@ time.card-timestamp {
   pointer-events: none;
   cursor: default;
   opacity: 0.55;
-  background: var(--surface-1, #1a1a22);
-  color: var(--text-dim, #888);
+  background: var(--pulse-bg-tile);
+  color: var(--pulse-text-dim);
 }
 .card-hero.card-hero--expired .cta-button .cta-odds {
   display: none;
@@ -158,7 +221,7 @@ time.card-timestamp {
   max-width: 520px;
   margin: 0 auto;
   min-height: 100vh;
-  padding-bottom: 32px;
+  padding-bottom: var(--pulse-space-6);
 }
 
 @media (min-width: 860px) {
@@ -174,23 +237,23 @@ time.card-timestamp {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 16px 10px;
+  padding: 14px var(--pulse-space-4) 10px;
   background: linear-gradient(180deg, rgba(15, 15, 20, 0.95) 0%, rgba(10, 10, 15, 0.85) 100%);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
-  border-bottom: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--pulse-border);
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pulse-space-2);
 }
 
 .logomark {
   width: 22px;
   height: 22px;
-  border-radius: 6px;
+  border-radius: var(--pulse-radius-sm);
   background: conic-gradient(from 210deg, #7c5cff, #ff2d87, #c6ff3d, #7c5cff);
   display: flex;
   align-items: center;
@@ -201,7 +264,7 @@ time.card-timestamp {
 .mark-core {
   width: 9px;
   height: 9px;
-  border-radius: 99px;
+  border-radius: var(--pulse-radius-pill);
   background: #0a0a0f;
 }
 
@@ -209,7 +272,7 @@ time.card-timestamp {
   font-weight: 800;
   font-size: 15px;
   letter-spacing: 0.5px;
-  color: var(--text-primary);
+  color: var(--pulse-text);
   text-transform: uppercase;
 }
 
@@ -220,13 +283,13 @@ time.card-timestamp {
   width: 30px;
   height: 30px;
   background: transparent;
-  border: 1px solid var(--border-subtle);
-  border-radius: 99px;
-  color: var(--text-muted);
+  border: 1px solid var(--pulse-border);
+  border-radius: var(--pulse-radius-pill);
+  color: var(--pulse-text-muted);
   transition: color 120ms, border-color 120ms;
 }
 
-.refresh-btn:hover { color: var(--text-primary); border-color: var(--border-hover); }
+.refresh-btn:hover { color: var(--pulse-text); border-color: var(--pulse-border-hover); }
 
 /* ── filter strip ── */
 
@@ -237,13 +300,13 @@ time.card-timestamp {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 10px 12px;
+  padding: 10px var(--pulse-space-3);
   overflow-x: auto;
   white-space: nowrap;
   background: rgba(10, 10, 15, 0.88);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
-  border-bottom: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--pulse-border);
   scrollbar-width: none;
 }
 .filter-strip::-webkit-scrollbar { display: none; }
@@ -254,8 +317,8 @@ time.card-timestamp {
   font-weight: 700;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--text-dim);
-  padding: 0 4px;
+  color: var(--pulse-text-dim);
+  padding: 0 var(--pulse-space-1);
 }
 
 .filter-divider {
@@ -263,7 +326,7 @@ time.card-timestamp {
   width: 1px;
   height: 18px;
   background: rgba(255, 255, 255, 0.08);
-  margin: 0 4px;
+  margin: 0 var(--pulse-space-1);
 }
 
 .chip {
@@ -271,8 +334,8 @@ time.card-timestamp {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 6px 12px;
-  border-radius: 999px;
+  padding: 6px var(--pulse-space-3);
+  border-radius: var(--pulse-radius-pill);
   background: transparent;
   border: 1px solid rgba(255, 255, 255, 0.08);
   color: rgba(255, 255, 255, 0.55);
@@ -281,25 +344,25 @@ time.card-timestamp {
   transition: background 120ms, color 120ms, border-color 120ms;
 }
 
-.chip:hover { color: var(--text-primary); border-color: var(--border-hover); }
+.chip:hover { color: var(--pulse-text); border-color: var(--pulse-border-hover); }
 
 .chip.active {
-  background: var(--accent-soft);
+  background: var(--pulse-accent-soft);
   border-color: rgba(124, 92, 255, 0.4);
-  color: var(--text-primary);
+  color: var(--pulse-text);
 }
 
 .chip[data-hook].active {
-  background: color-mix(in srgb, var(--chip-color, var(--accent)) 15%, transparent);
-  border-color: color-mix(in srgb, var(--chip-color, var(--accent)) 40%, transparent);
-  color: var(--chip-color, var(--accent));
+  background: color-mix(in srgb, var(--chip-color, var(--pulse-accent)) 15%, transparent);
+  border-color: color-mix(in srgb, var(--chip-color, var(--pulse-accent)) 40%, transparent);
+  color: var(--chip-color, var(--pulse-accent));
 }
 
 .chip .dot {
   width: 7px;
   height: 7px;
-  border-radius: 99px;
-  background: var(--chip-color, var(--accent));
+  border-radius: var(--pulse-radius-pill);
+  background: var(--chip-color, var(--pulse-accent));
 }
 
 .chip[data-hook="live_moment"] .dot {
@@ -312,27 +375,27 @@ time.card-timestamp {
 .feed {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 14px 12px 24px;
+  gap: var(--pulse-space-3);
+  padding: 14px var(--pulse-space-3) var(--pulse-space-6);
 }
 
 .feed-end {
   text-align: center;
   font-size: 12px;
-  color: var(--text-dim);
-  padding: 20px 16px 40px;
+  color: var(--pulse-text-dim);
+  padding: var(--pulse-space-5) var(--pulse-space-4) 40px;
 }
-.feed-end .spark { color: var(--accent); margin-right: 4px; }
+.feed-end .spark { color: var(--pulse-accent); margin-right: var(--pulse-space-1); }
 
 .empty-state {
-  padding: 60px 24px;
+  padding: 60px var(--pulse-space-6);
   text-align: center;
-  color: var(--text-muted);
+  color: var(--pulse-text-muted);
   font-size: 13px;
 }
 .empty-state .pulse-icon {
-  width: 10px; height: 10px; border-radius: 99px; background: var(--accent);
-  box-shadow: 0 0 16px var(--accent);
+  width: 10px; height: 10px; border-radius: var(--pulse-radius-pill); background: var(--pulse-accent);
+  box-shadow: 0 0 16px var(--pulse-accent);
   display: inline-block; margin-right: 6px;
   animation: pulseDot 1.4s ease-in-out infinite;
 }
@@ -340,9 +403,9 @@ time.card-timestamp {
 /* skeleton loading */
 .skeleton-card {
   height: 280px;
-  border-radius: 18px;
+  border-radius: var(--pulse-radius-xl);
   background: linear-gradient(180deg, #13131b 0%, #0b0b10 100%);
-  box-shadow: inset 0 0 0 1px var(--border-subtle);
+  box-shadow: inset 0 0 0 1px var(--pulse-border);
   animation: pulseDot 2.4s ease-in-out infinite;
 }
 
@@ -352,7 +415,7 @@ time.card-timestamp {
 
 .card-hero {
   position: relative;
-  border-radius: 18px;
+  border-radius: var(--pulse-radius-xl);
   overflow: hidden;
   background:
     radial-gradient(120% 80% at 0% 0%, var(--hook-color-08, rgba(124, 92, 255, 0.15)), transparent 50%),
@@ -370,12 +433,12 @@ time.card-timestamp {
   opacity: 0.08;
   transform: scale(6);
   transform-origin: top right;
-  color: var(--hook-color, var(--accent));
+  color: var(--hook-color, var(--pulse-accent));
   pointer-events: none;
 }
 
 .card-body {
-  padding: 16px;
+  padding: var(--pulse-space-4);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -394,10 +457,10 @@ time.card-timestamp {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 3px 8px 3px 7px;
-  border-radius: 999px;
-  background: var(--hook-color, var(--accent));
-  color: #0a0a0f;
+  padding: 3px var(--pulse-space-2) 3px 7px;
+  border-radius: var(--pulse-radius-pill);
+  background: var(--hook-color, var(--pulse-accent));
+  color: var(--pulse-accent-fg);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -407,7 +470,7 @@ time.card-timestamp {
 
 .recency {
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--pulse-text-dim);
   font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
@@ -416,14 +479,14 @@ time.card-timestamp {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  color: var(--live);
+  color: var(--pulse-live);
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 .recency.live .pulse {
-  width: 7px; height: 7px; border-radius: 99px; background: var(--live);
-  box-shadow: 0 0 10px var(--live);
+  width: 7px; height: 7px; border-radius: var(--pulse-radius-pill); background: var(--pulse-live);
+  box-shadow: 0 0 10px var(--pulse-live);
   animation: pulseDot 1.2s ease-in-out infinite;
 }
 
@@ -433,7 +496,7 @@ time.card-timestamp {
   font-size: 22px;
   line-height: 1.15;
   font-weight: 700;
-  color: var(--text-primary);
+  color: var(--pulse-text);
   letter-spacing: -0.02em;
   text-wrap: balance;
 }
@@ -443,27 +506,27 @@ time.card-timestamp {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px 8px;
+  gap: 6px var(--pulse-space-2);
   font-size: 11px;
-  color: var(--text-muted);
+  color: var(--pulse-text-muted);
 }
 .source-match .source {
   color: rgba(255, 255, 255, 0.8);
   font-weight: 600;
 }
-.source-match .dot-sep { color: var(--text-dim); }
-.source-match .kickoff { color: var(--text-dim); }
+.source-match .dot-sep { color: var(--pulse-text-dim); }
+.source-match .kickoff { color: var(--pulse-text-dim); }
 
 .team-pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   padding: 3px 7px;
-  border-radius: 6px;
+  border-radius: var(--pulse-radius-sm);
   background: color-mix(in srgb, var(--team-color, #666) 15%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--team-color, #666) 33%, transparent);
   color: var(--team-text, #fff);
-  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+  font-family: var(--pulse-font-mono);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -478,8 +541,8 @@ time.card-timestamp {
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 18px 16px;
-  border-radius: 14px;
+  padding: 18px var(--pulse-space-4);
+  border-radius: var(--pulse-radius-lg);
   background: linear-gradient(180deg, rgba(124, 92, 255, 0.15) 0%, rgba(124, 92, 255, 0.05) 100%);
   border: 1px solid rgba(124, 92, 255, 0.35);
   position: relative;
@@ -495,23 +558,23 @@ time.card-timestamp {
 .pulse-pick .pick-meta { flex: 1; min-width: 0; }
 .pulse-pick .pick-label {
   font-size: 9.5px;
-  color: var(--accent);
+  color: var(--pulse-accent);
   font-weight: 800;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  margin-bottom: 4px;
+  margin-bottom: var(--pulse-space-1);
 }
 .pulse-pick .pick-selection {
   font-size: 16px;
   font-weight: 650;
-  color: var(--text-primary);
+  color: var(--pulse-text);
   line-height: 1.25;
 }
 .pulse-pick .pick-odds {
   font-size: 34px;
   font-weight: 700;
-  color: var(--win);
-  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+  color: var(--pulse-success);
+  font-family: var(--pulse-font-mono);
   line-height: 1;
   font-feature-settings: "tnum";
   flex-shrink: 0;
@@ -520,16 +583,16 @@ time.card-timestamp {
 /* multi-leg (Bet Builder / combo) variant of the Pulse Pick block */
 .pulse-pick--stack {
   align-items: stretch;
-  padding: 14px 16px 14px 14px;
+  padding: 14px var(--pulse-space-4) 14px 14px;
 }
-.pulse-pick--stack .pick-meta { display: flex; flex-direction: column; gap: 8px; }
+.pulse-pick--stack .pick-meta { display: flex; flex-direction: column; gap: var(--pulse-space-2); }
 .leg-stack { display: flex; flex-direction: column; gap: 6px; }
 .leg {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  padding: 8px 10px;
+  padding: var(--pulse-space-2) 10px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 8px;
+  border-radius: var(--pulse-space-2);
   min-height: 34px;
 }
 .leg-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
@@ -538,12 +601,12 @@ time.card-timestamp {
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--text-dim);
+  color: var(--pulse-text-dim);
 }
 .leg-label {
   font-size: 13px;
   font-weight: 600;
-  color: var(--text-primary);
+  color: var(--pulse-text);
   line-height: 1.2;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -552,8 +615,8 @@ time.card-timestamp {
 .leg-odds {
   font-size: 14px;
   font-weight: 700;
-  color: var(--text-primary);
-  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+  color: var(--pulse-text);
+  font-family: var(--pulse-font-mono);
   font-feature-settings: "tnum";
   flex-shrink: 0;
 }
@@ -574,11 +637,11 @@ time.card-timestamp {
   font-weight: 600;
   line-height: 1.15;
   letter-spacing: 0.02em;
-  color: var(--text-dim);
+  color: var(--pulse-text-dim);
   text-align: right;
 }
 .pulse-pick--stack .pick-odds--bb .bb-odds-note:first-child {
-  color: var(--text-secondary);
+  color: var(--pulse-text-secondary);
 }
 
 /* angle */
@@ -586,7 +649,7 @@ time.card-timestamp {
   margin: 0;
   font-size: 13px;
   line-height: 1.45;
-  color: var(--text-secondary);
+  color: var(--pulse-text-secondary);
   text-wrap: pretty;
 }
 
@@ -599,34 +662,34 @@ time.card-timestamp {
 .stat-chip {
   font-size: 10.5px;
   padding: 5px 9px;
-  border-radius: 6px;
+  border-radius: var(--pulse-radius-sm);
   background: rgba(255, 255, 255, 0.05);
   color: rgba(255, 255, 255, 0.8);
-  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+  font-family: var(--pulse-font-mono);
   font-weight: 500;
 }
-.stat-chip .k { color: var(--text-dim); }
+.stat-chip .k { color: var(--pulse-text-dim); }
 
 /* CTA */
 .cta-button {
   width: 100%;
-  padding: 12px 14px;
+  padding: var(--pulse-space-3) 14px;
   background: linear-gradient(180deg, #7c5cff 0%, #6847e6 100%);
   border: none;
-  border-radius: 10px;
+  border-radius: var(--pulse-radius-md);
   display: flex;
   align-items: center;
   justify-content: space-between;
   color: #fff;
   font-weight: 700;
-  font-size: 14px;
-  box-shadow: 0 8px 24px -8px rgba(124, 92, 255, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  font-size: var(--pulse-font-size-base);
+  box-shadow: var(--pulse-shadow-cta);
   transition: transform 100ms;
 }
 .cta-button:active { transform: scale(0.98); }
-.cta-button .cta-left { display: inline-flex; align-items: center; gap: 8px; }
+.cta-button .cta-left { display: inline-flex; align-items: center; gap: var(--pulse-space-2); }
 .cta-button .cta-odds {
-  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+  font-family: var(--pulse-font-mono);
   font-size: 15px;
   font-weight: 700;
   letter-spacing: 0.02em;
@@ -644,22 +707,22 @@ time.card-timestamp {
 .card-foot {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--pulse-space-3);
 }
 
 .pick-rate {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pulse-space-2);
   flex: 1;
   font-size: 11px;
-  color: var(--text-secondary);
+  color: var(--pulse-text-secondary);
 }
 .pick-rate .bar {
   flex: 1;
   height: 3px;
   background: rgba(255, 255, 255, 0.07);
-  border-radius: 99px;
+  border-radius: var(--pulse-radius-pill);
   overflow: hidden;
   position: relative;
 }
@@ -669,10 +732,10 @@ time.card-timestamp {
   inset: 0;
   width: var(--pick-pct, 50%);
   background: linear-gradient(90deg, #7c5cff, #c6ff3d);
-  border-radius: 99px;
+  border-radius: var(--pulse-radius-pill);
 }
 .pick-rate .pct {
-  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+  font-family: var(--pulse-font-mono);
   font-weight: 700;
   color: rgba(255, 255, 255, 0.85);
   font-variant-numeric: tabular-nums;
@@ -689,17 +752,17 @@ time.card-timestamp {
   gap: 5px;
   background: transparent;
   border: none;
-  color: var(--text-muted);
+  color: var(--pulse-text-muted);
   font-size: 12px;
   font-weight: 600;
-  padding: 6px 8px;
-  border-radius: 6px;
+  padding: 6px var(--pulse-space-2);
+  border-radius: var(--pulse-radius-sm);
   transition: color 120ms;
 }
-.engagement button:hover { color: var(--text-primary); }
-.engagement button.active { color: var(--accent-active, var(--danger)); }
-.engagement button.active[data-kind="like"] svg { fill: var(--danger); }
-.engagement button.active[data-kind="save"] svg { fill: var(--win); }
+.engagement button:hover { color: var(--pulse-text); }
+.engagement button.active { color: var(--accent-active, var(--pulse-danger)); }
+.engagement button.active[data-kind="like"] svg { fill: var(--pulse-danger); }
+.engagement button.active[data-kind="save"] svg { fill: var(--pulse-success); }
 
 /* ─────────────────────────────────────────────────────────────
  *  EMBED MODE — strip all shell chrome when ?embed=1
@@ -713,14 +776,14 @@ body.embed #app { max-width: 100%; margin: 0; padding-bottom: 0; }
 .pulse-toast {
   position: fixed;
   left: 50%;
-  bottom: 24px;
+  bottom: var(--pulse-space-6);
   transform: translate(-50%, 12px);
   background: #11141c;
   color: #e5e9f2;
   border: 1px solid #2a3044;
-  border-radius: 12px;
+  border-radius: var(--pulse-radius-lg);
   padding: 10px 14px;
-  box-shadow: 0 12px 30px rgba(0,0,0,0.4);
+  box-shadow: var(--pulse-shadow);
   font-size: 13px;
   max-width: 92vw;
   z-index: 1000;
@@ -742,15 +805,15 @@ body.embed #app { max-width: 100%; margin: 0; padding-bottom: 0; }
 }
 .pulse-toast__main { flex: 1; }
 .pulse-toast__sub {
-  font-size: 11px; color: #8b93a7; margin-top: 4px;
+  font-size: 11px; color: #8b93a7; margin-top: var(--pulse-space-1);
   padding-left: 32px;
 }
 .pulse-toast__copy {
   background: transparent;
   color: #8b93a7;
   border: 1px solid #2a3044;
-  border-radius: 6px;
-  padding: 3px 8px;
+  border-radius: var(--pulse-radius-sm);
+  padding: 3px var(--pulse-space-2);
   font-size: 11px;
   cursor: pointer;
   flex-shrink: 0;
@@ -775,8 +838,8 @@ body.embed #app { max-width: 100%; margin: 0; padding-bottom: 0; }
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 4px 9px;
-  border-radius: 999px;
+  padding: var(--pulse-space-1) 9px;
+  border-radius: var(--pulse-radius-pill);
   background: transparent;
   border: 1px solid rgba(255, 255, 255, 0.09);
   color: #8b93a7;
@@ -794,7 +857,7 @@ body.embed #app { max-width: 100%; margin: 0; padding-bottom: 0; }
 }
 .card-react__btn:active { transform: scale(0.96); }
 .card-react__btn.is-active {
-  color: #0a0a0f;
+  color: var(--pulse-accent-fg);
   background: var(--hook-color, #e5e9f2);
   border-color: var(--hook-color, #e5e9f2);
   font-weight: 600;
@@ -813,3 +876,35 @@ body.embed #app { max-width: 100%; margin: 0; padding-bottom: 0; }
   opacity: 0.85;
 }
 
+/* ─────────────────────────────────────────────────────────────
+ *  POWERED BY PULSE — small persistent footer badge.
+ *  Sits at the bottom of #app so it scrolls with feed content
+ *  rather than floating fixed. Operators can hide it via the
+ *  query string `?powered_by=false` (handled in app.js init).
+ * ───────────────────────────────────────────────────────────── */
+.pulse-poweredby {
+  display: block;
+  margin: var(--pulse-space-4) auto var(--pulse-space-2);
+  width: fit-content;
+  padding: var(--pulse-space-2) var(--pulse-space-3);
+  font-family: var(--pulse-font);
+  font-size: calc(var(--pulse-font-size-base) * 0.78);
+  color: var(--pulse-text-muted);
+  background: var(--pulse-bg-card);
+  border: 1px solid var(--pulse-border);
+  border-radius: var(--pulse-radius-sm);
+  text-decoration: none;
+  letter-spacing: 0.02em;
+  opacity: 0.85;
+  pointer-events: auto;
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.pulse-poweredby:hover {
+  opacity: 1;
+  color: var(--pulse-text);
+  border-color: var(--pulse-border-hover);
+}
+.pulse-poweredby:focus-visible {
+  outline: 2px solid var(--pulse-accent);
+  outline-offset: 2px;
+}
