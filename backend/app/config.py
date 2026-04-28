@@ -478,6 +478,20 @@ PULSE_COST_WEBSEARCH_PER_CALL_USD = float(
     os.getenv("PULSE_COST_WEBSEARCH_PER_CALL_USD", "0.025")
 )
 
+# ── Out-of-band alerts ────────────────────────────────────────────────
+# Where the in-process alert emitter (app/services/alert_emitter.py)
+# POSTs critical events. Today the only consumer is the cost-tripwire
+# (engine self-paused because daily LLM budget exhausted). When unset
+# the emitter logs at WARNING — Sentry's FastApiIntegration captures
+# WARNINGs as breadcrumbs — but doesn't try to POST anywhere.
+#
+# Accepts any HTTPS endpoint that consumes a JSON body shaped like:
+#   {"level":"critical","title":"...","body":"...",
+#    "timestamp":"<ISO-8601 UTC>","project":"pulse"}
+# i.e. Slack incoming webhook, Telegram-bot relay, custom Pipedream URL.
+# Empty string is the kill switch.
+PULSE_ALERTS_WEBHOOK_URL = os.getenv("PULSE_ALERTS_WEBHOOK_URL", "")
+
 # Hook-diversity release buffer (social-feed stream ordering rule).
 # Candidates that pass gates are buffered for up to this many seconds
 # instead of broadcasting immediately. A single release scheduler wakes
