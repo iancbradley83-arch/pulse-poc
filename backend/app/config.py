@@ -546,3 +546,14 @@ PULSE_EMBED_TOKEN_REQUIRED = os.getenv(
 PULSE_EMBED_DEFAULT_TTL_SECONDS = int(
     os.getenv("PULSE_EMBED_DEFAULT_TTL_SECONDS", "0")
 )
+
+# ── Admin HTTP Basic auth (PR feat/admin-basic-auth) ──────────────────────
+# Locks every /admin/* surface behind HTTP Basic. Both vars MUST be set
+# for enforcement to engage; if either is empty the require_admin
+# dependency is a no-op (so local dev keeps working without ceremony,
+# and we log a single warning at boot). On Railway, set both before
+# public launch — the seeded apuesta-total token sits behind /admin/embeds.json
+# and would leak otherwise. See main.py::require_admin for the timing-safe
+# compare and the WWW-Authenticate response.
+PULSE_ADMIN_USER = os.getenv("PULSE_ADMIN_USER", "")
+PULSE_ADMIN_PASS = os.getenv("PULSE_ADMIN_PASS", "")
