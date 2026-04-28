@@ -1,0 +1,13 @@
+# Build config for the ops-bot service. Without this, Railway falls back
+# to the repo-root railway.toml, which targets backend/Dockerfile (the
+# pulse-poc widget's image). With root_dir=/ops-bot set on the service,
+# Railway picks up THIS file first; the dockerfilePath below resolves to
+# ops-bot/Dockerfile on disk.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
