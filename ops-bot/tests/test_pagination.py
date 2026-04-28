@@ -118,3 +118,38 @@ def test_suspended_card_flagged():
     ]
     text = format_feed_page(cards, page=1, total_pages=1, total_cards=1)
     assert "[SUSPENDED]" in text
+
+
+def test_block_extracts_team_short_name_from_dict():
+    """Regression: /api/feed gives home_team as a dict {short_name, color},
+    not a string. _team_name must extract short_name (or name) — the dict
+    literal must NEVER appear."""
+    cards = [
+        {
+            "id": "abc12345",
+            "hook_type": "injury",
+            "game": {
+                "home_team": {"short_name": "AM", "color": "#CB3524"},
+                "away_team": {"short_name": "ARS", "color": "#EF0107"},
+            },
+            "narrative_hook": "test",
+            "total_odds": 4.45,
+        }
+    ]
+    text = format_feed_page(cards, page=1, total_pages=1, total_cards=1)
+    assert "AM vs ARS" in text
+    assert "short_name" not in text
+    assert "color" not in text
+    assert "#CB3524" not in text
+
+
+def test_pagination_footer_uses_underscore_form():
+    """Telegram only treats /cards_2 (underscore) as a tappable command;
+    /cards 2 (space) does not pass the arg through tap. Footer must use _N."""
+    cards = [{"id": "abc12345", "hook_type": "x", "game": {}, "narrative_hook": "n", "total_odds": 1.5}]
+    text = format_feed_page(cards, page=2, total_pages=5, total_cards=25)
+    assert "/cards_1" in text
+    assert "/cards_3" in text
+    # No legacy space-arg form
+    assert "/cards 1" not in text
+    assert "/cards 3" not in text

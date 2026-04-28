@@ -341,12 +341,11 @@ def _card_block(card: Dict[str, Any]) -> str:
         game_line += f" · {league}"
 
     narrative = (card.get("narrative_hook") or card.get("headline") or "").strip()
-    narrative = _truncate_at_word(narrative, 110)
+    narrative = _truncate_at_word(narrative, 140)
 
-    lines = [
-        f"[{cid}] · {hook} · {odds_str}{flag}",
-        game_line,
-    ]
+    lines = [f"[{cid}] · {hook} · {odds_str}{flag}"]
+    if home != "?" or away != "?":
+        lines.append(game_line)
     if narrative:
         lines.append(narrative)
     return "\n".join(lines)
@@ -367,12 +366,14 @@ def format_feed_page(
 
     # Footer with tappable nav commands (Telegram makes /commands in message
     # text tappable on iOS / Android / desktop).
+    # Telegram makes a single token like /cards_2 tappable as a command.
+    # Plain '/cards 2' only highlights '/cards' and tapping doesn't pass the arg.
     nav_parts: List[str] = []
     if page > 1:
-        nav_parts.append(f"prev: /cards {page - 1}")
+        nav_parts.append(f"prev: /cards_{page - 1}")
     nav_parts.append(f"page {page} of {total_pages}")
     if page < total_pages:
-        nav_parts.append(f"next: /cards {page + 1}")
+        nav_parts.append(f"next: /cards_{page + 1}")
     nav = "  ·  ".join(nav_parts)
 
     footer = f"\n\n— {nav} —\n{total_cards} cards in feed · /card <id> for detail"
