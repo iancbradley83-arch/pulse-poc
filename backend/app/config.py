@@ -336,6 +336,23 @@ PULSE_DEEPLINK_TEMPLATE_BSCODE = os.getenv(
     "{wrapper}?fpath=%2Fes-pe%2Fspbkv3%3Fbscode%3D{bscode}",
 )
 
+# ── Boot-defer (cost knob for rapid redeploys) ─────────────────────────
+# When > 0, every tier loop's first cycle waits at least this many seconds
+# after boot before firing. Combined with per-tier offsets via max().
+# Set to 1800 (30 min) on Railway for "deploy-cheap mode" so rapid
+# redeploys don't repeatedly pay for first-cycle scout work. Default 0
+# preserves the historical short-offset behaviour.
+#
+# Parsed defensively — a malformed value (e.g. "abc") falls back to 0
+# rather than crashing boot, matching every other knob in this file.
+def _parse_boot_defer(raw: str) -> int:
+    try:
+        return int(raw or "0")
+    except (TypeError, ValueError):
+        return 0
+
+PULSE_BOOT_DEFER_SECONDS = _parse_boot_defer(os.getenv("PULSE_BOOT_DEFER_SECONDS", "0"))
+
 # ── Tiered freshness / staggered publish ───────────────────────────────
 # Social-feed cadence: instead of one 4h atomic cycle, run tier-specific
 # loops that re-scout fixtures by kickoff proximity. Cards stream in one
