@@ -1,5 +1,7 @@
 """Narrative Generator — creates card hooks using Claude API or template fallback."""
 
+import os
+
 from app.models.schemas import GameEvent, Market, EventType
 from app.config import ANTHROPIC_API_KEY, USE_LLM
 
@@ -34,7 +36,11 @@ class NarrativeGenerator:
         return self._generate_template(event, market, context)
 
     async def _generate_llm(self, event: GameEvent, market: Market, context: dict) -> str:
-        """Call Claude API to generate narrative."""
+        """Call Claude API to generate narrative.
+
+        Model is selected via the `PULSE_NARRATIVE_GENERATOR_MODEL` env var
+        (defaults to `claude-haiku-4-5`).
+        """
         try:
             user_msg = f"""Event: {event.description}
 Market: {market.label}
@@ -45,7 +51,7 @@ Score: {context.get('score', 'N/A')}
 Write a 1-2 sentence narrative hook for this market."""
 
             response = self._client.messages.create(
-                model="claude-3-5-haiku-latest",
+                model=os.getenv("PULSE_NARRATIVE_GENERATOR_MODEL", "claude-haiku-4-5"),
                 max_tokens=80,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_msg}]

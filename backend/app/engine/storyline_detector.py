@@ -973,7 +973,7 @@ class StorylineDetector:
 
         try:
             from app.main import _bump_cycle_counter
-            _bump_cycle_counter("storyline_sonnet_websearch")
+            _bump_cycle_counter("storyline_haiku_websearch")
         except Exception:
             pass
         # Cost-tripwire short-circuit. Storyline scout uses web_search,

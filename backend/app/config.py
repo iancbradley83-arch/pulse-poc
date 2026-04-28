@@ -246,6 +246,9 @@ PULSE_STORYLINE_VERIFY_MODEL = os.getenv(
     "PULSE_STORYLINE_VERIFY_MODEL", "claude-haiku-4-5",
 )
 
+# Model used by NarrativeGenerator when synthesising hook copy from live event/market data.
+PULSE_NARRATIVE_GENERATOR_MODEL = os.getenv("PULSE_NARRATIVE_GENERATOR_MODEL", "claude-haiku-4-5")
+
 # Borderline-participant tolerance (2026-04-24 mix-balance PR). When
 # the standings-verify pass drops enough participants that only 2
 # survive, check any dropped candidate whose row is within 1 position
