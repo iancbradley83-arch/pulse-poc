@@ -35,7 +35,12 @@ def _age_str(iso_str: str) -> str:
 
 def format_help() -> str:
     return (
-        "pulse-ops-bot — commands\n"
+        "pulse-ops-bot — Pulse ops from your phone\n"
+        "\n"
+        "Telegram console for the Pulse content widget. Monitor health,\n"
+        "cost, and deploys. Inspect cards and operator embeds. Pull logs\n"
+        "and runbook sections — all without opening a laptop. Read-only\n"
+        "today; pause / resume / redeploy / blacklist land in stage 3.\n"
         "\n"
         "stage 1 (read-only)\n"
         "  /status              pulse health + cost + deploy + cards/$ per card\n"
