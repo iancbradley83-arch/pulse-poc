@@ -303,6 +303,12 @@ class CostTracker:
         (projection exactly equals remaining) clears. When False, the
         engine path should silently fall back to cached/empty rather
         than raise.
+
+        On the *first* rejection of a given UTC day we also fire a
+        critical alert via the in-process emitter — the engine pausing
+        is "working as designed but you should know" territory. Dedup
+        is keyed on the UTC date so repeat rejections within the same
+        day stay silent; a new day re-arms the alert.
         """
         try:
             total = await self.today_total_usd()
@@ -315,6 +321,28 @@ class CostTracker:
                 "projected=$%.4f — engine paused for the day",
                 total, self._daily_budget, projected_usd,
             )
+            # First-rejection-of-the-day alert. Best-effort: the emitter
+            # swallows its own failures, but we belt-and-brace here too
+            # so the engine path can never raise from a budget rejection.
+            try:
+                day = today_utc()
+                try:
+                    calls = await self._store.get_daily_cost_calls(day)
+                except Exception:
+                    calls = 0
+                from app.services.alert_emitter import emit_critical
+                emit_critical(
+                    title="pulse cost tripwire fired",
+                    body=(
+                        f"Daily LLM budget exhausted: spent "
+                        f"${total:.2f}/{self._daily_budget:.2f} across "
+                        f"{int(calls)} calls. Engine paused for the day; "
+                        f"resumes at UTC midnight."
+                    ),
+                    dedup_key=f"tripwire-{day}",
+                )
+            except Exception as exc:
+                logger.warning("[cost] tripwire alert dispatch failed: %s", exc)
             return False
         return True
 
