@@ -1626,9 +1626,9 @@ _tier_tasks: list = []
 # each tier cycle (so per-cycle log is honest) and aggregated daily.
 _cycle_call_counts: dict[str, int] = {
     "scout_haiku_websearch": 0,
-    "storyline_sonnet_websearch": 0,  # storyline detector LLM call
+    "storyline_haiku_websearch": 0,  # storyline detector LLM call
     "standings_haiku_websearch": 0,
-    "rewrite_sonnet": 0,
+    "rewrite_haiku": 0,
 }
 # Last-cycle cost snapshot. Populated at end-of-cycle from the actual
 # delta in cost_tracker.today_total_usd() across the cycle, NOT from
@@ -1936,9 +1936,9 @@ async def _run_tier_once(tier: str) -> dict:
             "daily_total=$%.4f",
             est_cost,
             _cycle_call_counts.get("scout_haiku_websearch", 0),
-            _cycle_call_counts.get("storyline_sonnet_websearch", 0),
+            _cycle_call_counts.get("storyline_haiku_websearch", 0),
             _cycle_call_counts.get("standings_haiku_websearch", 0),
-            _cycle_call_counts.get("rewrite_sonnet", 0),
+            _cycle_call_counts.get("rewrite_haiku", 0),
             std_hits, std_misses, sl_hits, sl_misses,
             _post_cycle_cost_usd,
         )
@@ -2787,7 +2787,7 @@ async def _run_candidate_engine(
         # cache_misses here = real Sonnet rewrite calls; feed it into the
         # cycle cost telemetry.
         try:
-            _bump_cycle_counter("rewrite_sonnet", int(rewriter.cache_misses))
+            _bump_cycle_counter("rewrite_haiku", int(rewriter.cache_misses))
         except Exception:
             pass
         logger.info(
