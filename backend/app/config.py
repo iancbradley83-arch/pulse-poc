@@ -383,6 +383,14 @@ def _parse_boot_defer(raw: str) -> int:
 
 PULSE_BOOT_DEFER_SECONDS = _parse_boot_defer(os.getenv("PULSE_BOOT_DEFER_SECONDS", "0"))
 
+# Disabled by default — boot scout runs LLM scout/build calls on every
+# redeploy and adds ~$0.20–0.30 per deploy. Snapshot rehydrate
+# (feed_rehydrate.rehydrate_feed_from_snapshots) keeps the feed live
+# without it; tier loops pick up new content on cadence after
+# PULSE_BOOT_DEFER_SECONDS. Set to "true" if you really need a fresh
+# scout on every boot (debugging, demo prep, content reset).
+PULSE_BOOT_SCOUT_ENABLED = os.getenv("PULSE_BOOT_SCOUT_ENABLED", "false").lower() == "true"
+
 # ── Tiered freshness / staggered publish ───────────────────────────────
 # Social-feed cadence: instead of one 4h atomic cycle, run tier-specific
 # loops that re-scout fixtures by kickoff proximity. Cards stream in one
