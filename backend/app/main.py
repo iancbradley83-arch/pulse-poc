@@ -1135,6 +1135,55 @@ async def admin_rerun_status():
     }
 
 
+@app.get("/admin/cost.json", dependencies=[Depends(require_admin)])
+async def admin_cost_json(days: int = 1):
+    """Machine-readable cost endpoint consumed by ops-bot.
+
+    Returns today's totals plus a `days`-length history (most-recent-first,
+    capped at 30). Shape is documented in ops-bot/DESIGN.md Bug 1 spec.
+
+    Auth: same open-by-default convention as all other /admin/* endpoints.
+    A basic-auth PR is queued separately; do not gate this differently.
+    """
+    days = max(1, min(int(days), 30))
+
+    try:
+        snap = await _get_cost_tracker().snapshot()
+    except Exception:
+        snap = {
+            "day_utc": _today_utc(),
+            "total_usd": 0.0,
+            "budget_usd": 3.0,
+            "remaining_usd": 3.0,
+            "calls": 0,
+            "percent_used": 0.0,
+        }
+
+    try:
+        history = await candidate_store.get_daily_cost_history(days=days)
+    except Exception as exc:
+        logger.warning("[cost] /admin/cost.json history read failed: %s", exc)
+        history = []
+
+    limit_usd = float(snap.get("budget_usd", 3.0))
+
+    day_rows = []
+    for row in history:
+        day_rows.append({
+            "date": row["date"],
+            "usd": round(float(row.get("accumulated_usd", 0.0)), 4),
+            "calls": int(row.get("calls", 0)),
+            "limit_usd": round(limit_usd, 2),
+        })
+
+    return {
+        "total_usd": round(float(snap.get("total_usd", 0.0)), 4),
+        "total_calls": int(snap.get("calls", 0)),
+        "limit_usd": round(limit_usd, 2),
+        "days": day_rows,
+    }
+
+
 @app.get("/admin/cost", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
 async def admin_cost_page():
     """7-day cost-history page. Read-only, no auth (POC convention)."""

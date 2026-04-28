@@ -125,8 +125,10 @@ async def main() -> None:
     bot = Bot(token=token)
     dp = Dispatcher()
 
-    # Auth middleware — applied to all updates.
-    dp.message.middleware(AllowlistMiddleware(allowed_ids))
+    # Auth middleware — outer so it fires on every message before handler
+    # resolution. Inner middleware only fires when a handler matches the
+    # message, so /start (no handler) and unrecognised text bypassed auth.
+    dp.message.outer_middleware(AllowlistMiddleware(allowed_ids))
 
     # Wire command handlers.
     set_clients(pulse_client, railway_client)
