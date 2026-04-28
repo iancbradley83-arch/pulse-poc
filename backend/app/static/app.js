@@ -985,6 +985,13 @@ const PULSE = (() => {
     if (params.get('embed') === '1' || window.self !== window.top) {
       document.body.classList.add('embed');
     }
+    // Operator opt-out for the "Powered by Pulse" badge. Operators that
+    // negotiate a no-brand contract pass `?powered_by=false` on the embed
+    // URL and we drop the badge entirely from the DOM. Default = visible.
+    if (params.get('powered_by') === 'false') {
+      const badge = document.getElementById('pulse-poweredby');
+      if (badge && badge.parentNode) badge.parentNode.removeChild(badge);
+    }
     renderFilterStrip();
     wireFeedDelegation();
     loadFeed();
