@@ -100,6 +100,7 @@ from app.config import (
     ANTHROPIC_API_KEY,
     PULSE_DATA_SOURCE,
     PULSE_DB_PATH,
+    PULSE_EMBED_TOKEN_REQUIRED,
     PULSE_HOOK_BET_TYPE_PREFERENCE_JSON,
     PULSE_NEWS_CACHE_TTL_HOURS,
     PULSE_NEWS_INGEST_ENABLED,
@@ -146,6 +147,11 @@ from app.engine.news_scorer import NewsScorer, PolicyLayer
 from app.api.routes import create_routes
 from app.api.admin import create_admin_routes
 from app.api.reactions import create_reactions_routes
+from app.api.embeds import (
+    EmbedTokenMiddleware,
+    create_embed_admin_routes,
+    seed_default_embed_if_empty,
+)
 
 logger = logging.getLogger("pulse")
 DATA_DIR = Path(__file__).parent / "data"
@@ -601,6 +607,17 @@ def _get_cost_tracker() -> _CostTracker:
         _cost_tracker = _CostTracker(store=candidate_store)
     return _cost_tracker
 
+# ── Embed token middleware (PR feat/embed-token-contract) ──
+# Gates GET/HEAD on /api/feed and /api/feed/* when
+# PULSE_EMBED_TOKEN_REQUIRED=true. Defaults OFF so the live widget
+# keeps working through cutover. Must be added AFTER candidate_store
+# is constructed (above) since the middleware closes over it.
+app.add_middleware(
+    EmbedTokenMiddleware,
+    store=candidate_store,
+    enabled=bool(PULSE_EMBED_TOKEN_REQUIRED),
+)
+
 # ── Mount routes ──
 router = create_routes(catalog, feed, simulator)
 app.include_router(router)
@@ -608,6 +625,8 @@ admin_router = create_admin_routes(candidate_store, catalog, simulator)
 app.include_router(admin_router)
 reactions_router = create_reactions_routes(candidate_store, feed, limiter)
 app.include_router(reactions_router)
+embed_admin_router = create_embed_admin_routes(candidate_store)
+app.include_router(embed_admin_router)
 
 # ── Static files ──
 STATIC_DIR = Path(__file__).parent / "static"
@@ -754,6 +773,22 @@ async def generate_prematch_cards():
         await candidate_store.init()
     except Exception as exc:
         logger.exception("[PULSE] candidate_store.init failed at startup: %s", exc)
+
+    # Embed-token seed (PR feat/embed-token-contract). On first boot
+    # against an empty `embeds` table, insert the apuesta-total default
+    # row and log the new token at INFO with a [embed-seed] prefix so an
+    # operator can copy it from Railway logs ONCE. Subsequent boots
+    # (table already populated) skip seeding silently.
+    try:
+        seeded_token = await seed_default_embed_if_empty(candidate_store)
+        if seeded_token:
+            logger.info(
+                "[embed-seed] slug=apuesta-total token=%s "
+                "(rotate via /admin/embeds/apuesta-total/rotate before public launch)",
+                seeded_token,
+            )
+    except Exception as exc:
+        logger.warning("[embed-seed] seed failed (non-fatal): %s", exc)
     if PULSE_DATA_SOURCE == "rogue":
         # _load_rogue_prematch always pulls the Rogue catalog (free) and
         # always tries to load operator-curated featured BBs (free Rogue
