@@ -1963,13 +1963,30 @@ async def _run_tier_once(tier: str) -> dict:
         _tier_inflight[tier] = False
 
 
+def _compute_initial_tier_delay(tier: str, boot_defer_seconds: int) -> int:
+    """First-cycle delay for a tier loop. Stagger offsets keep tiers from
+    firing in the same second on boot; the boot-defer knob lets ops push
+    the floor up so rapid redeploys don't re-pay for scout work the
+    previous boot already did. The two combine via max() — whichever is
+    larger wins, so the historical 90/180/270/360 stagger is preserved
+    when boot_defer is unset (= 0)."""
+    _offset_map = {_TIER_HOT: 90, _TIER_WARM: 180, _TIER_COOL: 270, _TIER_COLD: 360}
+    return max(_offset_map.get(tier, 60), max(0, int(boot_defer_seconds or 0)))
+
+
 async def _tier_loop(tier: str) -> None:
     """Periodic tier loop — sleeps cadence, runs one cycle, repeats."""
     import asyncio as _asyncio
+    from app.config import PULSE_BOOT_DEFER_SECONDS
     cadence_s, _ = _TIER_CONFIG[tier]()
     # Stagger first-run offsets so tiers don't all fire at once on boot.
     _offset_map = {_TIER_HOT: 90, _TIER_WARM: 180, _TIER_COOL: 270, _TIER_COLD: 360}
-    await _asyncio.sleep(_offset_map.get(tier, 60))
+    _initial_delay = _compute_initial_tier_delay(tier, PULSE_BOOT_DEFER_SECONDS)
+    logger.info(
+        "[tier:%s] first-cycle defer: sleeping %ds (offset=%d, boot_defer=%d)",
+        tier, _initial_delay, _offset_map.get(tier, 60), PULSE_BOOT_DEFER_SECONDS,
+    )
+    await _asyncio.sleep(_initial_delay)
     logger.info("[tier:%s] loop active — cadence %ds", tier, cadence_s)
     while True:
         try:
