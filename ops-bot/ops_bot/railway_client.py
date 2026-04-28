@@ -16,7 +16,7 @@ trailing newline). We catch that exception class specifically and emit a
 sanitised log message so the token never appears in Railway logs.
 """
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -151,3 +151,54 @@ class RailwayClient:
             raise
         except Exception as exc:
             raise RailwayError(f"couldn't parse variables response: {exc}") from exc
+
+    async def recent_logs(
+        self,
+        project_id: str,
+        service_id: str,
+        n: int = 20,
+    ) -> List[Dict[str, str]]:
+        """
+        Return the most-recent N WARN/ERROR log lines from the latest deployment.
+
+        Fetches up to 500 runtime log entries, filters to severity in
+        {WARNING, WARN, ERROR}, then returns the last N entries (most-recent last).
+
+        Shape of each entry: {"timestamp": str, "severity": str, "message": str}
+        """
+        deployment = await self.latest_deployment(project_id, service_id)
+        deployment_id = deployment["id"]
+
+        query = """
+        query DeploymentLogs($deploymentId: String!, $limit: Int!) {
+          deploymentLogs(deploymentId: $deploymentId, limit: $limit) {
+            message
+            severity
+            timestamp
+          }
+        }
+        """
+        data = await self._query(query, {"deploymentId": deployment_id, "limit": 500})
+        try:
+            raw_logs = data.get("deploymentLogs", [])
+            if not isinstance(raw_logs, list):
+                raise RailwayError(f"unexpected deploymentLogs shape: {type(raw_logs)}")
+
+            filtered = [
+                {
+                    "timestamp": str(entry.get("timestamp", "")),
+                    "severity": str(entry.get("severity", "")),
+                    "message": str(entry.get("message", "")),
+                }
+                for entry in raw_logs
+                if str(entry.get("severity", "")).upper() in ("WARNING", "WARN", "ERROR")
+            ]
+
+            # Railway returns logs newest-first; reverse for chronological output,
+            # then take the last N (most recent).
+            filtered.reverse()
+            return filtered[-n:]
+        except RailwayError:
+            raise
+        except Exception as exc:
+            raise RailwayError(f"couldn't parse deploymentLogs response: {exc}") from exc
