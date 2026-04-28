@@ -1292,6 +1292,36 @@ class CandidateStore:
             out.append((r[0], r[1], exp))
         return out
 
+    async def count_unique_published_cards_since(self, since_ts: float) -> int:
+        """Count DISTINCT card_id rows in published_cards with
+        snapshotted_at >= ``since_ts``.
+
+        Used by `/admin/cost.json?detail=1` for the
+        `unique_cards_published_today` field — dedupes by card id so
+        boot-scout republishes don't inflate the figure. Pass the
+        UTC-midnight timestamp for "today's" count.
+
+        Note: `published_cards` is an upsert-on-card_id table, so even
+        without filtering, the row count equals unique-card count for
+        cards still in the snapshot. The since-ts filter narrows to
+        cards last snapshotted today; a card snapshotted yesterday and
+        re-snapshotted today counts once.
+        """
+        async with self._connect() as db:
+            async with db.execute(
+                """
+                SELECT COUNT(DISTINCT card_id)
+                FROM published_cards
+                WHERE snapshotted_at >= ?
+                """,
+                (float(since_ts),),
+            ) as cur:
+                row = await cur.fetchone()
+        try:
+            return int(row[0]) if row and row[0] is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
     # ── Embeds (per-operator widget registration) ──
 
     async def list_embeds(self, active_only: bool = False) -> list[Embed]:

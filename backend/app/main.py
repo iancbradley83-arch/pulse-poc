@@ -582,7 +582,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(SlowAPIMiddleware)
 
 # ── Candidate engine plumbing ──
-from typing import Optional as _Optional
+from typing import Any, Optional as _Optional
 candidate_store = CandidateStore(PULSE_DB_PATH)
 candidate_engine: _Optional[CandidateEngine] = None  # initialised in startup
 
@@ -1135,15 +1135,65 @@ async def admin_rerun_status():
     }
 
 
+_TRUTHY_DETAIL = frozenset({"1", "true", "yes", "on"})
+
+
+def _detail_enabled(detail: _Optional[str]) -> bool:
+    """Parse the `?detail=` query param.
+
+    Truthy: ``1``, ``true``, ``yes``, ``on`` (case- and whitespace-
+    insensitive). Anything else (including missing, empty, ``0``,
+    ``false``, ``banana``) → False.
+    """
+    if not detail:
+        return False
+    return detail.strip().lower() in _TRUTHY_DETAIL
+
+
+def _today_utc_midnight_ts() -> float:
+    """Return the UTC midnight timestamp (epoch seconds) for today.
+
+    Used to bucket published-card rows into "today" by `snapshotted_at`
+    in `/admin/cost.json?detail=1`. Computed via `calendar.timegm` so we
+    don't pick up the host's local TZ offset.
+    """
+    import calendar as _cal
+    import time as _t
+    tm = _t.gmtime()
+    midnight = (tm.tm_year, tm.tm_mon, tm.tm_mday, 0, 0, 0, 0, 0, 0)
+    return float(_cal.timegm(midnight))
+
+
 @app.get("/admin/cost.json", dependencies=[Depends(require_admin)])
-async def admin_cost_json(days: int = 1):
+async def admin_cost_json(days: int = 7, detail: _Optional[str] = None):
     """Machine-readable cost endpoint consumed by ops-bot.
 
-    Returns today's totals plus a `days`-length history (most-recent-first,
-    capped at 30). Shape is documented in ops-bot/DESIGN.md Bug 1 spec.
+    Default response (no query / `?detail=0`): today's totals plus a
+    7-day history (most-recent-first, capped at 30). Matches what the
+    `/admin/cost` HTML page exposes — no new computation.
 
-    Auth: same open-by-default convention as all other /admin/* endpoints.
-    A basic-auth PR is queued separately; do not gate this differently.
+    With `?detail=1` (also accepts ``true`` / ``yes`` / ``on``,
+    case-insensitive), the response additionally includes:
+
+      - ``by_kind``  — per-kind breakdown for today from
+        ``daily_cost_by_kind`` (added in the per-kind telemetry PR).
+        Empty dict if no rows yet.
+      - ``cards_in_feed_now`` — `len(feed.prematch_cards)`.
+      - ``unique_cards_published_today`` — DISTINCT card_id from
+        ``published_cards`` snapshotted on/after today's UTC midnight.
+        Dedupes boot-scout republishes (issue 4 in
+        ``follow-ups-from-ops-session-2026-04-28.md``).
+      - ``republish_events_today`` — raw publish-event count today.
+        ``null`` for now: there is no publish-event log table; the
+        ``published_cards`` snapshot is upsert-on-card_id and would
+        only ever return the unique count again.
+      - ``rewrite_cache_hits_today`` — Sonnet-rewrite cache hits today.
+        ``null`` for now: ``NarrativeRewriter`` exposes a per-cycle
+        counter (resets each rerun) but no daily-aggregated total.
+
+    Auth: gated by ``require_admin`` (HTTP Basic when
+    ``PULSE_ADMIN_USER`` + ``PULSE_ADMIN_PASS`` are set, no-op
+    otherwise). Same convention as every other ``/admin/*`` route.
     """
     days = max(1, min(int(days), 30))
 
@@ -1176,12 +1226,62 @@ async def admin_cost_json(days: int = 1):
             "limit_usd": round(limit_usd, 2),
         })
 
-    return {
+    body: dict[str, Any] = {
         "total_usd": round(float(snap.get("total_usd", 0.0)), 4),
         "total_calls": int(snap.get("calls", 0)),
         "limit_usd": round(limit_usd, 2),
         "days": day_rows,
     }
+
+    if not _detail_enabled(detail):
+        return body
+
+    # Detail block. Ops-bot Stage 1.5 (`/breakdown`, `$/card` KPI)
+    # consumes these fields. Each source is read defensively so a
+    # single failure can't 500 the whole endpoint.
+    today = _today_utc()
+
+    try:
+        by_kind = await candidate_store.get_daily_cost_by_kind(today)
+        # Normalize to plain dicts of usd/calls so the JSON response is
+        # stable regardless of internal type quirks.
+        by_kind_clean: dict[str, dict[str, float | int]] = {}
+        for kind, vals in (by_kind or {}).items():
+            try:
+                by_kind_clean[str(kind)] = {
+                    "usd": round(float(vals.get("usd", 0.0)), 4),
+                    "calls": int(vals.get("calls", 0)),
+                }
+            except (AttributeError, TypeError, ValueError):
+                continue
+        body["by_kind"] = by_kind_clean
+    except Exception as exc:
+        logger.warning("[cost] /admin/cost.json by_kind read failed: %s", exc)
+        body["by_kind"] = {}
+
+    try:
+        body["cards_in_feed_now"] = len(feed.prematch_cards)
+    except Exception as exc:
+        logger.warning("[cost] /admin/cost.json cards_in_feed_now read failed: %s", exc)
+        body["cards_in_feed_now"] = 0
+
+    try:
+        midnight_ts = _today_utc_midnight_ts()
+        body["unique_cards_published_today"] = (
+            await candidate_store.count_unique_published_cards_since(midnight_ts)
+        )
+    except Exception as exc:
+        logger.warning(
+            "[cost] /admin/cost.json unique_cards_published_today read failed: %s", exc,
+        )
+        body["unique_cards_published_today"] = 0
+
+    # Not currently surfaced — see docstring. Explicit null beats
+    # silent omission for a downstream consumer.
+    body["republish_events_today"] = None
+    body["rewrite_cache_hits_today"] = None
+
+    return body
 
 
 @app.get("/admin/cost", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
