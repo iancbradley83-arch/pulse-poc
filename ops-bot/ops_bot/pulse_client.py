@@ -165,6 +165,27 @@ class PulseClient:
         except Exception as exc:
             raise PulseError(f"request failed: {exc}") from exc
 
+    async def embeds(self) -> Dict[str, Any]:
+        """GET /admin/embeds.json — basic auth required if credentials set."""
+        url = f"{self._base_url}/admin/embeds.json"
+        try:
+            kwargs: Dict[str, Any] = {}
+            if self._admin_auth:
+                kwargs["auth"] = self._admin_auth
+            resp = await self._client.get(url, **kwargs)
+            if resp.status_code == 404:
+                raise PulseError("404")
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.TimeoutException as exc:
+            raise PulseError("unreachable") from exc
+        except httpx.HTTPStatusError as exc:
+            raise PulseError(f"http {exc.response.status_code}") from exc
+        except PulseError:
+            raise
+        except Exception as exc:
+            raise PulseError(f"request failed: {exc}") from exc
+
     async def feed(self) -> Dict[str, Any]:
         """GET /api/feed — no auth required."""
         url = f"{self._base_url}/api/feed"
