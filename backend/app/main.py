@@ -14,6 +14,8 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
 
 # Configure logging BEFORE any module-level loggers are created. Without this,
 # our `logger.info(...)` calls go nowhere on Railway — only WARNING+ slips
@@ -23,6 +25,76 @@ logging.basicConfig(
     level=os.getenv("PULSE_LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+# ---------------------------------------------------------------------------
+# Sentry — DSN-gated. Unset/empty PULSE_SENTRY_DSN = silent no-op so local
+# dev and CI never ship spurious events. FastApiIntegration auto-captures
+# any exception that bubbles to a route handler, so engine errors that
+# propagate up are picked up without per-module wiring.
+# ---------------------------------------------------------------------------
+_SENTRY_SCRUB_HEADERS = {"authorization", "cookie"}
+_SENTRY_SCRUB_ENV_KEYS = {
+    "RAILWAY_API_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ROGUE_CONFIG_JWT",
+}
+
+
+def _sentry_before_send(event, hint):
+    """Strip auth headers and known secret env vars before shipping to Sentry."""
+    try:
+        request = event.get("request") or {}
+        headers = request.get("headers")
+        if isinstance(headers, dict):
+            for key in list(headers.keys()):
+                if key.lower() in _SENTRY_SCRUB_HEADERS:
+                    headers[key] = "[Filtered]"
+
+        for breadcrumb in (event.get("breadcrumbs") or {}).get("values") or []:
+            data = breadcrumb.get("data")
+            if not isinstance(data, dict):
+                continue
+            for key in list(data.keys()):
+                if key.lower() in _SENTRY_SCRUB_HEADERS:
+                    data[key] = "[Filtered]"
+
+        contexts = event.get("contexts") or {}
+        runtime_env = contexts.get("env") or contexts.get("environment")
+        if isinstance(runtime_env, dict):
+            for secret_key in _SENTRY_SCRUB_ENV_KEYS:
+                if secret_key in runtime_env:
+                    runtime_env[secret_key] = "[Filtered]"
+
+        extra = event.get("extra")
+        if isinstance(extra, dict):
+            env_blob = extra.get("env")
+            if isinstance(env_blob, dict):
+                for secret_key in _SENTRY_SCRUB_ENV_KEYS:
+                    if secret_key in env_blob:
+                        env_blob[secret_key] = "[Filtered]"
+    except Exception:  # noqa: BLE001 — never let scrubbing break the pipeline
+        pass
+    return event
+
+
+_sentry_dsn = (os.getenv("PULSE_SENTRY_DSN") or "").strip()
+if _sentry_dsn:
+    try:
+        _traces_rate = float(os.getenv("PULSE_SENTRY_TRACES_SAMPLE_RATE", "0.05"))
+    except ValueError:
+        _traces_rate = 0.05
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        traces_sample_rate=_traces_rate,
+        profiles_sample_rate=0.0,
+        environment=os.getenv("PULSE_ENVIRONMENT", "production"),
+        release=os.getenv("RAILWAY_GIT_COMMIT_SHA") or "unknown",
+        send_default_pii=False,
+        integrations=[FastApiIntegration()],
+        before_send=_sentry_before_send,
+    )
+else:
+    print("[sentry] disabled — PULSE_SENTRY_DSN not set")
 
 from app.config import (
     ANTHROPIC_API_KEY,

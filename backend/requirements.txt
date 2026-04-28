@@ -19,3 +19,7 @@ aiosqlite==0.20.0
 
 # Per-IP rate limiting. Defaults and key_func wired in backend/app/main.py.
 slowapi>=0.1.9,<0.2
+
+# Sentry SDK with FastAPI integration. Captures unhandled exceptions and a
+# small sample of slow requests. DSN-gated via PULSE_SENTRY_DSN — unset = off.
+sentry-sdk[fastapi]~=2.20
