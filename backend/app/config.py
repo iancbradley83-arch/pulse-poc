@@ -575,6 +575,13 @@ PULSE_CARD_TTL_SECONDS = int(os.getenv("PULSE_CARD_TTL_SECONDS", "21600"))
 # How often the TTL sweep runs (checking for expired cards).
 PULSE_CARD_TTL_SWEEP_SECONDS = int(os.getenv("PULSE_CARD_TTL_SWEEP_SECONDS", "60"))
 
+# Drop persisted-card snapshots this many seconds after kickoff. Cards
+# beyond this are filtered out of /api/feed anyway by kickoff rules;
+# keeping their snapshot wastes disk + RAM. Default 1h.
+PULSE_POSTKICKOFF_TTL_SECONDS = int(
+    os.getenv("PULSE_POSTKICKOFF_TTL_SECONDS", "3600") or "3600"
+)
+
 # Default TRUE: emit the direct kmianko URL instead of the apuestatotal.com
 # wrapper. Discovered post-PR #37 that the outer wrapper is a Next.js SPA
 # that builds the kmianko iframe client-side — its fpath decoder strips or

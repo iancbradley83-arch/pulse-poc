@@ -31,6 +31,34 @@ from app.models.news import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_kickoff_for_backfill(raw: str) -> Optional[float]:
+    """Parse `Game.start_time` ("23 Apr 20:00 UTC") into a unix epoch.
+
+    Mirrors `_parse_kickoff_to_epoch` in app/main.py and the equivalent
+    helper in services/feed_manager.py. Duplicated here so the
+    candidate_store has no upward import on main / feed_manager (would
+    create a cycle: main → candidate_store → feed_manager → main).
+    Missing year → fill with current UTC year, bump forward a year if the
+    parse lands >6 months in the past (Dec fixture viewed from Jan).
+    """
+    if not raw:
+        return None
+    try:
+        from datetime import datetime, timezone, timedelta
+        txt = raw.strip()
+        if txt.endswith(" UTC"):
+            txt = txt[:-4]
+        now = datetime.now(timezone.utc)
+        parsed = datetime.strptime(txt, "%d %b %H:%M").replace(
+            year=now.year, tzinfo=timezone.utc,
+        )
+        if (now - parsed) > timedelta(days=180):
+            parsed = parsed.replace(year=now.year + 1)
+        return parsed.timestamp()
+    except Exception:
+        return None
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS news_items (
     id TEXT PRIMARY KEY,
@@ -454,6 +482,66 @@ class CandidateStore:
                     "[PULSE] published_cards: created_at column added; backfilled %d rows",
                     backfilled,
                 )
+
+            # published_cards expires_at backfill (PR fix/expires-at-backfill,
+            # 2026-04-28). PR #92 wired the TTL sweep + startup purge but
+            # rows have never had a non-NULL expires_at — every snapshot
+            # we ever wrote landed with NULL, so the purge dropped 0 rows
+            # forever. Backfill from the snapshot's kickoff (`game.start_time`):
+            #   primary: kickoff + PULSE_POSTKICKOFF_TTL_SECONDS (default 1h)
+            #   fallback (missing/malformed): COALESCE(created_at, snapshotted_at) + 21600s
+            # Idempotent — only touches rows where expires_at IS NULL, so
+            # subsequent boots are a no-op. Runs in a single transaction.
+            if pub_cols:
+                post_kickoff_ttl = int(
+                    os.getenv("PULSE_POSTKICKOFF_TTL_SECONDS", "3600") or "3600"
+                )
+                fallback_ttl = int(
+                    os.getenv("PULSE_CARD_TTL_SECONDS", "21600") or "21600"
+                )
+                async with db.execute(
+                    "SELECT card_id, snapshot_json, "
+                    "COALESCE(created_at, snapshotted_at) AS anchor "
+                    "FROM published_cards WHERE expires_at IS NULL"
+                ) as cur:
+                    rows = await cur.fetchall()
+                if rows:
+                    updates: list[tuple[float, str]] = []
+                    for r in rows:
+                        card_id = r[0]
+                        snap = r[1]
+                        anchor = float(r[2] or 0.0)
+                        expires_at: Optional[float] = None
+                        try:
+                            doc = json.loads(snap) if snap else {}
+                            game = doc.get("game") if isinstance(doc, dict) else None
+                            kickoff_raw = (
+                                (game or {}).get("start_time", "") if isinstance(game, dict) else ""
+                            )
+                            ko = _parse_kickoff_for_backfill(kickoff_raw or "")
+                            if ko is not None:
+                                expires_at = ko + float(post_kickoff_ttl)
+                        except Exception:
+                            # Malformed JSON or unexpected shape — fall through
+                            # to the anchor-based fallback.
+                            expires_at = None
+                        if expires_at is None:
+                            expires_at = anchor + float(fallback_ttl)
+                        updates.append((expires_at, card_id))
+                    await db.executemany(
+                        "UPDATE published_cards SET expires_at = ? "
+                        "WHERE card_id = ? AND expires_at IS NULL",
+                        updates,
+                    )
+                    await db.commit()
+                    logger.info(
+                        "[PULSE] published_cards: expires_at backfilled for %d rows",
+                        len(updates),
+                    )
+                else:
+                    logger.info(
+                        "[PULSE] published_cards: expires_at backfilled for 0 rows"
+                    )
 
             # daily_cost_by_kind migration (PR feat/cost-by-kind-telemetry,
             # 2026-04-28). Additive new table; CREATE TABLE IF NOT EXISTS
