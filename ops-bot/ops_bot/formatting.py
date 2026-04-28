@@ -38,10 +38,11 @@ def format_help() -> str:
         "pulse-ops-bot — commands\n"
         "\n"
         "stage 1 (read-only)\n"
-        "  /status        pulse health + cost + deploy\n"
+        "  /status        pulse health + cost + deploy + cards/$ per card\n"
         "  /cost [days]   daily LLM spend, default last 3\n"
+        "  /breakdown     today's spend by kind + $/card KPIs\n"
         "\n"
-        "stage 2 coming: /feed /card /embed /cost-detail /logs /runbook /env\n"
+        "stage 2 coming: /feed /card /embed /logs /runbook /env\n"
         "stage 3 coming: /pause /resume /rerun /flag /redeploy /blacklist /snooze\n"
         "stage 4 coming: /preview /restore /incident /contact"
     )
@@ -56,6 +57,7 @@ def format_status(
     pulse_unreachable: bool = False,
     railway_unreachable: bool = False,
     check_age_seconds: int = 0,
+    cost_detail: Optional[Dict[str, Any]] = None,
 ) -> str:
     lines: List[str] = []
 
@@ -109,6 +111,16 @@ def format_status(
         lines.append(f"Engine: {rerun}  {news}  {storylines}")
     else:
         lines.append("Engine: (unavailable)")
+
+    # Cards-in-feed + $/card KPI line (PR #84 enrichment, optional).
+    if cost_detail is not None:
+        cards_feed = cost_detail.get("cards_in_feed_now")
+        total_usd = float(cost_detail.get("total_usd", 0.0))
+        if cards_feed is not None:
+            kpi = f"Cards: {cards_feed} in feed"
+            if isinstance(cards_feed, int) and cards_feed > 0 and total_usd > 0:
+                kpi += f"  $/card: ${total_usd / cards_feed:.4f}"
+            lines.append(kpi)
 
     lines.append("")
     lines.append(f"last check: {check_age_seconds}s ago")
@@ -165,3 +177,79 @@ def format_boot_ping(pulse_ok: bool, spend_usd: float, limit_usd: float = 3.0) -
         f"[ops-bot] online — restart\n"
         f"Pulse: {pulse_state}  cost: ${spend_usd:.2f} / ${limit_usd:.2f}"
     )
+
+
+def format_breakdown(detail: Dict[str, Any]) -> str:
+    """
+    Format the /breakdown response from /admin/cost.json?detail=1.
+
+    Renders today's spend split by kind, plus card counts and per-card KPIs.
+    Tolerates missing/null enrichment fields (the new telemetry can be cold).
+    """
+    today = ""
+    if detail.get("days"):
+        today = detail["days"][0].get("date", "") or ""
+
+    total_usd = float(detail.get("total_usd", 0.0))
+    limit_usd = float(detail.get("limit_usd", 3.0))
+    total_calls = int(detail.get("total_calls", 0))
+    pct = math.floor(total_usd / limit_usd * 100) if limit_usd > 0 else 0
+
+    lines: List[str] = []
+    header = "Daily breakdown" + (f" — {today}" if today else "")
+    lines.append(header)
+    lines.append(f"Total: ${total_usd:.2f} / ${limit_usd:.2f}  ({pct}%) — {total_calls} calls")
+    lines.append("")
+
+    by_kind = detail.get("by_kind") or {}
+    if by_kind:
+        lines.append("By kind:")
+        rows = sorted(
+            by_kind.items(),
+            key=lambda x: -float((x[1] or {}).get("usd", 0.0)),
+        )
+        for kind, agg in rows:
+            agg = agg or {}
+            usd = float(agg.get("usd", 0.0))
+            calls = int(agg.get("calls", 0))
+            lines.append(f"  {kind:22} {calls:4d} calls   ${usd:.4f}")
+    else:
+        lines.append("By kind: (no per-kind data yet — engine cycles will populate)")
+    lines.append("")
+
+    cards_feed = detail.get("cards_in_feed_now")
+    cards_today = detail.get("unique_cards_published_today")
+    republishes = detail.get("republish_events_today")
+    cache_hits = detail.get("rewrite_cache_hits_today")
+
+    cards_parts: List[str] = []
+    if cards_feed is not None:
+        cards_parts.append(f"{cards_feed} in feed")
+    if cards_today is not None:
+        cards_parts.append(f"{cards_today} unique today")
+    if republishes is not None:
+        cards_parts.append(f"{republishes} publish events")
+    if cards_parts:
+        lines.append("Cards: " + " · ".join(cards_parts))
+
+    if isinstance(cards_feed, int) and cards_feed > 0 and total_usd > 0:
+        lines.append(f"$/card in feed:      ${total_usd / cards_feed:.4f}")
+    if isinstance(cards_today, int) and cards_today > 0 and total_usd > 0:
+        lines.append(f"$/unique card today: ${total_usd / cards_today:.4f}")
+
+    if cache_hits is not None:
+        lines.append(f"Rewrite cache hits today: {cache_hits}")
+
+    if (
+        isinstance(republishes, int)
+        and isinstance(cards_today, int)
+        and cards_today > 0
+        and republishes > 3 * cards_today
+    ):
+        lines.append("")
+        lines.append(
+            "(today has heavy republish churn — likely redeploy boots; "
+            "steady-state $/card is lower)"
+        )
+
+    return "\n".join(lines)

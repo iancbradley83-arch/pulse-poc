@@ -126,6 +126,45 @@ class PulseClient:
         except Exception as exc:
             raise PulseError(f"couldn't parse cost response: {exc}") from exc
 
+    async def cost_detail(self) -> Dict[str, Any]:
+        """
+        GET /admin/cost.json?detail=1 — enriched payload from PR #84.
+
+        Shape (live as of 2026-04-28):
+          {
+            "total_usd": float, "total_calls": int, "limit_usd": float,
+            "days": [...],
+            "by_kind": {kind: {"usd": float, "calls": int}} or {},
+            "cards_in_feed_now": int|null,
+            "unique_cards_published_today": int|null,
+            "republish_events_today": int|null,
+            "rewrite_cache_hits_today": int|null
+          }
+
+        The enrichment fields may be null while the new telemetry warms up.
+        Caller renders missing fields gracefully.
+        """
+        url = f"{self._base_url}/admin/cost.json"
+        params = {"detail": 1}
+        try:
+            kwargs: Dict[str, Any] = {"params": params}
+            if self._admin_auth:
+                kwargs["auth"] = self._admin_auth
+            resp = await self._client.get(url, **kwargs)
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise PulseError("cost_detail: response was not an object")
+            return data
+        except httpx.TimeoutException as exc:
+            raise PulseError("unreachable") from exc
+        except httpx.HTTPStatusError as exc:
+            raise PulseError(f"http {exc.response.status_code}") from exc
+        except PulseError:
+            raise
+        except Exception as exc:
+            raise PulseError(f"request failed: {exc}") from exc
+
     async def feed(self) -> Dict[str, Any]:
         """GET /api/feed — no auth required."""
         url = f"{self._base_url}/api/feed"
