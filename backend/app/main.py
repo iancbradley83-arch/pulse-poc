@@ -1435,13 +1435,16 @@ async def _load_rogue_prematch(
         # snapshot rehydrate runs in the startup hook so the feed stays
         # populated across redeploys without any LLM call.
         _rerun_enabled = os.getenv("PULSE_RERUN_ENABLED", "true").lower() == "true"
-        if not (PULSE_NEWS_INGEST_ENABLED and _rerun_enabled):
-            logger.info(
-                "[PULSE] engine paused (rerun=%s news_ingest=%s) — skipping boot scout",
-                str(_rerun_enabled).lower(),
-                str(bool(PULSE_NEWS_INGEST_ENABLED)).lower(),
-            )
+        from app.config import PULSE_BOOT_SCOUT_ENABLED as _BOOT_SCOUT_ENABLED
+        _should_run, _log_msg = _should_run_boot_scout(
+            news_ingest_enabled=bool(PULSE_NEWS_INGEST_ENABLED),
+            rerun_enabled=_rerun_enabled,
+            boot_scout_enabled=_BOOT_SCOUT_ENABLED,
+        )
+        if not _should_run:
+            logger.info(_log_msg)
         else:
+            logger.info(_log_msg)
             # Real correlated BB + combo prices come from the same
             # RogueClient via POST /v1/betting/calculateBets.
             #
@@ -2128,6 +2131,42 @@ async def _run_tier_once(tier: str) -> dict:
         return {"ok": False, "error": str(exc)}
     finally:
         _tier_inflight[tier] = False
+
+
+def _should_run_boot_scout(
+    news_ingest_enabled: bool,
+    rerun_enabled: bool,
+    boot_scout_enabled: bool,
+) -> tuple[bool, str]:
+    """Pure decision helper for the boot-scout gate.
+
+    Three states, in priority order:
+
+    1. News-ingest OR rerun OFF — engine paused entirely; the existing
+       cost guard wins regardless of boot_scout_enabled. Returns
+       ``(False, "...engine paused...")``.
+    2. Boot scout disabled (default) — engine is on, but the cold-start
+       LLM scout is skipped. Snapshot rehydrate + tier loops cover the
+       feed without paying ~$0.20-0.30 per redeploy. Returns
+       ``(False, "...boot scout disabled...")``.
+    3. Boot scout enabled (explicit override) — full historical
+       behaviour, the cold-start scout fires. Returns
+       ``(True, "...boot scout active...")``.
+
+    The caller logs the second tuple element at INFO level so the three
+    states are visible at a glance in runtime logs.
+    """
+    if not (news_ingest_enabled and rerun_enabled):
+        return False, (
+            "[PULSE] engine paused (rerun=%s news_ingest=%s) — skipping boot scout"
+            % (str(rerun_enabled).lower(), str(bool(news_ingest_enabled)).lower())
+        )
+    if not boot_scout_enabled:
+        return False, (
+            "[PULSE] boot scout disabled (PULSE_BOOT_SCOUT_ENABLED=false) — "
+            "relying on snapshot rehydrate; tier loops will scout on cadence"
+        )
+    return True, "[PULSE] boot scout active — running _run_candidate_engine on cold start"
 
 
 def _compute_initial_tier_delay(tier: str, boot_defer_seconds: int) -> int:
