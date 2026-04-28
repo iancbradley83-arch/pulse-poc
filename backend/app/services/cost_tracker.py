@@ -30,12 +30,42 @@ prices; web_search is the standard add-on. See
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import time
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Optional contextual override for the `kind` recorded against a call.
+# The boot-scout path (`_load_rogue_prematch` on startup) sets this to
+# `"boot_scout"` so today's redeploy churn is attributable cleanly,
+# without forcing every NewsIngester call site to grow a new arg. When
+# unset, `record_call` uses the `kind` it was passed.
+_kind_override: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "pulse_cost_kind_override", default=None,
+)
+
+
+def set_kind_override(kind: Optional[str]) -> Any:
+    """Set the per-context `kind` override used by record_call.
+
+    Returns the contextvar Token so callers can `reset()` when their
+    scope ends. Pass `None` to clear.
+    """
+    return _kind_override.set(kind)
+
+
+def reset_kind_override(token: Any) -> None:
+    """Reset the kind-override contextvar to the value before `set_kind_override`."""
+    try:
+        _kind_override.reset(token)
+    except (ValueError, LookupError):
+        # Token from a different context; safe to ignore — the new
+        # context's default (None) will apply.
+        pass
 
 
 # ── Budget + pricing knobs ─────────────────────────────────────────────
@@ -200,7 +230,10 @@ class CostTracker:
             if websearch_per_call_usd is not None
             else DEFAULT_WEBSEARCH_PER_CALL_USD
         )
-        self._alerted_80pct_for_day: Optional[str] = None
+        # 80% budget alert state removed 2026-04-28 — pulse-ops-bot now
+        # owns the alert ladder ($1/$2/$2.95). Tripwire alert (the
+        # critical, dedup'd one) still lives in `can_spend` via
+        # `alert_emitter.emit_critical`.
 
     # ── Cost arithmetic helpers ────────────────────────────────────────
 
@@ -355,8 +388,18 @@ class CostTracker:
     ) -> None:
         """Persist an actual call cost to the daily counter.
 
-        `kind` is a free-form bucket label (news_scout, rewrite,
-        storyline_scout, etc.) used for telemetry only.
+        Writes BOTH the per-day total (`add_daily_cost`) and the per-kind
+        bucket (`add_daily_cost_by_kind`). The per-kind write is
+        fail-open: if it raises (e.g. fresh DB without the bucket table
+        on a stale aiosqlite connection cache), we log a warning and
+        continue rather than blocking the engine path.
+
+        `kind` is a free-form bucket label (`news_scout`, `rewrite`,
+        `storyline_scout`, `boot_scout`, etc.). When the
+        `_kind_override` contextvar is set (boot path stamps
+        `"boot_scout"`), we use the override for the by-kind row but
+        leave the total path untouched. Empty/None kind defaults to
+        `"unknown"` so we never write a NULL bucket.
         """
         usd = max(0.0, float(cost_usd or 0.0))
         try:
@@ -367,32 +410,26 @@ class CostTracker:
                 model, kind, usd, exc,
             )
             return
-        logger.debug(
-            "[cost] record model=%s kind=%s usd=$%.4f", model, kind, usd,
-        )
-        # 80%-threshold alarm via the alerts skill (best-effort, never
-        # blocks the call path). Once per UTC day per process.
-        try:
-            total = await self.today_total_usd()
-        except Exception:
-            total = usd
-        if total >= self._daily_budget * 0.80:
-            day = today_utc()
-            if self._alerted_80pct_for_day != day:
-                self._alerted_80pct_for_day = day
-                self._fire_alert(
-                    f"Pulse LLM spend at ${total:.2f} / "
-                    f"${self._daily_budget:.2f} budget for {day} (>=80%)."
-                )
 
-    @staticmethod
-    def _fire_alert(message: str) -> None:
-        """Best-effort alert dispatch — never raises on import failure."""
+        # Per-kind aggregate write (PR feat/cost-by-kind-telemetry,
+        # 2026-04-28). Best-effort: failures here MUST NOT regress the
+        # daily-total path or break the engine.
+        effective_kind = _kind_override.get() or (kind or "unknown")
         try:
-            from alerts import warn  # type: ignore
-            warn(message, source="pulse-cost-tracker")
+            await self._store.add_daily_cost_by_kind(
+                today_utc(), effective_kind, usd, calls_delta=1,
+            )
         except Exception as exc:
-            logger.warning("[cost] alert fire failed: %s — msg=%s", exc, message)
+            logger.warning(
+                "[cost] by-kind write failed (kind=%s usd=$%.4f): %s",
+                effective_kind, usd, exc,
+            )
+
+        logger.debug(
+            "[cost] record model=%s kind=%s (effective=%s) usd=$%.4f",
+            model, kind, effective_kind, usd,
+        )
+        # 80% budget alert removed 2026-04-28 — pulse-ops-bot now owns the alert ladder ($1/$2/$2.95).
 
     async def reset_if_new_day(self) -> None:
         """No-op for SQLite-backed bucket — `today_utc()` keys the row.

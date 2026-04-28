@@ -200,6 +200,22 @@ CREATE TABLE IF NOT EXISTS daily_cost (
     last_call_at REAL
 );
 
+-- Per-kind daily cost aggregation (PR feat/cost-by-kind-telemetry,
+-- 2026-04-28). Restores the bucket-level telemetry that PR #66 simplified
+-- out. One row per (utc_date, kind); `kind` strings are the ones already
+-- passed into `cost_tracker.record_call(kind=...)` (e.g. `news_scout`,
+-- `rewrite`, `storyline_scout`, `boot_scout`). Foundation for the
+-- upcoming `/admin/cost.json?detail=1` endpoint that ops-bot's
+-- `/breakdown` command will consume. Pure aggregate — no Pydantic model;
+-- callers see / write tuples.
+CREATE TABLE IF NOT EXISTS daily_cost_by_kind (
+    utc_date TEXT NOT NULL,
+    kind     TEXT NOT NULL,
+    usd      REAL NOT NULL DEFAULT 0,
+    calls    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (utc_date, kind)
+);
+
 -- Published-card snapshot table (PR fix/published-cards-snapshot,
 -- 2026-04-27). Each row is a fully-rendered Card serialized to JSON at
 -- the moment it lands in FeedManager. Cold-start rehydrate reads these
@@ -397,6 +413,15 @@ class CandidateStore:
             async with db.execute("PRAGMA table_info(embeds)") as cur:
                 _embed_cols = {row[1] for row in await cur.fetchall()}
             _ = _embed_cols
+
+            # daily_cost_by_kind migration (PR feat/cost-by-kind-telemetry,
+            # 2026-04-28). Additive new table; CREATE TABLE IF NOT EXISTS
+            # in executescript below handles first-run install. Probe
+            # exists so future column additions (e.g. p95 latency, error
+            # counts) have a landing spot without re-doing this block.
+            async with db.execute("PRAGMA table_info(daily_cost_by_kind)") as cur:
+                _bk_cols = {row[1] for row in await cur.fetchall()}
+            _ = _bk_cols
 
             await db.executescript(_SCHEMA)
             await db.commit()
@@ -1012,6 +1037,62 @@ class CandidateStore:
                 (date, usd, int(calls_delta), _t.time()),
             )
             await db.commit()
+
+    async def add_daily_cost_by_kind(
+        self,
+        utc_date: str,
+        kind: str,
+        usd: float,
+        *,
+        calls_delta: int = 1,
+    ) -> None:
+        """Atomically add a per-`kind` cost row for `utc_date`.
+
+        Mirrors `add_daily_cost`'s upsert pattern but bucketed on
+        (utc_date, kind). Two concurrent tier loops or a boot-scout +
+        scheduled-rerun overlap can both append safely — the
+        `ON CONFLICT(utc_date, kind) DO UPDATE` is a single statement.
+        """
+        u = max(0.0, float(usd or 0.0))
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO daily_cost_by_kind (utc_date, kind, usd, calls)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(utc_date, kind) DO UPDATE SET
+                    usd = usd + excluded.usd,
+                    calls = calls + excluded.calls
+                """,
+                (utc_date, str(kind), u, int(calls_delta)),
+            )
+            await db.commit()
+
+    async def get_daily_cost_by_kind(
+        self, utc_date: str,
+    ) -> dict[str, dict[str, float | int]]:
+        """Return the per-kind breakdown for a UTC day.
+
+        Shape: ``{kind: {"usd": float, "calls": int}, ...}``. Empty dict
+        if the day has no rows yet. Powers the upcoming
+        `/admin/cost.json?detail=1` endpoint (separate PR) and ops-bot's
+        `/breakdown` command.
+        """
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT kind, usd, calls FROM daily_cost_by_kind WHERE utc_date = ?",
+                (utc_date,),
+            ) as cur:
+                rows = await cur.fetchall()
+        out: dict[str, dict[str, float | int]] = {}
+        for r in rows or []:
+            try:
+                out[str(r[0])] = {
+                    "usd": float(r[1] or 0.0),
+                    "calls": int(r[2] or 0),
+                }
+            except (TypeError, ValueError):
+                continue
+        return out
 
     async def get_daily_cost_history(self, days: int = 7) -> list[dict[str, Any]]:
         """Return the most recent `days` rows of daily cost telemetry.
