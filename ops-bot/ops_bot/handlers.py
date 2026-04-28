@@ -19,7 +19,7 @@ from .config import (
     RAILWAY_SERVICE_ID,
     RAILWAY_ENVIRONMENT_ID,
 )
-from .formatting import format_help, format_status, format_cost
+from .formatting import format_help, format_status, format_cost, format_breakdown
 from .pulse_client import PulseClient, PulseError
 from .railway_client import RailwayClient, RailwayError
 
@@ -73,6 +73,14 @@ async def cmd_status(message: Message) -> None:
         logger.warning("status: feed fetch failed: %s", exc)
         pulse_unreachable = True
 
+    # Fetch enriched cost detail for the cards-in-feed + $/card line.
+    # Optional — failure here doesn't mark Pulse unreachable; we just skip the line.
+    cost_detail = None
+    try:
+        cost_detail = await _pulse_client.cost_detail()
+    except PulseError as exc:
+        logger.info("status: cost_detail fetch failed (non-blocking): %s", exc)
+
     # Fetch Railway deployment + engine vars.
     deployment = None
     engine_vars = None
@@ -106,7 +114,31 @@ async def cmd_status(message: Message) -> None:
         pulse_unreachable=pulse_unreachable,
         railway_unreachable=railway_unreachable,
         check_age_seconds=elapsed,
+        cost_detail=cost_detail,
     )
+    await message.answer(text)
+
+
+@router.message(Command("breakdown"))
+async def cmd_breakdown(message: Message) -> None:
+    pulse_unreachable = False
+    detail = None
+    try:
+        detail = await _pulse_client.cost_detail()
+    except PulseError as exc:
+        logger.warning("breakdown: fetch failed: %s", exc)
+        pulse_unreachable = True
+
+    if detail is None:
+        if pulse_unreachable:
+            await message.answer("(Pulse unreachable)")
+        else:
+            await message.answer("no breakdown data available")
+        return
+
+    text = format_breakdown(detail)
+    if pulse_unreachable:
+        text += "\n(Pulse unreachable)"
     await message.answer(text)
 
 
