@@ -246,6 +246,29 @@ CREATE TABLE IF NOT EXISTS embeds (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_embeds_slug ON embeds(slug);
 CREATE INDEX IF NOT EXISTS idx_embeds_active ON embeds(active);
+
+-- Per-kind cost aggregation (restored in feat/cost-breakdown-1-5; was lost
+-- in PR #66). One row per (UTC date, kind). Upserted atomically alongside
+-- `daily_cost` on every record_call so the two tables stay in sync.
+-- Kind strings in flight: news_scout, rewrite, storyline_scout,
+-- storyline_verify, storyline_narrative, standings_verify, combined_narrative.
+CREATE TABLE IF NOT EXISTS daily_cost_by_kind (
+    date TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    usd  REAL NOT NULL DEFAULT 0,
+    calls INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (date, kind)
+);
+
+-- Generic daily integer counters (feat/cost-breakdown-1-5). Used for
+-- rewrite_cache_hits_today and republish_events_today. One row per
+-- (UTC date, counter_name). Reset naturally by keying on UTC date.
+CREATE TABLE IF NOT EXISTS daily_counters (
+    date TEXT NOT NULL,
+    name TEXT NOT NULL,
+    value INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (date, name)
+);
 """
 
 
@@ -397,6 +420,17 @@ class CandidateStore:
             async with db.execute("PRAGMA table_info(embeds)") as cur:
                 _embed_cols = {row[1] for row in await cur.fetchall()}
             _ = _embed_cols
+
+            # daily_cost_by_kind + daily_counters migration
+            # (feat/cost-breakdown-1-5). Both are CREATE TABLE IF NOT EXISTS
+            # in _SCHEMA — first-run handled automatically. Probe exists so
+            # future column additions have a landing spot.
+            async with db.execute("PRAGMA table_info(daily_cost_by_kind)") as cur:
+                _dck_cols = {row[1] for row in await cur.fetchall()}
+            _ = _dck_cols
+            async with db.execute("PRAGMA table_info(daily_counters)") as cur:
+                _dc_cols = {row[1] for row in await cur.fetchall()}
+            _ = _dc_cols
 
             await db.executescript(_SCHEMA)
             await db.commit()
@@ -1038,6 +1072,145 @@ class CandidateStore:
                 "last_call_at": float(r[3]) if r[3] is not None else None,
             })
         return out
+
+    # ── Per-kind cost telemetry (feat/cost-breakdown-1-5) ─────────────────
+
+    async def add_daily_cost_by_kind(
+        self, date: str, kind: str, usd_delta: float, *, calls_delta: int = 1,
+    ) -> None:
+        """Atomically upsert a cost delta into the per-kind bucket.
+
+        Called by CostTracker.record_call alongside add_daily_cost so the
+        two tables stay in sync. Falls through silently on any SQLite error
+        so a kind-table failure can never crash the engine's cost path.
+        """
+        usd = max(0.0, float(usd_delta or 0.0))
+        kind = str(kind or "unknown")
+        try:
+            async with self._connect() as db:
+                await db.execute(
+                    """
+                    INSERT INTO daily_cost_by_kind (date, kind, usd, calls)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(date, kind) DO UPDATE SET
+                        usd   = usd   + excluded.usd,
+                        calls = calls + excluded.calls
+                    """,
+                    (date, kind, usd, int(calls_delta)),
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.warning(
+                "[CandidateStore] add_daily_cost_by_kind failed (kind=%s): %s",
+                kind, exc,
+            )
+
+    async def get_daily_cost_by_kind(self, date: str) -> dict[str, dict[str, Any]]:
+        """Return per-kind breakdown for a UTC day.
+
+        Returns {kind: {"usd": float, "calls": int}}.
+        Empty dict if no rows exist for the day.
+        """
+        try:
+            async with self._connect() as db:
+                async with db.execute(
+                    "SELECT kind, usd, calls FROM daily_cost_by_kind WHERE date = ?",
+                    (date,),
+                ) as cur:
+                    rows = await cur.fetchall()
+        except Exception as exc:
+            logger.warning(
+                "[CandidateStore] get_daily_cost_by_kind failed: %s", exc,
+            )
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows or []:
+            out[r[0]] = {
+                "usd": round(float(r[1] or 0.0), 4),
+                "calls": int(r[2] or 0),
+            }
+        return out
+
+    # ── Generic daily counters (feat/cost-breakdown-1-5) ──────────────────
+
+    async def increment_daily_counter(
+        self, date: str, name: str, delta: int = 1,
+    ) -> None:
+        """Atomically increment a named integer counter for a UTC day.
+
+        Used for rewrite_cache_hits_today and republish_events_today.
+        Falls through silently on SQLite error.
+        """
+        try:
+            async with self._connect() as db:
+                await db.execute(
+                    """
+                    INSERT INTO daily_counters (date, name, value)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(date, name) DO UPDATE SET
+                        value = value + excluded.value
+                    """,
+                    (date, str(name), int(delta)),
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.warning(
+                "[CandidateStore] increment_daily_counter failed (name=%s): %s",
+                name, exc,
+            )
+
+    async def get_daily_counter(self, date: str, name: str) -> int:
+        """Return today's value for a named counter. 0 if no row."""
+        try:
+            async with self._connect() as db:
+                async with db.execute(
+                    "SELECT value FROM daily_counters WHERE date = ? AND name = ?",
+                    (date, str(name)),
+                ) as cur:
+                    row = await cur.fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception as exc:
+            logger.warning(
+                "[CandidateStore] get_daily_counter failed (name=%s): %s",
+                name, exc,
+            )
+            return 0
+
+    # ── Published-card today stats (feat/cost-breakdown-1-5) ─────────────
+
+    async def count_unique_cards_published_today(self, date_str: str) -> int:
+        """Count distinct card_id rows snapshotted on a UTC day.
+
+        `date_str` is YYYY-MM-DD (UTC). We filter on snapshotted_at
+        unix timestamp falling within the UTC day boundaries.
+
+        Returns the count of unique card_id values (not publish events —
+        published_cards uses INSERT OR REPLACE so each card_id appears at
+        most once; this is effectively the published-card count for the day).
+        The number is useful as a cross-check against republish_events_today.
+        """
+        import time as _t
+        try:
+            import calendar
+            import datetime as _dt
+            day = _dt.datetime.strptime(date_str, "%Y-%m-%d")
+            day_start = calendar.timegm(day.timetuple())  # UTC midnight
+            day_end = day_start + 86400
+            async with self._connect() as db:
+                async with db.execute(
+                    """
+                    SELECT COUNT(DISTINCT card_id) FROM published_cards
+                    WHERE snapshotted_at >= ? AND snapshotted_at < ?
+                    """,
+                    (float(day_start), float(day_end)),
+                ) as cur:
+                    row = await cur.fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception as exc:
+            logger.warning(
+                "[CandidateStore] count_unique_cards_published_today failed: %s", exc,
+            )
+            return 0
 
     async def reaction_aggregates(self) -> list[dict[str, Any]]:
         """Aggregate reactions by (fixture, hook_type, bet_type, storyline) for

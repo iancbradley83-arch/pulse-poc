@@ -344,6 +344,13 @@ class NarrativeRewriter:
                 logger.debug(
                     "[NarrativeRewriter] rewrite_cache_hit key=%s...", cache_key[:12],
                 )
+                # Persist the cache-hit to the daily counter so
+                # /admin/cost.json?detail=1 can surface rewrite_cache_hits_today.
+                if self._cost_tracker is not None:
+                    try:
+                        await self._cost_tracker.record_rewrite_cache_hit()
+                    except Exception:
+                        pass
                 return {"headline": cached["headline"], "angle": cached.get("angle", "")}
 
         pick_label = ""

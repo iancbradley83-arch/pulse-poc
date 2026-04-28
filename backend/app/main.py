@@ -1136,14 +1136,19 @@ async def admin_rerun_status():
 
 
 @app.get("/admin/cost.json", dependencies=[Depends(require_admin)])
-async def admin_cost_json(days: int = 1):
+async def admin_cost_json(days: int = 1, detail: int = 0):
     """Machine-readable cost endpoint consumed by ops-bot.
 
-    Returns today's totals plus a `days`-length history (most-recent-first,
-    capped at 30). Shape is documented in ops-bot/DESIGN.md Bug 1 spec.
+    Without ?detail=1 (default): returns the Stage 1 shape — today's totals
+    plus a `days`-length history. This shape is backward-compatible and must
+    not change.
+
+    With ?detail=1: returns the enriched Stage 1.5 shape with per-kind
+    breakdown and today-only card/publish/cache counters. The breakdown
+    fields are TODAY-only (UTC); they do not aggregate across the `days`
+    window. The `days` array is identical to the unenriched response.
 
     Auth: same open-by-default convention as all other /admin/* endpoints.
-    A basic-auth PR is queued separately; do not gate this differently.
     """
     days = max(1, min(int(days), 30))
 
@@ -1176,11 +1181,55 @@ async def admin_cost_json(days: int = 1):
             "limit_usd": round(limit_usd, 2),
         })
 
-    return {
+    base = {
         "total_usd": round(float(snap.get("total_usd", 0.0)), 4),
         "total_calls": int(snap.get("calls", 0)),
         "limit_usd": round(limit_usd, 2),
         "days": day_rows,
+    }
+
+    if not detail:
+        return base
+
+    # ?detail=1 — enrich with per-kind breakdown and today-only counters.
+    # All fields below are TODAY (UTC) only, regardless of ?days=N.
+    tracker = _get_cost_tracker()
+
+    by_kind: dict = {}
+    try:
+        by_kind = await tracker.today_by_kind()
+    except Exception as exc:
+        logger.warning("[cost] /admin/cost.json by_kind read failed: %s", exc)
+
+    counters: dict = {}
+    try:
+        counters = await tracker.today_counters()
+    except Exception as exc:
+        logger.warning("[cost] /admin/cost.json counters read failed: %s", exc)
+
+    cards_in_feed_now: _Optional[int] = None
+    try:
+        cards_in_feed_now = len(feed.prematch_cards)
+    except Exception:
+        pass
+
+    unique_cards_today: _Optional[int] = None
+    try:
+        unique_cards_today = await candidate_store.count_unique_cards_published_today(
+            _today_utc()
+        )
+    except Exception as exc:
+        logger.warning(
+            "[cost] /admin/cost.json unique_cards_published_today failed: %s", exc
+        )
+
+    return {
+        **base,
+        "by_kind": by_kind,
+        "cards_in_feed_now": cards_in_feed_now,
+        "unique_cards_published_today": unique_cards_today,
+        "republish_events_today": counters.get("republish_events", 0),
+        "rewrite_cache_hits_today": counters.get("rewrite_cache_hits", 0),
     }
 
 
@@ -2830,6 +2879,13 @@ async def _run_candidate_engine(
                 cand.bscode = card.bscode
                 bscode_updates.append(cand)
         target_feed.add_prematch_card(card)
+        # Track raw publish events (including re-publishes from boot scouts
+        # or multiple reruns). Used by /admin/cost.json?detail=1 to surface
+        # republish_events_today alongside unique_cards_published_today.
+        try:
+            await _get_cost_tracker().record_republish_event()
+        except Exception:
+            pass
         # Staggered publish hook — fires on every successful insert. Tier
         # loops wire this to `feed.broadcast_card_added` so the frontend
         # drops each new card into the feed one-by-one rather than waiting

@@ -356,43 +356,78 @@ class CostTracker:
         """Persist an actual call cost to the daily counter.
 
         `kind` is a free-form bucket label (news_scout, rewrite,
-        storyline_scout, etc.) used for telemetry only.
+        storyline_scout, etc.) used for both the aggregate daily_cost row
+        and the per-kind daily_cost_by_kind row.
         """
         usd = max(0.0, float(cost_usd or 0.0))
+        date = today_utc()
         try:
-            await self._store.add_daily_cost(today_utc(), usd, calls_delta=1)
+            await self._store.add_daily_cost(date, usd, calls_delta=1)
         except Exception as exc:
             logger.warning(
                 "[cost] record_call write failed (model=%s kind=%s usd=$%.4f): %s",
                 model, kind, usd, exc,
             )
             return
+        # Per-kind aggregation — best-effort; failure here must not surface
+        # to callers. add_daily_cost_by_kind already swallows its own errors.
+        try:
+            await self._store.add_daily_cost_by_kind(date, kind, usd, calls_delta=1)
+        except Exception as exc:
+            logger.warning(
+                "[cost] record_call by-kind write failed (kind=%s): %s", kind, exc,
+            )
         logger.debug(
             "[cost] record model=%s kind=%s usd=$%.4f", model, kind, usd,
         )
-        # 80%-threshold alarm via the alerts skill (best-effort, never
-        # blocks the call path). Once per UTC day per process.
-        try:
-            total = await self.today_total_usd()
-        except Exception:
-            total = usd
-        if total >= self._daily_budget * 0.80:
-            day = today_utc()
-            if self._alerted_80pct_for_day != day:
-                self._alerted_80pct_for_day = day
-                self._fire_alert(
-                    f"Pulse LLM spend at ${total:.2f} / "
-                    f"${self._daily_budget:.2f} budget for {day} (>=80%)."
-                )
 
-    @staticmethod
-    def _fire_alert(message: str) -> None:
-        """Best-effort alert dispatch — never raises on import failure."""
+    async def today_by_kind(self) -> dict[str, dict]:
+        """Return per-kind cost breakdown for today (UTC).
+
+        Shape: {kind: {"usd": float, "calls": int}}.
+        Empty dict on any read failure — callers treat missing as zeroes.
+        """
         try:
-            from alerts import warn  # type: ignore
-            warn(message, source="pulse-cost-tracker")
+            return await self._store.get_daily_cost_by_kind(today_utc())
         except Exception as exc:
-            logger.warning("[cost] alert fire failed: %s — msg=%s", exc, message)
+            logger.warning("[cost] today_by_kind read failed: %s", exc)
+            return {}
+
+    async def record_rewrite_cache_hit(self) -> None:
+        """Increment today's rewrite_cache_hits counter. Best-effort."""
+        try:
+            await self._store.increment_daily_counter(
+                today_utc(), "rewrite_cache_hits",
+            )
+        except Exception as exc:
+            logger.warning("[cost] record_rewrite_cache_hit failed: %s", exc)
+
+    async def record_republish_event(self) -> None:
+        """Increment today's republish_events counter. Best-effort.
+
+        Called each time a card is (re-)published to FeedManager so we can
+        distinguish raw publish events from unique cards.
+        """
+        try:
+            await self._store.increment_daily_counter(
+                today_utc(), "republish_events",
+            )
+        except Exception as exc:
+            logger.warning("[cost] record_republish_event failed: %s", exc)
+
+    async def today_counters(self) -> dict[str, int]:
+        """Return {counter_name: value} for today's daily_counters rows."""
+        try:
+            date = today_utc()
+            hits = await self._store.get_daily_counter(date, "rewrite_cache_hits")
+            republish = await self._store.get_daily_counter(date, "republish_events")
+            return {
+                "rewrite_cache_hits": hits,
+                "republish_events": republish,
+            }
+        except Exception as exc:
+            logger.warning("[cost] today_counters read failed: %s", exc)
+            return {"rewrite_cache_hits": 0, "republish_events": 0}
 
     async def reset_if_new_day(self) -> None:
         """No-op for SQLite-backed bucket — `today_utc()` keys the row.

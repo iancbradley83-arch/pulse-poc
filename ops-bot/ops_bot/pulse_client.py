@@ -126,6 +126,60 @@ class PulseClient:
         except Exception as exc:
             raise PulseError(f"couldn't parse cost response: {exc}") from exc
 
+    async def cost_detail(self) -> Dict[str, Any]:
+        """GET /admin/cost.json?detail=1 — enriched breakdown for /breakdown command.
+
+        Returns the Stage 1.5 shape with by_kind, cards_in_feed_now,
+        unique_cards_published_today, republish_events_today,
+        rewrite_cache_hits_today. Falls back to an empty-but-valid dict
+        on parse failure rather than raising PulseError so callers can
+        degrade gracefully.
+        """
+        url = f"{self._base_url}/admin/cost.json"
+        params = {"days": 1, "detail": 1}
+        try:
+            kwargs: Dict[str, Any] = {"params": params}
+            if self._admin_auth:
+                kwargs["auth"] = self._admin_auth
+            resp = await self._client.get(url, **kwargs)
+            resp.raise_for_status()
+            data = resp.json()
+            return self._normalise_cost_detail(data)
+        except httpx.TimeoutException as exc:
+            raise PulseError("unreachable") from exc
+        except httpx.HTTPStatusError as exc:
+            raise PulseError(f"http {exc.response.status_code}") from exc
+        except PulseError:
+            raise
+        except Exception as exc:
+            raise PulseError(f"request failed: {exc}") from exc
+
+    def _normalise_cost_detail(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalise the ?detail=1 response into a guaranteed-shape dict.
+
+        Merges the Stage 1 fields from _normalise_cost with the Stage 1.5
+        enrichments. Any missing field is returned as None so formatters
+        can handle gracefully.
+        """
+        try:
+            base = self._normalise_cost(data, days=1)
+        except PulseError:
+            base = {
+                "total_usd": 0.0,
+                "total_calls": 0,
+                "days": [],
+                "limit_usd": 3.0,
+            }
+        by_kind = data.get("by_kind") or {}
+        return {
+            **base,
+            "by_kind": by_kind,
+            "cards_in_feed_now": data.get("cards_in_feed_now"),
+            "unique_cards_published_today": data.get("unique_cards_published_today"),
+            "republish_events_today": data.get("republish_events_today"),
+            "rewrite_cache_hits_today": data.get("rewrite_cache_hits_today"),
+        }
+
     async def feed(self) -> Dict[str, Any]:
         """GET /api/feed — no auth required."""
         url = f"{self._base_url}/api/feed"
