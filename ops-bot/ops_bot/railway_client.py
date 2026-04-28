@@ -159,13 +159,18 @@ class RailwayClient:
         n: int = 20,
     ) -> List[Dict[str, str]]:
         """
-        Return the most-recent N WARN/ERROR log lines from the latest deployment.
+        Return the most-recent N actual WARN/ERROR log lines from the latest deployment.
 
-        Fetches up to 500 runtime log entries, filters to severity in
-        {WARNING, WARN, ERROR}, then returns the last N entries (most-recent last).
+        Railway tags every line from pulse-poc as severity=error because Pulse
+        writes to stderr — so we can't trust Railway's severity field. Instead
+        we parse the inner Python log level from the message text and only
+        keep WARNING / ERROR / CRITICAL / lines containing 'Traceback'.
 
-        Shape of each entry: {"timestamp": str, "severity": str, "message": str}
+        Each returned entry: {"timestamp": str, "severity": str, "message": str}
+        Returned chronologically (oldest first).
         """
+        import re as _re
+
         deployment = await self.latest_deployment(project_id, service_id)
         deployment_id = deployment["id"]
 
@@ -179,25 +184,40 @@ class RailwayClient:
         }
         """
         data = await self._query(query, {"deploymentId": deployment_id, "limit": 500})
+
+        # Match a Python log level inside the message body.
+        py_level_re = _re.compile(
+            r"\b(CRITICAL|ERROR|WARNING|WARN|Traceback)\b"
+        )
+
         try:
             raw_logs = data.get("deploymentLogs", [])
             if not isinstance(raw_logs, list):
                 raise RailwayError(f"unexpected deploymentLogs shape: {type(raw_logs)}")
 
-            filtered = [
-                {
-                    "timestamp": str(entry.get("timestamp", "")),
-                    "severity": str(entry.get("severity", "")),
-                    "message": str(entry.get("message", "")),
-                }
-                for entry in raw_logs
-                if str(entry.get("severity", "")).upper() in ("WARNING", "WARN", "ERROR")
-            ]
+            kept: List[Dict[str, str]] = []
+            for entry in raw_logs:
+                msg = str(entry.get("message", ""))
+                m = py_level_re.search(msg)
+                if not m:
+                    continue
+                level = m.group(1).upper()
+                if level == "WARN":
+                    level = "WARNING"
+                if level == "TRACEBACK":
+                    level = "ERROR"
+                kept.append(
+                    {
+                        "timestamp": str(entry.get("timestamp", "")),
+                        "severity": level,
+                        "message": msg,
+                    }
+                )
 
             # Railway returns logs newest-first; reverse for chronological output,
             # then take the last N (most recent).
-            filtered.reverse()
-            return filtered[-n:]
+            kept.reverse()
+            return kept[-n:]
         except RailwayError:
             raise
         except Exception as exc:
