@@ -52,8 +52,8 @@ class PulseClient:
             raise PulseError(f"request failed: {exc}") from exc
 
     async def cost(self, days: int = 1) -> Dict[str, Any]:
-        """GET /admin/cost?days=N — basic auth required if credentials set."""
-        url = f"{self._base_url}/admin/cost"
+        """GET /admin/cost.json?days=N — basic auth required if credentials set."""
+        url = f"{self._base_url}/admin/cost.json"
         params = {"days": days}
         try:
             kwargs: Dict[str, Any] = {"params": params}

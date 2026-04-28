@@ -9,6 +9,11 @@ Methods:
       -> dict[str, str]  (env var name -> value)
 
 Raises RailwayError on network failures or unexpected responses.
+
+Security note: httpx.LocalProtocolError embeds the raw header value in its
+message when a malformed Authorization header is sent (e.g. a token with a
+trailing newline). We catch that exception class specifically and emit a
+sanitised log message so the token never appears in Railway logs.
 """
 import logging
 from typing import Any, Dict, Optional
@@ -57,8 +62,19 @@ class RailwayClient:
             raise RailwayError(f"http {exc.response.status_code}") from exc
         except RailwayError:
             raise
+        except httpx.LocalProtocolError:
+            # httpx embeds the raw header value in LocalProtocolError.message,
+            # which would leak the bearer token into logs. Log a sanitised
+            # message instead and never call str(exc) here.
+            logger.warning(
+                "railway api: malformed Authorization header"
+                " — check RAILWAY_API_TOKEN for trailing whitespace or newlines"
+            )
+            raise RailwayError(
+                "malformed Authorization header — check RAILWAY_API_TOKEN"
+            )
         except Exception as exc:
-            raise RailwayError(f"request failed: {exc}") from exc
+            raise RailwayError(f"request failed: {type(exc).__name__}") from exc
 
     async def latest_deployment(
         self, project_id: str, service_id: str
