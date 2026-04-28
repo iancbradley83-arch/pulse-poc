@@ -1344,11 +1344,29 @@ async def _load_rogue_prematch(
         else:
             # Real correlated BB + combo prices come from the same
             # RogueClient via POST /v1/betting/calculateBets.
-            await _run_candidate_engine(
-                simulator._games,
-                rogue_client=client,
-                target_feed=target_feed,
+            #
+            # Stamp the per-kind cost bucket as `boot_scout` for the
+            # cold-start path so today's redeploy churn (~$2.11 on
+            # 2026-04-28) is attributable separately from the scheduled
+            # tier loop's `news_scout` spend. Scheduled rerun calls this
+            # function with `is_rerun=True` and falls through to the
+            # default (no override → caller's `kind` wins).
+            from app.services.cost_tracker import (
+                set_kind_override,
+                reset_kind_override,
             )
+            _kind_token = (
+                set_kind_override("boot_scout") if not is_rerun else None
+            )
+            try:
+                await _run_candidate_engine(
+                    simulator._games,
+                    rogue_client=client,
+                    target_feed=target_feed,
+                )
+            finally:
+                if _kind_token is not None:
+                    reset_kind_override(_kind_token)
 
         # Surface operator-curated featured BBs (Apuesta Total's
         # /v1/featured/betbuilder picks). Each is priced via calculate_bets
