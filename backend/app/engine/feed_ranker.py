@@ -413,11 +413,26 @@ def rank_cards(
         except Exception:
             setattr(c, "__ranker_score__", float(c.relevance_score or 0.0))
 
-    # 2. Drop no-shows.
+    # 2. Drop no-shows. (Correctness — kickoff-passed / suspended cards
+    #    must never render. Not gated.)
     alive = [c for c in cards if not _is_no_show(c, now=now)]
 
     # 3. Dedupe same-fixture same-market duplicates.
-    alive = _dedupe_by_fixture_market(alive)
+    #    Gated behind PULSE_PRUNE_PAID_CARDS (default false) per the
+    #    "publish everything we paid LLM cost for" decision (Ian,
+    #    2026-04-28). When the kill switch is off (default), this filter
+    #    is a no-op so every card we incurred LLM cost on stays visible
+    #    until kickoff / TTL expiry. When set to "true", prior pruning
+    #    behaviour is restored (drop the lower-scored same-fixture +
+    #    same-market_type card). See item 1 in
+    #    docs/follow-ups-from-ops-session-2026-04-28.md for the trace
+    #    showing this filter was the source of today's 2-card gap.
+    try:
+        from app.config import PULSE_PRUNE_PAID_CARDS as _prune_paid
+    except Exception:
+        _prune_paid = False
+    if _prune_paid:
+        alive = _dedupe_by_fixture_market(alive)
 
     # 4. Sort by score desc.
     alive.sort(key=lambda c: getattr(c, "__ranker_score__", 0.0), reverse=True)
@@ -444,6 +459,17 @@ def rank_cards(
 
 # ── Self-test ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Self-test pre-dates the PULSE_PRUNE_PAID_CARDS kill switch; it
+    # asserts the same-fixture+same-market dedupe runs. Force the kill
+    # switch on so the self-test continues to exercise prior behaviour
+    # (the production default is now off — every paid card stays
+    # visible). Real test coverage of both modes lives in
+    # tests/test_publish_everything_paid.py.
+    import os as _os
+    _os.environ["PULSE_PRUNE_PAID_CARDS"] = "true"
+    from app import config as _cfg
+    _cfg.PULSE_PRUNE_PAID_CARDS = True
+
     from app.models.schemas import (
         Game, Team, Sport, GameStatus, Market, MarketSelection, NewsItem,
     )
