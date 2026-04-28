@@ -68,6 +68,15 @@ def _parse_sections(text: str) -> List[Tuple[str, str]]:
     return sections
 
 
+async def list_topics() -> Optional[List[str]]:
+    """Return the list of section headings, or None if the fetch fails."""
+    try:
+        text = await _fetch_runbook()
+    except RuntimeError:
+        return None
+    return [h for h, _ in _parse_sections(text)]
+
+
 async def lookup(topic: str) -> str:
     """
     Return the section(s) matching *topic* (case-insensitive substring).

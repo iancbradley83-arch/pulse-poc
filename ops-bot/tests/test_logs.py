@@ -13,12 +13,18 @@ from ops_bot.formatting import format_logs
 # ---------------------------------------------------------------------------
 
 def _make_entry(severity, message="test message", ts="2026-04-28T16:50:50Z"):
+    """
+    Note: filter now parses the Python log level out of `message` text
+    (Railway tags everything as severity=error from stderr — we ignore
+    that field). Tests that want to be filtered IN must include the
+    word WARNING / ERROR / CRITICAL / Traceback in the message body.
+    """
     return {"timestamp": ts, "severity": severity, "message": message}
 
 
 @pytest.mark.asyncio
 async def test_recent_logs_filters_warn_and_error():
-    """Only WARNING and ERROR entries are returned; INFO/DEBUG are dropped."""
+    """Only entries whose message body contains a Python WARN/ERROR level pass."""
     client = RailwayClient("dummy-token")
 
     deployment_data = {
@@ -26,21 +32,19 @@ async def test_recent_logs_filters_warn_and_error():
             "edges": [{"node": {"id": "dep-123", "status": "SUCCESS", "createdAt": "2026-04-28T00:00:00Z", "meta": {}}}]
         }
     }
+    # Messages must contain the level token internally; severity field is ignored.
     logs_data = {
         "deploymentLogs": [
-            _make_entry("INFO", "app started"),
-            _make_entry("WARNING", "high memory"),
-            _make_entry("ERROR", "db connection failed"),
-            _make_entry("DEBUG", "verbose debug"),
-            _make_entry("WARN", "another warn"),
+            _make_entry("error", "INFO httpx: GET /health 200"),
+            _make_entry("error", "WARNING pulse: high memory"),
+            _make_entry("error", "ERROR db connection failed"),
+            _make_entry("error", "DEBUG verbose debug"),
+            _make_entry("error", "WARN another warn"),
+            _make_entry("error", "Traceback (most recent call last):"),
         ]
     }
 
-    call_count = 0
-
     async def mock_query(query, variables=None):
-        nonlocal call_count
-        call_count += 1
         if "deployments" in query:
             return deployment_data
         return logs_data
@@ -49,10 +53,10 @@ async def test_recent_logs_filters_warn_and_error():
         result = await client.recent_logs("proj", "svc", n=20)
 
     severities = {e["severity"] for e in result}
-    assert "INFO" not in severities
+    assert "INFO" not in severities  # INFO httpx line filtered out
     assert "DEBUG" not in severities
-    assert "WARNING" in severities or "WARN" in severities
-    assert "ERROR" in severities
+    assert "WARNING" in severities  # both WARNING and WARN are normalised to WARNING
+    assert "ERROR" in severities  # both ERROR and Traceback normalise to ERROR
 
 
 @pytest.mark.asyncio
@@ -64,9 +68,9 @@ async def test_recent_logs_returns_at_most_n():
             "edges": [{"node": {"id": "dep-123", "status": "SUCCESS", "createdAt": "2026-04-28T00:00:00Z", "meta": {}}}]
         }
     }
-    # 10 WARN entries
+    # 10 WARNING entries (must include the level token in the message body)
     logs_data = {
-        "deploymentLogs": [_make_entry("WARNING", f"msg {i}") for i in range(10)]
+        "deploymentLogs": [_make_entry("error", f"WARNING msg {i}") for i in range(10)]
     }
 
     async def mock_query(query, variables=None):
@@ -143,4 +147,24 @@ def test_format_logs_timestamp_formatted():
         {"timestamp": "2026-04-28T16:50:50Z", "severity": "WARNING", "message": "test"},
     ]
     text = format_logs(entries, n=20)
-    assert "2026-04-28 16:50:50" in text
+    # New format: HH:MM:SS only (Railway timestamp date is implicit, the day
+    # is the same as the latest deployment).
+    assert "16:50:50" in text
+
+
+def test_format_logs_strips_inner_python_prefix():
+    """Compact rendering: Python log lines have their own timestamp+level prefix.
+    The bot strips that to avoid duplicating it after the Railway HH:MM:SS + level."""
+    entries = [
+        {
+            "timestamp": "2026-04-28T16:50:50Z",
+            "severity": "WARNING",
+            "message": "2026-04-28 16:50:50,041 WARNING app.services.cost_tracker: alert fire failed",
+        }
+    ]
+    text = format_logs(entries, n=20)
+    # The timestamp+level prefix is stripped. The substantive message is preserved.
+    assert "alert fire failed" in text
+    # The duplicated inner timestamp is not present in the rendered line.
+    rendered_line = [l for l in text.split("\n") if "alert fire failed" in l][0]
+    assert "2026-04-28" not in rendered_line

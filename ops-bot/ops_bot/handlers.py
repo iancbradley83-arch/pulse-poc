@@ -199,24 +199,7 @@ async def cmd_cost(message: Message) -> None:
 
 @router.message(Command("feed"))
 async def cmd_feed(message: Message) -> None:
-    """
-    /feed          — feed audit summary
-    /feed page <n> — paginated listing (5 cards per page)
-    """
-    text = message.text or ""
-    parts = text.strip().split()
-
-    if len(parts) >= 2 and parts[1].lower() == "page":
-        page = 1
-        if len(parts) >= 3:
-            try:
-                page = int(parts[2])
-            except ValueError:
-                await message.answer("usage: /feed page <n>")
-                return
-        await _cmd_feed_page(message, page)
-        return
-
+    """/feed — feed audit summary. Use /cards [page] for the paginated card list."""
     feed_data = None
     try:
         feed_data = await _pulse_client.feed()
@@ -227,22 +210,39 @@ async def cmd_feed(message: Message) -> None:
 
     cards = feed_data.get("cards", [])
     summary = build_feed_summary(cards)
-    await message.answer(format_feed_audit(summary))
+    text = format_feed_audit(summary)
+    if cards:
+        text += "\n\nuse /cards to scroll the actual cards"
+    await message.answer(text)
 
 
-async def _cmd_feed_page(message: Message, page: int) -> None:
+@router.message(Command("cards"))
+async def cmd_cards(message: Message) -> None:
+    """/cards [page] — paginated card list (5 per page)."""
+    text = message.text or ""
+    parts = text.strip().split()
+    page = 1
+    if len(parts) >= 2:
+        try:
+            page = int(parts[1])
+            if page < 1:
+                page = 1
+        except ValueError:
+            await message.answer("usage: /cards [page]  — page must be a number")
+            return
+
     feed_data = None
     try:
         feed_data = await _pulse_client.feed()
     except PulseError as exc:
-        logger.warning("feed page: fetch failed: %s", exc)
+        logger.warning("cards: fetch failed: %s", exc)
         await message.answer("(Pulse unreachable)")
         return
 
     cards = feed_data.get("cards", [])
     page_cards, total_pages = get_page(cards, page)
-    text = format_feed_page(page_cards, page, total_pages, len(cards))
-    await message.answer(text)
+    out = format_feed_page(page_cards, page, total_pages, len(cards))
+    await message.answer(out)
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +253,29 @@ async def _cmd_feed_page(message: Message, page: int) -> None:
 async def cmd_card(message: Message) -> None:
     text = message.text or ""
     parts = text.strip().split(None, 1)
+
+    # No arg → list a few card IDs from the feed so the user has something to copy.
     if len(parts) < 2 or not parts[1].strip():
-        await message.answer("usage: /card <id>")
+        try:
+            feed_data = await _pulse_client.feed()
+        except PulseError:
+            await message.answer("usage: /card <id>  — Pulse unreachable, try later")
+            return
+        cards = feed_data.get("cards", [])[:5]
+        if not cards:
+            await message.answer("usage: /card <id>  — no cards in feed right now")
+            return
+        rows = []
+        for c in cards:
+            cid = (c.get("id") or "")[:8]
+            game = c.get("game") or {}
+            home = game.get("home_team") or game.get("home") or ""
+            away = game.get("away_team") or game.get("away") or ""
+            rows.append(f"  {cid}  {home} vs {away}".rstrip())
+        body = "\n".join(rows)
+        await message.answer(
+            f"usage: /card <id>\n\nrecent cards:\n{body}\n\nor see /cards for the full list"
+        )
         return
 
     card_id = parts[1].strip()
@@ -298,11 +319,9 @@ async def cmd_card(message: Message) -> None:
 async def cmd_embed(message: Message) -> None:
     text = message.text or ""
     parts = text.strip().split(None, 1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer("usage: /embed <slug>")
-        return
 
-    slug = parts[1].strip()
+    # If no arg, fetch the embed list and surface it as a hint.
+    slug = parts[1].strip() if len(parts) >= 2 and parts[1].strip() else None
 
     try:
         data = await _pulse_client.embeds()
@@ -318,6 +337,12 @@ async def cmd_embed(message: Message) -> None:
         return
 
     embeds = data.get("embeds", [])
+
+    if slug is None:
+        available = ", ".join(e.get("slug", "?") for e in embeds) or "none"
+        await message.answer(f"usage: /embed <slug>\n\nconfigured: {available}")
+        return
+
     matched = next((e for e in embeds if e.get("slug") == slug), None)
     if matched is None:
         available = ", ".join(e.get("slug", "?") for e in embeds) or "none"
@@ -369,8 +394,15 @@ async def cmd_logs(message: Message) -> None:
 async def cmd_runbook(message: Message) -> None:
     text = message.text or ""
     parts = text.strip().split(None, 1)
+
+    # No topic → list available topics so the user knows what to ask for.
     if len(parts) < 2 or not parts[1].strip():
-        await message.answer("usage: /runbook <topic>")
+        topics = await _runbook.list_topics()
+        if topics is None:
+            await message.answer("usage: /runbook <topic>  — runbook unavailable, try later")
+            return
+        body = "\n".join(f"  {t}" for t in topics) or "  (none)"
+        await message.answer(f"usage: /runbook <topic>\n\navailable topics:\n{body}")
         return
 
     topic = parts[1].strip()

@@ -5,6 +5,7 @@ All output must match Appendix A of DESIGN.md exactly — monospace-friendly,
 no emoji. Reviewer will diff against the spec.
 """
 import math
+import re as _re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -49,11 +50,11 @@ def format_help() -> str:
         "\n"
         "stage 2 (visibility)\n"
         "  /feed                feed audit — hook mix, league mix, missing prices\n"
-        "  /feed page <n>       paginate feed (5 cards per page)\n"
+        "  /cards [page]        paginated card list (5 per page, defaults to 1)\n"
         "  /card <id>           full card detail (id or 8-char prefix)\n"
-        "  /embed <slug>        embed config for a given operator slug\n"
+        "  /embed [slug]        embed config; bare lists configured slugs\n"
         "  /logs [n]            last n WARN/ERROR from pulse-poc (default 20)\n"
-        "  /runbook <topic>     section from RUNBOOK.md matching topic\n"
+        "  /runbook [topic]     RUNBOOK.md section; bare lists topics\n"
         "  /env <key>           current env var on pulse-poc (secrets scrubbed)\n"
         "\n"
         "stage 3 coming: /pause /resume /rerun /flag /redeploy /blacklist /snooze\n"
@@ -442,23 +443,36 @@ def format_embed(embed: Dict[str, Any]) -> str:
 # Stage 2 — logs
 # ---------------------------------------------------------------------------
 
+# Strip the duplicate "YYYY-MM-DD HH:MM:SS,mmm INFO" prefix from message body.
+_PY_PREFIX_RE = _re.compile(
+    r"^\s*\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[,.]\d+\s+"
+    r"\[?(?:CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG)\]?\s+"
+)
+
+
 def format_logs(entries: List[Dict[str, str]], n: int) -> str:
-    """Format WARN/ERROR log entries."""
+    """Format WARN/ERROR log entries — compact, prefix-stripped, level-coded."""
     if not entries:
-        return f"no warn/error entries in last deployment logs (requested {n})"
+        return f"no warn/error in last deployment (requested {n})"
 
     lines: List[str] = [f"last {len(entries)} warn/error from pulse-poc", ""]
     for entry in entries:
         ts = entry.get("timestamp", "")
         try:
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            ts_display = dt.strftime("%Y-%m-%d %H:%M:%S")
+            ts_display = dt.strftime("%H:%M:%S")
         except Exception:
-            ts_display = ts
+            ts_display = ts[:8]
 
-        severity = entry.get("severity", "").upper()
-        message = entry.get("message", "")
-        lines.append(f"{ts_display} {severity} {message}")
+        severity = (entry.get("severity") or "").upper() or "?"
+        message = (entry.get("message") or "").strip()
+
+        # Drop the inner Python timestamp + level prefix (avoid duplication).
+        message = _PY_PREFIX_RE.sub("", message, count=1)
+        if len(message) > 240:
+            message = message[:237] + "..."
+
+        lines.append(f"{ts_display} {severity:<7} {message}")
 
     return "\n".join(lines)
 
@@ -466,8 +480,6 @@ def format_logs(entries: List[Dict[str, str]], n: int) -> str:
 # ---------------------------------------------------------------------------
 # Stage 2 — env var
 # ---------------------------------------------------------------------------
-
-import re as _re
 
 _SECRET_PATTERN = _re.compile(r"(?i)(token|secret|key|pass|jwt|api)")
 
