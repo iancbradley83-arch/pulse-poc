@@ -833,6 +833,24 @@ async def generate_prematch_cards():
     except Exception as exc:
         logger.exception("[PULSE] candidate_store.init failed at startup: %s", exc)
 
+    # One-shot expired-card purge on boot. The TTL sweep loop runs every
+    # ~60s once it's wired, but on a cold start there can be a backlog of
+    # rows whose `expires_at` is far in the past (the sweep was never
+    # wired before PR fix/published-cards-storage, so the table grew
+    # forever). Drain that here so subsequent telemetry is honest from
+    # boot. Safe even when the column is fresh — the SQL is a simple
+    # WHERE expires_at < now and matches nothing on a clean DB.
+    try:
+        import time as _time
+        purged = await candidate_store.delete_expired_published_cards(
+            _time.time()
+        )
+        logger.info("[PULSE] startup expired-card purge: dropped %d rows", purged)
+    except Exception as exc:
+        logger.warning(
+            "[PULSE] startup expired-card purge failed (non-fatal): %s", exc,
+        )
+
     # Embed-token seed (PR feat/embed-token-contract). On first boot
     # against an empty `embeds` table, insert the apuesta-total default
     # row and log the new token at INFO with a [embed-seed] prefix so an
@@ -2236,6 +2254,23 @@ async def _card_ttl_sweep_loop() -> None:
                         )
         except Exception as exc:
             logger.exception("[PULSE] TTL sweep errored: %s", exc)
+        # Also sweep dead snapshot rows out of the SQLite table so it
+        # doesn't grow forever. Independent try/except — the in-memory
+        # sweep above is the user-visible signal; this is bookkeeping.
+        try:
+            import time as _time
+            dropped_db = await candidate_store.delete_expired_published_cards(
+                _time.time()
+            )
+            if dropped_db:
+                logger.info(
+                    "[PULSE] TTL swept %d expired snapshot rows from published_cards",
+                    dropped_db,
+                )
+        except Exception as exc:
+            logger.exception(
+                "[PULSE] published_cards TTL sweep errored: %s", exc,
+            )
 
 
 def _label_contains_excluded_player(label: str, excluded: set) -> bool:

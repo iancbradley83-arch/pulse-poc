@@ -236,10 +236,19 @@ CREATE TABLE IF NOT EXISTS published_cards (
     snapshotted_at REAL NOT NULL,
     expires_at REAL,
     bet_type TEXT,
-    storyline_id TEXT
+    storyline_id TEXT,
+    -- First-insert timestamp (epoch seconds). Distinct from
+    -- `snapshotted_at` which gets bumped on every INSERT OR REPLACE
+    -- (rehydrate path stamps it on every redeploy). `created_at` is
+    -- preserved across upserts via COALESCE in upsert_published_card,
+    -- so it accurately reflects when a card first hit the feed. Powers
+    -- the honest `unique_cards_published_today` count on
+    -- /admin/cost.json?detail=1. Added 2026-04-28.
+    created_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_published_cards_expires ON published_cards(expires_at);
 CREATE INDEX IF NOT EXISTS idx_published_cards_storyline ON published_cards(storyline_id);
+CREATE INDEX IF NOT EXISTS idx_published_cards_created ON published_cards(created_at);
 
 -- Per-operator embed contract (PR feat/embed-token-contract, 2026-04-28).
 -- One row per operator-environment. The widget loaded inside an operator
@@ -413,6 +422,38 @@ class CandidateStore:
             async with db.execute("PRAGMA table_info(embeds)") as cur:
                 _embed_cols = {row[1] for row in await cur.fetchall()}
             _ = _embed_cols
+
+            # published_cards migration (PR fix/published-cards-storage,
+            # 2026-04-28). Add `created_at REAL` so we can:
+            #   1. Wire delete_expired_published_cards into the TTL sweep
+            #      without thrashing snapshotted_at (kept as the
+            #      rehydrate-ordering signal — bumped on every snapshot).
+            #   2. Honestly count unique cards published today on
+            #      /admin/cost.json?detail=1 (was lying — snapshotted_at
+            #      gets restamped by every redeploy's rehydrate, so the
+            #      "since-midnight" filter matched the entire table).
+            # Backfill existing rows with `created_at = snapshotted_at`
+            # so they have SOMETHING; we lose the true creation timestamp
+            # for pre-migration rows but that's acceptable.
+            async with db.execute("PRAGMA table_info(published_cards)") as cur:
+                pub_cols = {row[1] for row in await cur.fetchall()}
+            if pub_cols and "created_at" not in pub_cols:
+                logger.info(
+                    "[CandidateStore] Migrating published_cards: ADD COLUMN created_at"
+                )
+                await db.execute(
+                    "ALTER TABLE published_cards ADD COLUMN created_at REAL"
+                )
+                cur = await db.execute(
+                    "UPDATE published_cards "
+                    "SET created_at = snapshotted_at WHERE created_at IS NULL"
+                )
+                await db.commit()
+                backfilled = cur.rowcount or 0
+                logger.info(
+                    "[PULSE] published_cards: created_at column added; backfilled %d rows",
+                    backfilled,
+                )
 
             # daily_cost_by_kind migration (PR feat/cost-by-kind-telemetry,
             # 2026-04-28). Additive new table; CREATE TABLE IF NOT EXISTS
@@ -1245,24 +1286,38 @@ class CandidateStore:
         read serialized Card JSON directly with no catalog dependency.
         Best-effort: callers wrap this in a try/except so a snapshot
         failure never blocks the publish path.
+
+        `created_at` is set on FIRST insert and preserved on subsequent
+        upserts via COALESCE against the existing row — the rehydrate
+        path's INSERT OR REPLACE on every redeploy must NOT reset it.
+        Powers the honest "unique cards published today" count.
         """
         import time as _t
+        now = _t.time()
         async with self._connect() as db:
             await db.execute(
                 """
                 INSERT OR REPLACE INTO published_cards (
                     card_id, candidate_id, snapshot_json, snapshotted_at,
-                    expires_at, bet_type, storyline_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    expires_at, bet_type, storyline_id, created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE(
+                        (SELECT created_at FROM published_cards WHERE card_id = ?),
+                        ?
+                    )
+                )
                 """,
                 (
                     card_id,
                     candidate_id,
                     snapshot_json,
-                    _t.time(),
+                    now,
                     expires_at,
                     bet_type,
                     storyline_id,
+                    card_id,
+                    now,
                 ),
             )
             await db.commit()
@@ -1294,25 +1349,28 @@ class CandidateStore:
 
     async def count_unique_published_cards_since(self, since_ts: float) -> int:
         """Count DISTINCT card_id rows in published_cards with
-        snapshotted_at >= ``since_ts``.
+        ``created_at >= since_ts``.
 
         Used by `/admin/cost.json?detail=1` for the
         `unique_cards_published_today` field — dedupes by card id so
         boot-scout republishes don't inflate the figure. Pass the
         UTC-midnight timestamp for "today's" count.
 
-        Note: `published_cards` is an upsert-on-card_id table, so even
-        without filtering, the row count equals unique-card count for
-        cards still in the snapshot. The since-ts filter narrows to
-        cards last snapshotted today; a card snapshotted yesterday and
-        re-snapshotted today counts once.
+        Filters on `created_at` (set once on first insert, preserved
+        across upserts) — NOT `snapshotted_at`, which gets bumped on
+        every redeploy's rehydrate INSERT OR REPLACE and would match
+        the entire table after one redeploy (the bug fixed in PR
+        fix/published-cards-storage). Pre-migration rows have
+        `created_at` backfilled from `snapshotted_at` so the count is
+        an upper bound for those (acceptable: they represent cards we
+        truly did publish at some point).
         """
         async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT COUNT(DISTINCT card_id)
                 FROM published_cards
-                WHERE snapshotted_at >= ?
+                WHERE created_at >= ?
                 """,
                 (float(since_ts),),
             ) as cur:
