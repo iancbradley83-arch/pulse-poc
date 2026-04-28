@@ -449,6 +449,13 @@ def _map_event_to_game(event: dict[str, Any]) -> Optional[Game]:
         sport=Sport.SOCCER,
     )
 
+    # `Settings.IsBetBuilderEnabled` per Rogue OpenAPI (EventSettingsModel).
+    # Default False if Settings absent / missing — conservative; the HOT-tier
+    # classifier's BB filter will then drop the fixture rather than letting
+    # an unverified row through.
+    settings = event.get("Settings") or {}
+    bb_enabled = bool(settings.get("IsBetBuilderEnabled", False)) if isinstance(settings, dict) else False
+
     return Game(
         id=str(event_id),
         sport=Sport.SOCCER,
@@ -461,6 +468,7 @@ def _map_event_to_game(event: dict[str, Any]) -> Optional[Game]:
         period="",
         broadcast=str(event.get("LeagueName") or ""),
         start_time=_start_time(event),
+        is_bet_builder_enabled=bb_enabled,
     )
 
 
@@ -575,4 +583,11 @@ async def fetch_soccer_snapshot(
         markets.extend(_map_event_to_markets(full))
 
     logger.info("Rogue: loaded %d games and %d markets", len(games), len(markets))
+    # Funnel composition: spot if Rogue suddenly stops sending the BB flag.
+    bb_on = sum(1 for g in games if g.is_bet_builder_enabled)
+    pct = int(round(100.0 * bb_on / len(games))) if games else 0
+    logger.info(
+        "[catalogue] loaded %d fixtures, %d with BB-enabled (%d%% of total)",
+        len(games), bb_on, pct,
+    )
     return games, markets, raw_detailed

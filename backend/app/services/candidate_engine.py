@@ -95,23 +95,25 @@ def _is_top_league(league_name: str) -> bool:
 
 
 def _bb_enabled(fixture: Any) -> bool:
-    """Best-effort BetBuilder-enabled check on a fixture / catalogue row.
+    """BetBuilder-enabled check on a fixture / catalogue row.
 
-    The Pulse Game model doesn't currently carry IsBetBuilderEnabled; the
-    flag, if surfaced, lives on a sibling dict-shaped catalogue row. Falls
-    back to True (don't filter out) when the flag is absent — we don't
-    want to starve the tier on legitimate data we just don't yet
-    annotate.
+    Reads `is_bet_builder_enabled` from the Game model (plumbed at
+    catalogue-load time from `Settings.IsBetBuilderEnabled` on the Rogue
+    Event payload). Falls back to dict-shaped attrs for synthetic /
+    legacy callers. No fail-soft: when the field is missing we return
+    False so the filter rejects, not passes — the kill switch
+    `PULSE_HOT_REQUIRE_BB_ENABLED=false` is the escape hatch if Rogue
+    mis-reports.
     """
     if isinstance(fixture, dict):
-        for key in ("IsBetBuilderEnabled", "is_bet_builder_enabled", "bb_enabled"):
+        for key in ("is_bet_builder_enabled", "IsBetBuilderEnabled", "bb_enabled"):
             if key in fixture:
                 return bool(fixture[key])
-        return True
-    for attr in ("IsBetBuilderEnabled", "is_bet_builder_enabled", "bb_enabled"):
+        return False
+    for attr in ("is_bet_builder_enabled", "IsBetBuilderEnabled", "bb_enabled"):
         if hasattr(fixture, attr):
             return bool(getattr(fixture, attr))
-    return True
+    return False
 
 
 def classify_hot_fixtures(

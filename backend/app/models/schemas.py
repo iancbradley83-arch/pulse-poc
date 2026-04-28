@@ -71,6 +71,13 @@ class Game(BaseModel):
     period: str = ""  # e.g., "Q3" or "2H"
     broadcast: str = ""
     start_time: str = ""  # e.g., "7:30 PM ET"
+    # Whether the operator has enabled Bet Builder on this fixture. Sourced
+    # from `Settings.IsBetBuilderEnabled` on the Rogue Event payload at
+    # catalogue-load time. Defaults to False so absence is conservative —
+    # the HOT-tier classifier's BB filter rejects rather than passes when
+    # the flag is missing. Toggle off via `PULSE_HOT_REQUIRE_BB_ENABLED=false`
+    # if Rogue mis-reports.
+    is_bet_builder_enabled: bool = False
 
 
 # ── Market ──
