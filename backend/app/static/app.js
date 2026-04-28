@@ -2,10 +2,17 @@
  *  PULSE — vanilla-JS port of the Hero Comfortable design handoff
  *  Fetches the public feed from /api/feed?type=prematch and renders
  *  each card in the Hero Leg variant. No build step, no framework.
- *  WebSocket live updates not yet wired (Stage 6+).
+ *
+ *  Live updates: 60s poll of /api/feed (replaces frontend WebSocket as
+ *  of the production-MVP plan — Pulse is a content widget, CDN-fronted
+ *  60s polling is enough and removes the WS-fanout infra requirement).
+ *  See docs/production-mvp-plan.md.
  * ===================================================================== */
 
 const PULSE = (() => {
+  // How often we re-fetch /api/feed in the background. Pause when the
+  // tab is hidden, resume on visibilitychange. Configurable here only.
+  const FEED_POLL_INTERVAL_MS = 60_000;
   // ── Hook registry (matches the design handoff README table) ─────────
   const HOOKS = {
     injury:        { label: 'Injury',     color: '#FF4D6D', icon: 'cross',     short: 'INJURY'   },
@@ -497,16 +504,17 @@ const PULSE = (() => {
 
     // Engagement + CTA buttons are wired via one delegated listener on
     // #feed (see wireFeedDelegation, called once at init). Per-render
-    // re-wiring was dropping handlers when `applyCardUpdate` replaced a
-    // card's <article> on SSE pricing ticks — first click worked, next
-    // click on any SSE-updated card was dead. Delegation survives any
-    // DOM replacement under #feed.
+    // re-wiring was dropping handlers when poll-driven diffs replaced
+    // a card's <article> in place — first click worked, next click on
+    // any updated card was dead. Delegation survives any DOM
+    // replacement under #feed.
   }
 
   // One-time delegated click handler on #feed. Handles:
   //   - .cta-button         → open operator slip (deep_link) or postMessage fallback
   //   - .engagement button  → toggle .active (cosmetic)
-  // Attached once at init; survives card re-renders + SSE card_update patches.
+  // Attached once at init; survives card re-renders + per-card patches
+  // emitted by the polling diff loop.
   let _feedDelegationWired = false;
   function wireFeedDelegation() {
     if (_feedDelegationWired) return;
@@ -648,74 +656,192 @@ const PULSE = (() => {
     }, 4000);
   }
 
+  // Sort comparator shared by initial load + polling diff. News-driven
+  // cards (hook_type + source_name) float to the top, then descending
+  // relevance_score.
+  function sortCards(cards) {
+    cards.sort((a, b) => {
+      const aNews = !!(a.hook_type && a.source_name);
+      const bNews = !!(b.hook_type && b.source_name);
+      if (aNews !== bNews) return aNews ? -1 : 1;
+      return (b.relevance_score || 0) - (a.relevance_score || 0);
+    });
+    return cards;
+  }
+
+  // Treat two cards as "materially equal" so the polling diff knows
+  // whether to bother patching the DOM. We don't deep-compare the whole
+  // payload — just the fields that drive the rendered card surface
+  // (price, suspended, leg odds, headline/angle, hook). This avoids
+  // pointless re-renders that would clobber any local UI state (e.g.
+  // .active engagement toggles).
+  function cardsAreEqual(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    if (a.headline !== b.headline) return false;
+    if (a.narrative_hook !== b.narrative_hook) return false;
+    if (a.hook_type !== b.hook_type) return false;
+    if (a.suspended !== b.suspended) return false;
+    if ((a.total_odds || null) !== (b.total_odds || null)) return false;
+    if ((a.deep_link || '') !== (b.deep_link || '')) return false;
+    const aLegs = Array.isArray(a.legs) ? a.legs : [];
+    const bLegs = Array.isArray(b.legs) ? b.legs : [];
+    if (aLegs.length !== bLegs.length) return false;
+    for (let i = 0; i < aLegs.length; i++) {
+      const al = aLegs[i] || {};
+      const bl = bLegs[i] || {};
+      if (al.selection_id !== bl.selection_id) return false;
+      if ((Number(al.odds) || 0) !== (Number(bl.odds) || 0)) return false;
+      if ((al.label || '') !== (bl.label || '')) return false;
+    }
+    const aSel = (a.market && a.market.selections) || [];
+    const bSel = (b.market && b.market.selections) || [];
+    if (aSel.length !== bSel.length) return false;
+    for (let i = 0; i < aSel.length; i++) {
+      if ((aSel[i].label || '') !== (bSel[i].label || '')) return false;
+      if ((Number(aSel[i].odds) || 0) !== (Number(bSel[i].odds) || 0)) return false;
+    }
+    return true;
+  }
+
+  // Fetch /api/feed once. On the first call we just slot the cards in
+  // and render. On subsequent calls (60s poll) we diff the new card
+  // list against our in-memory model and apply minimal DOM patches —
+  // adds, removes, and per-card updates — using the same applyCard*
+  // helpers the WS path used to drive. Event delegation on #feed is
+  // wired once at init (wireFeedDelegation) so handlers survive every
+  // patch.
+  let _feedLoadedOnce = false;
   async function loadFeed() {
     try {
       const res = await fetch('/api/feed?type=prematch&limit=100', { cache: 'no-store' });
       const data = await res.json();
-      allCards = (data.cards || []);
-      // Sort: news-driven first (has hook_type + source_name), newest cards first
-      allCards.sort((a, b) => {
-        const aNews = !!(a.hook_type && a.source_name);
-        const bNews = !!(b.hook_type && b.source_name);
-        if (aNews !== bNews) return aNews ? -1 : 1;
-        return (b.relevance_score || 0) - (a.relevance_score || 0);
-      });
-      // Re-render filter strip so chips reflect only hook_types + leagues
-      // present in the current feed (empty categories stay hidden).
-      renderFilterStrip();
-      renderFeed();
+      const incoming = sortCards(Array.isArray(data.cards) ? data.cards.slice() : []);
+
+      if (!_feedLoadedOnce) {
+        allCards = incoming;
+        _feedLoadedOnce = true;
+        // Re-render filter strip so chips reflect only hook_types +
+        // leagues present in the current feed.
+        renderFilterStrip();
+        renderFeed();
+        return;
+      }
+
+      diffAndApply(incoming);
     } catch (err) {
       console.error('Feed fetch failed', err);
-      document.getElementById('feed').innerHTML = `
-        <div class="empty-state">Feed unavailable. Try refresh.</div>
-      `;
+      // Only paint the empty/error state on first load. Polling errors
+      // should leave the existing rendered feed alone — transient
+      // network blips shouldn't nuke the user's view.
+      if (!_feedLoadedOnce) {
+        document.getElementById('feed').innerHTML = `
+          <div class="empty-state">Feed unavailable. Try refresh.</div>
+        `;
+      }
     }
   }
 
-  // ── WebSocket: live price updates + feed refresh ────────────────────
-  //
-  // Backend pushes three message types over /ws/feed:
-  //   - card_update   { card_id, total_odds, leg_odds:{sel_id:odds},
-  //                     suspended }
-  //                   → patch one card's price + leg odds in place,
-  //                     animate the change.
-  //   - feed_refresh  → re-pull /api/feed (used after a candidate-engine
-  //                     rerun atomic-swaps the card list).
-  //   - new_card      → reserved for live cards (Stage 7+); unused today.
-  //
-  // The connection auto-reconnects with exponential backoff up to 30s.
+  // Diff the incoming card list against `allCards` and emit the
+  // minimum set of {added, removed, updated} operations. Adds + removes
+  // route through the existing applyCardAdded / applyCardRemoved
+  // helpers so insertion ordering + fade-out animations stay consistent
+  // with the rest of the app.
+  function diffAndApply(incoming) {
+    const prevById = new Map(allCards.map(c => [c.id, c]));
+    const nextById = new Map(incoming.map(c => [c.id, c]));
 
-  let _ws = null;
-  let _wsBackoffMs = 1000;
-  function connectWS() {
-    try {
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      _ws = new WebSocket(`${proto}//${location.host}/ws/feed`);
-    } catch (err) {
-      console.warn('[ws] connect failed', err);
-      scheduleWSReconnect();
-      return;
+    // Removals first — frees up the empty-state branch for a clean
+    // re-render if every card just disappeared.
+    for (const [id] of prevById) {
+      if (!nextById.has(id)) {
+        applyCardRemoved({ card_id: id });
+      }
     }
-    _ws.addEventListener('open', () => {
-      _wsBackoffMs = 1000;
-      console.log('[ws] connected');
-    });
-    _ws.addEventListener('close', () => { _ws = null; scheduleWSReconnect(); });
-    _ws.addEventListener('error', () => { try { _ws.close(); } catch (e) {} });
-    _ws.addEventListener('message', (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch (e) { return; }
-      if (!msg || !msg.type) return;
-      if (msg.type === 'card_update') return applyCardUpdate(msg);
-      if (msg.type === 'feed_refresh') return loadFeed();
-      if (msg.type === 'card_added') return applyCardAdded(msg);
-      if (msg.type === 'card_removed') return applyCardRemoved(msg);
-      // new_card / game_update etc — ignored in v1
-    });
+
+    // Adds + updates. We refresh `allCards` by walking the incoming
+    // list in order (already sorted by sortCards). For existing cards
+    // that materially changed, we replace the in-memory entry and
+    // re-render that one <article> in place — preserves scroll
+    // position and the rest of the feed.
+    for (const card of incoming) {
+      const prev = prevById.get(card.id);
+      if (!prev) {
+        applyCardAdded({ card });
+      } else if (!cardsAreEqual(prev, card)) {
+        const idx = allCards.findIndex(c => c.id === card.id);
+        if (idx >= 0) allCards[idx] = card;
+        const article = document.querySelector(
+          `article[data-card-id="${CSS.escape(card.id)}"]`,
+        );
+        if (article) {
+          const fresh = document.createElement('div');
+          fresh.innerHTML = renderHeroCard(card);
+          const newArticle = fresh.firstElementChild;
+          if (newArticle) {
+            article.replaceWith(newArticle);
+            if (window.PulseReactions) window.PulseReactions.injectInto(newArticle);
+          }
+        }
+      }
+    }
+
+    // Final pass — make sure allCards reflects the server order so
+    // future diffs are stable.
+    sortCards(allCards);
+
+    // Filter chips might have new/missing categories now that the
+    // hook/league sets shifted. Cheap to re-render.
+    renderFilterStrip();
   }
-  function scheduleWSReconnect() {
-    setTimeout(connectWS, _wsBackoffMs);
-    _wsBackoffMs = Math.min(_wsBackoffMs * 2, 30000);
+
+  // ── Polling: 60s /api/feed refresh ──────────────────────────────────
+  //
+  // Replaces the old /ws/feed WebSocket. Pulse is a content widget —
+  // operator click + bet slip handoff happens server-side, so 60s
+  // freshness on cards is plenty and lets Cloudflare absorb 99% of
+  // read traffic at the edge.
+  //
+  // Behaviour:
+  //   - setInterval(loadFeed, FEED_POLL_INTERVAL_MS)
+  //   - Pause when document.hidden so background tabs don't burn
+  //     bandwidth or backend RPS.
+  //   - On visibilitychange → visible we kick a fetch immediately so
+  //     the user sees a fresh feed when they tab back in.
+  //
+  // Backend WS endpoint /ws/feed is intentionally left running on the
+  // server side — cleanup will happen in a follow-up PR once we've
+  // verified polling is healthy in production.
+
+  let _pollTimer = null;
+  function startFeedPolling() {
+    stopFeedPolling();
+    _pollTimer = setInterval(() => {
+      // Belt-and-braces: setInterval can fire while the tab is hidden
+      // on some browsers (esp. mobile Safari throttled but not paused).
+      // Skip the fetch entirely when hidden.
+      if (document.hidden) return;
+      loadFeed();
+    }, FEED_POLL_INTERVAL_MS);
+  }
+  function stopFeedPolling() {
+    if (_pollTimer != null) {
+      clearInterval(_pollTimer);
+      _pollTimer = null;
+    }
+  }
+  function wireVisibilityHandling() {
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        stopFeedPolling();
+      } else {
+        // Coming back from a hidden tab: refetch immediately so the
+        // user doesn't stare at a potentially-stale feed for up to
+        // 60s, then resume the regular interval.
+        loadFeed();
+        startFeedPolling();
+      }
+    });
   }
 
   // ── Staggered insert: one card lands via WS, slot it into the correct
@@ -851,38 +977,6 @@ const PULSE = (() => {
     }, 30 * 1000);
   }
 
-  function applyCardUpdate(msg) {
-    // Find card in our local model
-    const card = allCards.find(c => c.id === msg.card_id);
-    if (!card) return;
-    if (typeof msg.total_odds === 'number') card.total_odds = msg.total_odds;
-    if (typeof msg.suspended === 'boolean') card.suspended = msg.suspended;
-    if (msg.leg_odds && Array.isArray(card.legs)) {
-      for (const leg of card.legs) {
-        if (leg.selection_id && leg.selection_id in msg.leg_odds) {
-          leg.odds = msg.leg_odds[leg.selection_id];
-        }
-      }
-    }
-    // Patch the DOM in place — re-render this one card to pick up the new
-    // odds + suspended state. Simplest path; preserves scroll position
-    // because we replace innerHTML of just the article element.
-    const article = document.querySelector(`article[data-card-id="${CSS.escape(msg.card_id)}"]`);
-    if (article) {
-      const fresh = document.createElement('div');
-      fresh.innerHTML = renderHeroCard(card);
-      const newArticle = fresh.firstElementChild;
-      if (newArticle) {
-        article.replaceWith(newArticle);
-        // Re-inject the reactions widget on the replaced card.
-        if (window.PulseReactions) window.PulseReactions.injectInto(newArticle);
-        // Brief flash so the user notices the price changed.
-        newArticle.classList.add('price-updated');
-        setTimeout(() => newArticle.classList.remove('price-updated'), 1500);
-      }
-    }
-  }
-
   // ── Init ────────────────────────────────────────────────────────────
 
   function init() {
@@ -894,7 +988,10 @@ const PULSE = (() => {
     renderFilterStrip();
     wireFeedDelegation();
     loadFeed();
-    connectWS();
+    // Background poll replaces the old /ws/feed WebSocket. See
+    // production-mvp-plan.md for rationale.
+    if (!document.hidden) startFeedPolling();
+    wireVisibilityHandling();
     startTimestampTicker();
   }
 
