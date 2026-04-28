@@ -21,7 +21,7 @@ import logging
 import os
 from typing import Any, Optional
 
-from fastapi import APIRouter, Cookie, HTTPException, Request
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter
@@ -46,8 +46,15 @@ def create_reactions_routes(
     store: CandidateStore,
     feed: FeedManager,
     limiter: Limiter,
+    admin_dependency: Optional[Any] = None,
 ) -> APIRouter:
+    """Mixed router — public /api/cards/* reaction endpoints + the admin
+    /admin/reactions aggregator. `admin_dependency` is the require_admin
+    callable from main.py; when provided it gates ONLY the /admin/reactions
+    route. Default None keeps the route open (used by tests that don't
+    care about auth)."""
     router = APIRouter()
+    _admin_deps = [Depends(admin_dependency)] if admin_dependency is not None else []
 
     @router.post("/api/cards/{card_id}/react")
     @limiter.limit("30/minute")
@@ -92,7 +99,7 @@ def create_reactions_routes(
         mine = await store.reaction_for_anon(card_id, pulse_anon_id) if pulse_anon_id else None
         return {"ok": True, "totals": totals, "mine": mine}
 
-    @router.get("/admin/reactions", response_class=HTMLResponse)
+    @router.get("/admin/reactions", response_class=HTMLResponse, dependencies=_admin_deps)
     async def admin_reactions():
         if not _reactions_enabled():
             raise HTTPException(404, "reactions disabled")

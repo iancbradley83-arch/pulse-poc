@@ -3,10 +3,12 @@
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -98,6 +100,8 @@ else:
 
 from app.config import (
     ANTHROPIC_API_KEY,
+    PULSE_ADMIN_PASS,
+    PULSE_ADMIN_USER,
     PULSE_DATA_SOURCE,
     PULSE_DB_PATH,
     PULSE_EMBED_TOKEN_REQUIRED,
@@ -618,15 +622,68 @@ app.add_middleware(
     enabled=bool(PULSE_EMBED_TOKEN_REQUIRED),
 )
 
+# ── Admin HTTP Basic auth (PR feat/admin-basic-auth) ────────────────────
+# Single dependency wired onto every /admin/* route. Defaults OPEN so
+# local dev works without ceremony — but logs a single warning at boot
+# when both env vars are empty so it's loud in Railway logs if ops forgot
+# to set them before public launch. When BOTH PULSE_ADMIN_USER and
+# PULSE_ADMIN_PASS are set, the dependency requires HTTP Basic auth and
+# uses secrets.compare_digest to defeat timing attacks on both fields.
+#
+# Why HTTP Basic (not JWT/sessions): the admin surface is one operator,
+# read mostly, accessed maybe 10× a day. Sessions add a server-side store
+# we don't need; JWT adds a signing key + library. Basic auth piggybacks
+# on the browser's native credential prompt, requires zero JS, and Railway
+# already terminates TLS so creds never travel cleartext. We also already
+# have HSTS + CSP frame-ancestors=none above to harden the surface.
+_admin_security = HTTPBasic(realm="pulse-admin", auto_error=False)
+if not (PULSE_ADMIN_USER and PULSE_ADMIN_PASS):
+    logger.warning(
+        "[admin] auth disabled (PULSE_ADMIN_USER + PULSE_ADMIN_PASS unset) — DO NOT ship to public"
+    )
+
+
+def require_admin(
+    credentials: "_Optional[HTTPBasicCredentials]" = Depends(_admin_security),
+) -> None:
+    """Gate /admin/* on HTTP Basic when env vars are set; no-op otherwise.
+
+    Uses secrets.compare_digest for both username and password so a
+    timing side-channel can't leak either field one byte at a time. We
+    encode to bytes first because compare_digest's fast-path on str only
+    works when both inputs are ASCII; bytes is unambiguous.
+
+    Reads the credentials from `app.config` at call time (not import time)
+    so tests can monkeypatch the module attributes between requests.
+    """
+    from app import config as _cfg  # local import to support monkeypatch
+    expected_user = _cfg.PULSE_ADMIN_USER
+    expected_pass = _cfg.PULSE_ADMIN_PASS
+    if not (expected_user and expected_pass):
+        return
+    supplied_user = (credentials.username if credentials else "").encode("utf-8")
+    supplied_pass = (credentials.password if credentials else "").encode("utf-8")
+    user_ok = secrets.compare_digest(supplied_user, expected_user.encode("utf-8"))
+    pass_ok = secrets.compare_digest(supplied_pass, expected_pass.encode("utf-8"))
+    if not (user_ok and pass_ok):
+        raise HTTPException(
+            status_code=401,
+            detail="admin auth required",
+            headers={"WWW-Authenticate": 'Basic realm="pulse-admin"'},
+        )
+
+
 # ── Mount routes ──
 router = create_routes(catalog, feed, simulator)
 app.include_router(router)
 admin_router = create_admin_routes(candidate_store, catalog, simulator)
-app.include_router(admin_router)
-reactions_router = create_reactions_routes(candidate_store, feed, limiter)
+app.include_router(admin_router, dependencies=[Depends(require_admin)])
+reactions_router = create_reactions_routes(
+    candidate_store, feed, limiter, admin_dependency=require_admin,
+)
 app.include_router(reactions_router)
 embed_admin_router = create_embed_admin_routes(candidate_store)
-app.include_router(embed_admin_router)
+app.include_router(embed_admin_router, dependencies=[Depends(require_admin)])
 
 # ── Static files ──
 STATIC_DIR = Path(__file__).parent / "static"
@@ -920,7 +977,7 @@ async def _do_ondemand_rerun():
         _ondemand_rerun_inflight = False
 
 
-@app.post("/admin/rerun")
+@app.post("/admin/rerun", dependencies=[Depends(require_admin)])
 async def admin_rerun():
     """On-demand candidate-engine rerun for demos. Fires-and-forgets so
     the HTTP response returns immediately (rerun takes ~3 min; Railway's
@@ -1027,7 +1084,7 @@ async def admin_rerun():
     }
 
 
-@app.get("/admin/rerun/status")
+@app.get("/admin/rerun/status", dependencies=[Depends(require_admin)])
 async def admin_rerun_status():
     # Pull the SQLite-backed cost-tripwire snapshot. Cheap (one-row read);
     # safe when the engine has never run (returns zeros). Surfaced here
@@ -1076,7 +1133,7 @@ async def admin_rerun_status():
     }
 
 
-@app.get("/admin/cost", response_class=HTMLResponse)
+@app.get("/admin/cost", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
 async def admin_cost_page():
     """7-day cost-history page. Read-only, no auth (POC convention)."""
     try:
