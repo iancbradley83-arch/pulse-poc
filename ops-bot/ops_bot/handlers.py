@@ -702,8 +702,11 @@ async def cmd_snooze(message: Message) -> None:
         return
 
     kind = parts[1].strip().lower()
-    if kind not in _snooze.VALID_KINDS:
-        valid = ", ".join(sorted(_snooze.VALID_KINDS))
+
+    # "all" is a meta-kind that applies the snooze to every valid kind.
+    valid_and_all = _snooze.VALID_KINDS | {"all"}
+    if kind not in valid_and_all:
+        valid = ", ".join(sorted(_snooze.VALID_KINDS)) + ", all"
         await message.answer(
             f"unknown kind '{kind}'. valid: {valid}\n\n"
             "usage: /snooze <kind> <30m|1h|2h|off>"
@@ -726,19 +729,27 @@ async def cmd_snooze(message: Message) -> None:
         )
         return
 
+    kinds_to_apply = sorted(_snooze.VALID_KINDS) if kind == "all" else [kind]
+
     if duration_seconds == 0:
-        _snooze.clear(kind)
-        await message.answer(f"{kind} alert snooze cleared")
+        for k in kinds_to_apply:
+            _snooze.clear(k)
+        noun = "all alert snoozes" if kind == "all" else f"{kind} alert snooze"
+        await message.answer(f"{noun} cleared")
         return
 
-    _snooze.snooze(kind, duration_seconds)
+    for k in kinds_to_apply:
+        _snooze.snooze(k, duration_seconds)
+
     h = duration_seconds // 3600
     m = (duration_seconds % 3600) // 60
     if h:
         dur_human = f"{h}h" if not m else f"{h}h {m}m"
     else:
         dur_human = f"{m}m"
-    await message.answer(f"{kind} alerts snoozed for {dur_human}")
+
+    noun = "all alerts" if kind == "all" else f"{kind} alerts"
+    await message.answer(f"{noun} snoozed for {dur_human}")
 
 
 # ---------------------------------------------------------------------------
@@ -882,7 +893,7 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
         return
 
     # -----------------------------------------------------------------------
-    # action:dismiss — tapped [DISMISS] on a cost alert
+    # action:dismiss — tapped [DISMISS] on any alert
     # -----------------------------------------------------------------------
     if data == "action:dismiss":
         await callback.answer("dismissed")
@@ -891,6 +902,150 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
                 await callback.message.edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
+        return
+
+    # -----------------------------------------------------------------------
+    # action:redeploy — tapped [REDEPLOY] on a deploy/health alert
+    # -----------------------------------------------------------------------
+    if data == "action:redeploy":
+        if _railway_client is None:
+            await callback.answer("Railway API unavailable", show_alert=True)
+            return
+        _confirm.register(chat_id, "redeploy")
+        await callback.answer()
+        if callback.message:
+            text = format_confirm_prompt(
+                "redeploy",
+                "Railway deploymentRedeploy on latest pulse-poc deployment",
+            )
+            await callback.message.answer(text, reply_markup=_confirm_keyboard("redeploy"))
+        return
+
+    # -----------------------------------------------------------------------
+    # action:logs — tapped [LOGS] on a deploy alert
+    # -----------------------------------------------------------------------
+    if data == "action:logs":
+        await callback.answer()
+        if _railway_client is None:
+            if callback.message:
+                await callback.message.answer("(Railway API unreachable)")
+            return
+        try:
+            entries = await _railway_client.recent_logs(
+                RAILWAY_PROJECT_ID, RAILWAY_SERVICE_ID, 20
+            )
+        except RailwayError as exc:
+            logger.warning("callback logs: fetch failed: %s", exc)
+            if callback.message:
+                await callback.message.answer("(Railway API unreachable)")
+            return
+        if callback.message:
+            await callback.message.answer(format_logs(entries, 20))
+        return
+
+    # -----------------------------------------------------------------------
+    # action:status — tapped [STATUS] on a health alert
+    # -----------------------------------------------------------------------
+    if data == "action:status":
+        await callback.answer()
+        if callback.message:
+            # Synthesise a fake Message-like context and call cmd_status.
+            # We build the response inline to avoid coupling to Message object.
+            import time as _time
+            start = _time.monotonic()
+            health = None
+            cost = None
+            feed = None
+            cost_detail = None
+            deployment = None
+            engine_vars = None
+            pulse_unreachable = False
+            railway_unreachable = False
+
+            try:
+                health = await _pulse_client.health()
+            except PulseError:
+                pulse_unreachable = True
+            try:
+                cost = await _pulse_client.cost(days=1)
+            except PulseError:
+                pulse_unreachable = True
+            try:
+                feed = await _pulse_client.feed()
+            except PulseError:
+                pulse_unreachable = True
+            try:
+                cost_detail = await _pulse_client.cost_detail()
+            except PulseError:
+                pass
+
+            if _railway_client is not None:
+                try:
+                    deployment = await _railway_client.latest_deployment(
+                        RAILWAY_PROJECT_ID, RAILWAY_SERVICE_ID
+                    )
+                except RailwayError:
+                    railway_unreachable = True
+                try:
+                    engine_vars = await _railway_client.variables(
+                        RAILWAY_PROJECT_ID, RAILWAY_ENVIRONMENT_ID, RAILWAY_SERVICE_ID
+                    )
+                except RailwayError:
+                    railway_unreachable = True
+            else:
+                railway_unreachable = True
+
+            elapsed = int(_time.monotonic() - start)
+            text = format_status(
+                health=health,
+                cost=cost,
+                deployment=deployment,
+                feed=feed,
+                engine_vars=engine_vars,
+                pulse_unreachable=pulse_unreachable,
+                railway_unreachable=railway_unreachable,
+                check_age_seconds=elapsed,
+                cost_detail=cost_detail,
+            )
+            await callback.message.answer(text)
+        return
+
+    # -----------------------------------------------------------------------
+    # action:rerun — tapped [RERUN] on a feed alert
+    # -----------------------------------------------------------------------
+    if data == "action:rerun":
+        _confirm.register(chat_id, "rerun")
+        await callback.answer()
+        if callback.message:
+            text = format_confirm_prompt(
+                "rerun",
+                "POST /admin/rerun — triggers candidate engine cycle",
+            )
+            await callback.message.answer(text, reply_markup=_confirm_keyboard("rerun"))
+        return
+
+    # -----------------------------------------------------------------------
+    # action:feed — tapped [FEED] on a feed alert
+    # -----------------------------------------------------------------------
+    if data == "action:feed":
+        await callback.answer()
+        feed_data = None
+        try:
+            feed_data = await _pulse_client.feed()
+        except PulseError as exc:
+            logger.warning("callback feed: fetch failed: %s", exc)
+            if callback.message:
+                await callback.message.answer("(Pulse unreachable)")
+            return
+
+        if callback.message:
+            from .feed_audit import build_feed_summary
+            cards = feed_data.get("cards", [])
+            summary = build_feed_summary(cards)
+            text = format_feed_audit(summary)
+            if cards:
+                text += "\n\nuse /cards to scroll the actual cards"
+            await callback.message.answer(text)
         return
 
     # Unknown callback_data — answer silently so Telegram spinner stops.
