@@ -34,6 +34,7 @@ from .formatting import (
     format_env_var,
     _team_name,
 )
+from . import help_topics as _help_topics
 from .feed_audit import build_feed_summary, get_page
 from .pulse_client import PulseClient, PulseError
 from .railway_client import RailwayClient, RailwayError
@@ -54,9 +55,26 @@ def set_clients(pulse: PulseClient, railway: Optional[RailwayClient]) -> None:
     _railway_client = railway
 
 
+_HELP_UNDERSCORE_RE = re.compile(r"^/help_([a-z]+)(?:@\w+)?(?:\s|$)")
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    text = message.text or ""
+    parts = text.strip().split(None, 1)
+    if len(parts) >= 2 and parts[1].strip():
+        await message.answer(_help_topics.render(parts[1].strip()))
+        return
     await message.answer(format_help())
+
+
+@router.message(F.text.regexp(_HELP_UNDERSCORE_RE))
+async def cmd_help_underscore(message: Message) -> None:
+    """Match /help_status, /help_cost, etc. — tappable shortcuts from /help footer."""
+    m = _HELP_UNDERSCORE_RE.match(message.text or "")
+    if not m:
+        return
+    await message.answer(_help_topics.render(m.group(1)))
 
 
 @router.message(Command("status"))
