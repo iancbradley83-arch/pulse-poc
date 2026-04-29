@@ -73,12 +73,19 @@ async def test_alert_fires_once_on_first_rejection(tracker_factory):
     """First `can_spend → False` of the day fires emit_critical. Repeat
     rejections in the same UTC day do NOT re-fire."""
     tracker = await tracker_factory(budget=3.0)
-    # Push spend above the 99% ceiling.
-    await tracker.record_call(model="claude-haiku-4-5", kind="test", cost_usd=2.95)
 
     with patch.object(ae_mod, "_post_webhook") as post_mock, \
          patch("app.services.cost_tracker.today_utc", return_value="2026-04-28"), \
          patch("app.services.alert_emitter._today_utc", return_value="2026-04-28"):
+        # Push spend above the 99% ceiling. record_call must run UNDER
+        # the patched today_utc so the daily_cost row lands on the same
+        # date that can_spend reads — otherwise after the real-world
+        # date rolls past 2026-04-28 the read finds $0 and the rejection
+        # never fires (this was the regression that broke this test on
+        # 2026-04-29).
+        await tracker.record_call(
+            model="claude-haiku-4-5", kind="test", cost_usd=2.95,
+        )
         # Stub out the actual webhook layer so we can assert on emit
         # calls without doing a network round-trip. We patch the inner
         # _post_webhook because emit_critical is the *function under
@@ -98,7 +105,6 @@ async def test_alert_fires_webhook_when_url_set(tracker_factory, monkeypatch):
     """When PULSE_ALERTS_WEBHOOK_URL is set, _post_webhook is invoked
     exactly once for the first rejection of the day."""
     tracker = await tracker_factory(budget=3.0)
-    await tracker.record_call(model="claude-haiku-4-5", kind="test", cost_usd=2.95)
     monkeypatch.setenv("PULSE_ALERTS_WEBHOOK_URL", "https://example.test/hook")
 
     # Patch threading.Thread to run the target inline so the test is
@@ -116,7 +122,13 @@ async def test_alert_fires_webhook_when_url_set(tracker_factory, monkeypatch):
 
     with patch.object(ae_mod, "_post_webhook") as post_mock, \
          patch.object(ae_mod.threading, "Thread", _InlineThread), \
-         patch("app.services.cost_tracker.today_utc", return_value="2026-04-28"):
+         patch("app.services.cost_tracker.today_utc", return_value="2026-04-28"), \
+         patch("app.services.alert_emitter._today_utc", return_value="2026-04-28"):
+        # record_call must run under the patched today_utc — see comment
+        # in test_alert_fires_once_on_first_rejection.
+        await tracker.record_call(
+            model="claude-haiku-4-5", kind="test", cost_usd=2.95,
+        )
         for _ in range(3):
             await tracker.can_spend(0.50)
         assert post_mock.call_count == 1
@@ -153,12 +165,16 @@ async def test_alert_refires_after_utc_date_roll(tracker_factory):
     """A new UTC date causes the dedup key to change, so the next
     rejection of the new day fires a fresh alert."""
     tracker = await tracker_factory(budget=3.0)
-    await tracker.record_call(model="claude-haiku-4-5", kind="test", cost_usd=2.95)
 
     # Day 1 rejection. Patch both today-fns: cost_tracker uses its own
     # `today_utc`; alert_emitter uses its own `_today_utc` for dedup.
+    # record_call must run under the same patches so the daily_cost
+    # row lands on the date can_spend reads.
     with patch("app.services.cost_tracker.today_utc", return_value="2026-04-28"), \
          patch("app.services.alert_emitter._today_utc", return_value="2026-04-28"):
+        await tracker.record_call(
+            model="claude-haiku-4-5", kind="test", cost_usd=2.95,
+        )
         await tracker.can_spend(0.50)
         await tracker.can_spend(0.50)  # repeat — no extra alert
     assert len(ae_mod.AlertEmitter._seen) == 1
