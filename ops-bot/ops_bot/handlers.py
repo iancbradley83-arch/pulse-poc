@@ -487,20 +487,42 @@ async def cmd_playbook(message: Message) -> None:
     parts = text.strip().split(None, 1)
 
     if len(parts) < 2 or not parts[1].strip():
-        topics = await _playbook.list_topics()
-        if topics is None:
+        rows = await _playbook.list_topics_with_slugs()
+        if rows is None:
             await message.answer(
                 "usage: /playbook <topic>  — playbook unavailable, try later"
             )
             return
-        body = "\n".join(f"  {t}" for t in topics) or "  (none)"
+        # Render heading + tappable /playbook_<slug>.
+        max_h = max((len(h) for h, _ in rows), default=0)
+        body_lines = [
+            f"  {h.ljust(max_h)}  /playbook_{slug}"
+            for h, slug in rows
+        ] or ["  (none)"]
+        body = "\n".join(body_lines)
         await message.answer(
-            f"usage: /playbook <topic>\n\navailable scenarios:\n{body}"
+            f"usage: /playbook <topic>  ·  tap a /playbook_<topic> below\n\n"
+            f"{body}"
         )
         return
 
     topic = parts[1].strip()
     result = await _playbook.lookup(topic)
+    await message.answer(result)
+
+
+# Tappable /playbook_<slug> form. Telegram renders this as a single
+# tappable command — plain '/playbook cost' (with space) is not.
+_PLAYBOOK_UNDERSCORE_RE = re.compile(r"^/playbook_([a-z]+)(?:@\w+)?(?:\s|$)")
+
+
+@router.message(F.text.regexp(_PLAYBOOK_UNDERSCORE_RE))
+async def cmd_playbook_underscore(message: Message) -> None:
+    m = _PLAYBOOK_UNDERSCORE_RE.match(message.text or "")
+    if not m:
+        return
+    slug = m.group(1)
+    result = await _playbook.lookup(slug)
     await message.answer(result)
 
 

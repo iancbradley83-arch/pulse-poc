@@ -67,6 +67,51 @@ def _parse_sections(text: str) -> List[Tuple[str, str]]:
     return sections
 
 
+# NB: order matters. The first hint to match the heading wins.
+# "feed" must come before "health" because "feed unhealthy" contains
+# both "feed" and "health" (in "unhealthy"). Similarly "deep-link"
+# before "deeplink" so the hyphenated form is preferred when present.
+_HEADING_TO_SLUG_HINTS = (
+    ("coverage", "coverage"),
+    ("matrix", "coverage"),
+    ("cost", "cost"),
+    ("deploy", "deploy"),
+    ("feed", "feed"),
+    ("deep-link", "deeplink"),
+    ("deeplink", "deeplink"),
+    ("paused", "paused"),
+    ("bad card", "badcard"),
+    ("data loss", "data"),
+    ("sqlite", "data"),
+    ("bot itself", "bot"),
+    ("anthropic", "api"),
+    ("rogue", "api"),
+    ("operator", "operator"),
+    ("health", "health"),
+    ("learning", "learning"),
+    ("loop", "learning"),
+    ("wake up", "wake"),
+    ("sleep", "wake"),
+    ("adding", "adding"),
+)
+
+
+def slug_for(heading: str) -> str:
+    """
+    Derive a short tappable slug for a section heading.
+
+    Slugs must match `[a-z]+` so they can be appended to '/playbook_' and
+    rendered as a single tappable command in Telegram.
+    """
+    h = heading.lower()
+    for keyword, slug in _HEADING_TO_SLUG_HINTS:
+        if keyword in h:
+            return slug
+    # Fallback: first alphabetic word from the heading.
+    words = re.findall(r"[a-z]+", h.replace("scenario:", ""))
+    return words[0] if words else "topic"
+
+
 async def list_topics() -> Optional[List[str]]:
     """Return the list of section headings, or None if fetch fails."""
     try:
@@ -74,6 +119,15 @@ async def list_topics() -> Optional[List[str]]:
     except RuntimeError:
         return None
     return [h for h, _ in _parse_sections(text)]
+
+
+async def list_topics_with_slugs() -> Optional[List[tuple]]:
+    """Return [(heading, slug)] pairs, or None if fetch fails."""
+    try:
+        text = await _fetch_playbook()
+    except RuntimeError:
+        return None
+    return [(h, slug_for(h)) for h, _ in _parse_sections(text)]
 
 
 async def lookup(topic: str) -> str:
