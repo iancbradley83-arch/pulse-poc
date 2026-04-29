@@ -493,17 +493,18 @@ async def cmd_playbook(message: Message) -> None:
                 "usage: /playbook <topic>  — playbook unavailable, try later"
             )
             return
-        # Render heading + tappable /playbook_<slug>.
-        max_h = max((len(h) for h, _ in rows), default=0)
-        body_lines = [
-            f"  {h.ljust(max_h)}  /playbook_{slug}"
-            for h, slug in rows
-        ] or ["  (none)"]
-        body = "\n".join(body_lines)
-        await message.answer(
-            f"usage: /playbook <topic>  ·  tap a /playbook_<topic> below\n\n"
-            f"{body}"
-        )
+        # Two-line per scenario: tappable command on its own line so it can't
+        # wrap; description indented below. Telegram uses variable-width fonts;
+        # column alignment via padding does not work on phone.
+        body_lines = []
+        for h, slug in rows:
+            label = h
+            if label.lower().startswith("scenario:"):
+                label = label.split(":", 1)[1].strip()
+            body_lines.append(f"/playbook_{slug}")
+            body_lines.append(f"   {label}")
+        body = "\n".join(body_lines) if body_lines else "(none)"
+        await message.answer(f"tap any /playbook_<topic> below\n\n{body}")
         return
 
     topic = parts[1].strip()
