@@ -204,3 +204,37 @@ class PulseClient:
             raise
         except Exception as exc:
             raise PulseError(f"request failed: {exc}") from exc
+
+    async def post_admin_rerun(self) -> Dict[str, Any]:
+        """
+        POST /admin/rerun — trigger an on-demand candidate-engine rerun.
+
+        The endpoint is fire-and-forget on Pulse's side (Railway's 60s edge cap
+        means the engine response arrives in logs, not in the HTTP response body).
+
+        Expected response shape: {"ok": true} or {"ok": false, "error": "..."}
+        Raises PulseError on network failure or non-2xx status.
+        """
+        url = f"{self._base_url}/admin/rerun"
+        try:
+            kwargs: Dict[str, Any] = {}
+            if self._admin_auth:
+                kwargs["auth"] = self._admin_auth
+            resp = await self._client.post(url, **kwargs)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+                if not isinstance(data, dict):
+                    data = {"ok": True}
+            except Exception:
+                # Non-JSON body (e.g. plain "ok") — treat as success.
+                data = {"ok": True}
+            return data
+        except httpx.TimeoutException as exc:
+            raise PulseError("unreachable") from exc
+        except httpx.HTTPStatusError as exc:
+            raise PulseError(f"http {exc.response.status_code}") from exc
+        except PulseError:
+            raise
+        except Exception as exc:
+            raise PulseError(f"request failed: {exc}") from exc

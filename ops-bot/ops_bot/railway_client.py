@@ -152,6 +152,65 @@ class RailwayClient:
         except Exception as exc:
             raise RailwayError(f"couldn't parse variables response: {exc}") from exc
 
+    async def set_variable(
+        self,
+        project_id: str,
+        environment_id: str,
+        service_id: str,
+        name: str,
+        value: str,
+    ) -> None:
+        """
+        Upsert an env var on a Railway service via variableUpsert mutation.
+        Setting a variable triggers a Railway redeploy automatically.
+        Raises RailwayError on failure.
+        """
+        mutation = """
+        mutation VariableUpsert($input: VariableUpsertInput!) {
+          variableUpsert(input: $input)
+        }
+        """
+        variables: Dict[str, Any] = {
+            "input": {
+                "projectId": project_id,
+                "environmentId": environment_id,
+                "serviceId": service_id,
+                "name": name,
+                "value": value,
+            }
+        }
+        await self._query(mutation, variables)
+
+    async def redeploy_latest(self, deployment_id: str) -> Dict[str, Any]:
+        """
+        Trigger a redeploy of an existing deployment via deploymentRedeploy mutation.
+
+        Parameters
+        ----------
+        deployment_id : str
+            The Railway deployment ID to redeploy (obtain via latest_deployment()).
+
+        Returns a dict with at least {"id": str, "status": str}.
+        Raises RailwayError on failure.
+        """
+        mutation = """
+        mutation DeploymentRedeploy($id: String!) {
+          deploymentRedeploy(id: $id) {
+            id
+            status
+          }
+        }
+        """
+        data = await self._query(mutation, {"id": deployment_id})
+        try:
+            node = data.get("deploymentRedeploy") or {}
+            return {
+                "id": str(node.get("id", "")),
+                "status": str(node.get("status", "")),
+            }
+        except Exception as exc:
+            raise RailwayError(f"couldn't parse deploymentRedeploy response: {exc}") from exc
+
     async def recent_logs(
         self,
         project_id: str,

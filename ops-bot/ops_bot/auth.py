@@ -4,12 +4,14 @@ Auth middleware for aiogram v3.
 Rejects any update whose effective chat ID is not in the allowlist.
 Rejected senders receive one message and the chat ID is logged so Ian
 can grep Railway logs and add it to OPS_BOT_ALLOWED_CHAT_IDS.
+
+Stage 3: extended to handle CallbackQuery updates (inline-button taps).
 """
 import logging
-from typing import Any, Awaitable, Callable, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from aiogram import BaseMiddleware
-from aiogram.types import Message, TelegramObject
+from aiogram.types import CallbackQuery, Message, TelegramObject
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +23,30 @@ class AllowlistMiddleware(BaseMiddleware):
         self._allowed = set(allowed_chat_ids)
         super().__init__()
 
-    def _effective_chat_id(self, event: TelegramObject) -> int | None:
-        """Extract the chat ID from whatever update type we received."""
+    def _effective_chat_id(self, event: TelegramObject) -> Optional[int]:
+        """
+        Extract the chat ID from whatever update type we received.
+
+        For Message: event.chat.id
+        For CallbackQuery: event.message.chat.id (the chat where the original
+            message lives). We also check event.from_user.id as a fallback
+            for inline-mode callbacks (no message object).
+        For other types: walk common attribute paths.
+        """
         if isinstance(event, Message):
             return event.chat.id
+
+        if isinstance(event, CallbackQuery):
+            # Primary: the chat that contains the message the button was on.
+            if event.message is not None:
+                chat = getattr(event.message, "chat", None)
+                if chat is not None:
+                    return getattr(chat, "id", None)
+            # Fallback: use from_user.id (inline-mode callbacks have no message).
+            if event.from_user is not None:
+                return event.from_user.id
+            return None
+
         # For other update types, try common attribute paths.
         for attr in ("chat", "message"):
             obj = getattr(event, attr, None)
@@ -58,5 +80,12 @@ class AllowlistMiddleware(BaseMiddleware):
                 await event.answer("not authorised. your chat id has been logged.")
             except Exception:
                 pass  # Best-effort; never crash on rejection path.
+
+        # For CallbackQuery: answer silently (no toast) so the spinner stops.
+        if isinstance(event, CallbackQuery):
+            try:
+                await event.answer("not authorised")
+            except Exception:
+                pass
 
         return None

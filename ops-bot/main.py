@@ -7,6 +7,9 @@ Starts two concurrent coroutines:
 
 Safe to kill and restart at any time (stateless restart).
 On boot, sends a ping to all allowed chat IDs.
+
+Stage 3: callback_query outer middleware registered so inline-button taps
+go through the same auth gate as typed commands.
 """
 import asyncio
 import logging
@@ -125,16 +128,18 @@ async def main() -> None:
     bot = Bot(token=token)
     dp = Dispatcher()
 
-    # Auth middleware — outer so it fires on every message before handler
-    # resolution. Inner middleware only fires when a handler matches the
-    # message, so /start (no handler) and unrecognised text bypassed auth.
-    dp.message.outer_middleware(AllowlistMiddleware(allowed_ids))
+    # Auth middleware — registered on BOTH message and callback_query so
+    # inline-button taps go through the same allowlist gate as typed commands.
+    auth_mw = AllowlistMiddleware(allowed_ids)
+    dp.message.outer_middleware(auth_mw)
+    dp.callback_query.outer_middleware(auth_mw)
 
     # Wire command handlers.
     set_clients(pulse_client, railway_client)
     dp.include_router(router)
 
     # --- Cost alerter ---
+    # Pass bot + allowed_ids so the alerter can attach inline keyboards.
     async def broadcast(text: str) -> None:
         for chat_id in allowed_ids:
             try:
@@ -142,7 +147,12 @@ async def main() -> None:
             except Exception as exc:
                 logger.error("broadcast: could not send to %s: %s", chat_id, exc)
 
-    alerter = CostAlerter(pulse_client, broadcast)
+    alerter = CostAlerter(
+        pulse_client,
+        broadcast,
+        bot=bot,
+        allowed_ids=allowed_ids,
+    )
 
     # --- Health server ---
     health_runner = await start_health_server(health_port)
