@@ -227,7 +227,7 @@ TOPICS: dict[str, str] = {
         "  - Deploy is expected to fail: /snooze deploy 30m before triggering it\n"
         "  - Feed is intentionally thin during off-peak: /snooze feed 2h\n"
         "\n"
-        "Kinds:  cost  deploy  health  feed  all\n"
+        "Kinds:  cost  deploy  health  feed  deeplink  frontend  all\n"
         "  'all' applies the snooze to every kind at once.\n"
         "\n"
         "Durations:  30m  1h  2h  off  (off = clear immediately)\n"
