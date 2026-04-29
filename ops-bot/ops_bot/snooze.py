@@ -1,7 +1,7 @@
 """
 Snooze state for alert suppression.
 
-Supported kinds: "cost", "health" (health alerts ship in Stage 2B).
+Supported kinds: "cost", "health", "deploy", "feed", "deeplink".
 
 Snooze rules are persisted to SQLite at /data/snooze.db so a redeploy
 does not clear them. If the volume is absent or the DB cannot be opened,
@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-VALID_KINDS = {"cost", "deploy", "health", "feed"}
+VALID_KINDS = {"cost", "deploy", "health", "feed", "deeplink"}
 
 # In-memory state: kind -> expires_at (monotonic)
 _snoozed: Dict[str, float] = {}

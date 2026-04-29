@@ -27,9 +27,11 @@ from ops_bot.digests import DigestScheduler
 from ops_bot.feed_alerter import FeedAlerter
 from ops_bot.formatting import format_boot_ping
 from ops_bot.handlers import router, set_clients
+from ops_bot.deeplink_alerter import DeeplinkAlerter
 from ops_bot.health_alerter import HealthAlerter
 from ops_bot.pulse_client import PulseClient, PulseError
 from ops_bot.railway_client import RailwayClient
+from ops_bot import webhooks as _webhooks
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -51,9 +53,20 @@ async def health_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def start_health_server(port: int) -> web.AppRunner:
+async def start_health_server(port: int, broadcast_fn) -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/health", health_handler)
+
+    # Stage 4 lite — webhook scaffolding (inert until env vars + public domain set).
+    async def sentry_handler(request: web.Request) -> web.Response:
+        return await _webhooks.handle_sentry(request, broadcast_fn)
+
+    async def report_handler(request: web.Request) -> web.Response:
+        return await _webhooks.handle_report(request, broadcast_fn)
+
+    app.router.add_post("/sentry", sentry_handler)
+    app.router.add_post("/report", report_handler)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -174,12 +187,13 @@ async def main() -> None:
 
     health_alerter = HealthAlerter(pulse_client, broadcast_with_kb)
     feed_alerter = FeedAlerter(pulse_client, broadcast_with_kb)
+    deeplink_alerter = DeeplinkAlerter(pulse_client, broadcast_with_kb)
 
     # --- Digest scheduler ---
     digest_scheduler = DigestScheduler(bot, allowed_ids, pulse_client, railway_client)
 
     # --- Health server ---
-    health_runner = await start_health_server(health_port)
+    health_runner = await start_health_server(health_port, broadcast)
 
     # --- Boot sequence ---
     spend = await alerter.initialise()
@@ -197,6 +211,7 @@ async def main() -> None:
     alerter.start()
     health_alerter.start()
     feed_alerter.start()
+    deeplink_alerter.start()
     if deploy_alerter is not None:
         deploy_alerter.start()
     digest_scheduler.start()
@@ -210,6 +225,7 @@ async def main() -> None:
         alerter.stop()
         health_alerter.stop()
         feed_alerter.stop()
+        deeplink_alerter.stop()
         if deploy_alerter is not None:
             deploy_alerter.stop()
         digest_scheduler.stop()
