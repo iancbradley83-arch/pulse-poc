@@ -299,6 +299,28 @@ CREATE TABLE IF NOT EXISTS embeds (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_embeds_slug ON embeds(slug);
 CREATE INDEX IF NOT EXISTS idx_embeds_active ON embeds(active);
+
+-- Per-(storyline_type, scope) cooldown gate (PR fix/storyline-cooldown-sqlite,
+-- 2026-04-28). Persists the timestamps that StorylineDetector previously
+-- kept in module-level Python dicts. Container restarts wipe in-process
+-- state and re-arm the cooldown — the next tier cycle re-fires the
+-- expensive Haiku+web_search scout regardless of how recently it ran.
+-- With 11 redeploys yesterday alone, this is the same leak class that
+-- contributed to the original $407 incident. Persisting the row makes
+-- the 6h window actually durable.
+--
+-- `scope_key` mirrors the in-memory dict's tuple key flattened to a
+-- string: `f"{storyline_type.value}|{scope_label.lower()}"` — see
+-- `_storyline_cooldown_key` in app/engine/storyline_detector.py.
+-- `last_result_json` is the JSON-encoded StorylineItem (or null when the
+-- scout returned 0 participants — we still want to memoize the empty
+-- result so we don't re-scout an unproductive scope every cycle).
+CREATE TABLE IF NOT EXISTS storyline_cooldown (
+    scope_key       TEXT PRIMARY KEY,
+    last_scout_at   REAL NOT NULL,
+    last_result_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_storyline_cooldown_last_scout ON storyline_cooldown(last_scout_at);
 """
 
 
@@ -551,6 +573,16 @@ class CandidateStore:
             async with db.execute("PRAGMA table_info(daily_cost_by_kind)") as cur:
                 _bk_cols = {row[1] for row in await cur.fetchall()}
             _ = _bk_cols
+
+            # storyline_cooldown migration (PR fix/storyline-cooldown-sqlite,
+            # 2026-04-28). Additive new table — replaces the module-level
+            # dicts in app/engine/storyline_detector.py that lost state on
+            # every container restart. CREATE TABLE IF NOT EXISTS in the
+            # executescript below makes a fresh boot safe; warm boots are a
+            # no-op. Probe exists so future column additions land cleanly.
+            async with db.execute("PRAGMA table_info(storyline_cooldown)") as cur:
+                _sc_cols = {row[1] for row in await cur.fetchall()}
+            _ = _sc_cols
 
             await db.executescript(_SCHEMA)
             await db.commit()
@@ -1640,6 +1672,157 @@ class CandidateStore:
         async with self._connect() as db:
             await db.execute(
                 "UPDATE embeds SET active = 0 WHERE slug = ?", (slug,),
+            )
+            await db.commit()
+
+    # ── Storyline cooldown (PR fix/storyline-cooldown-sqlite, 2026-04-28) ──
+    #
+    # Persists the per-(storyline_type, scope) gate that
+    # StorylineDetector previously kept in module-level dicts. Container
+    # restarts wiped that state and re-armed the cooldown — yesterday's
+    # 11 redeploys meant we paid for the same Haiku+web_search scout
+    # call multiple times per day. Same leak class as the $407 incident.
+    #
+    # Read pattern: detector bulk-loads the rows it cares about at the
+    # start of `detect()` and gates against the local dict. Writes are
+    # one INSERT OR REPLACE per scout completion. Tiny table (~9 types ×
+    # ~10 scopes = <100 rows steady state), so even a per-call read is
+    # cheap — bulk read just keeps the diff against the existing detector
+    # loop minimal.
+
+    async def get_storyline_cooldown(
+        self, scope_key: str,
+    ) -> Optional[dict[str, Any]]:
+        """Return `{"last_scout_at": float, "last_result": dict | None}` or None.
+
+        `scope_key` matches StorylineDetector's flattened tuple key:
+        `f"{storyline_type.value}|{scope_label.lower()}"`.
+        """
+        async with self._connect() as db:
+            async with db.execute(
+                """
+                SELECT last_scout_at, last_result_json
+                FROM storyline_cooldown
+                WHERE scope_key = ?
+                """,
+                (scope_key,),
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            last_scout_at = float(row[0] or 0.0)
+        except (TypeError, ValueError):
+            return None
+        last_result: Optional[dict] = None
+        raw = row[1]
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    last_result = parsed
+            except (TypeError, ValueError, json.JSONDecodeError):
+                # Treat malformed JSON as a miss-result — the next scout
+                # will overwrite it. Don't poison the gate by re-raising.
+                last_result = None
+        return {"last_scout_at": last_scout_at, "last_result": last_result}
+
+    async def get_storyline_cooldowns_bulk(
+        self, scope_keys: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Single-query batch read for many scope_keys.
+
+        Returns a map keyed by `scope_key` containing only rows that
+        exist; missing keys are absent (caller treats them as "no
+        cooldown active"). Used by StorylineDetector at the start of a
+        cycle so per-candidate gating is a local-dict lookup.
+        """
+        if not scope_keys:
+            return {}
+        # De-dupe to keep the IN clause minimal.
+        keys = list({k for k in scope_keys if k})
+        if not keys:
+            return {}
+        placeholders = ",".join("?" * len(keys))
+        out: dict[str, dict[str, Any]] = {}
+        async with self._connect() as db:
+            async with db.execute(
+                f"""
+                SELECT scope_key, last_scout_at, last_result_json
+                FROM storyline_cooldown
+                WHERE scope_key IN ({placeholders})
+                """,
+                keys,
+            ) as cur:
+                rows = await cur.fetchall()
+        for r in rows:
+            try:
+                last_scout_at = float(r[1] or 0.0)
+            except (TypeError, ValueError):
+                continue
+            last_result: Optional[dict] = None
+            raw = r[2]
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        last_result = parsed
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    last_result = None
+            out[str(r[0])] = {
+                "last_scout_at": last_scout_at,
+                "last_result": last_result,
+            }
+        return out
+
+    async def set_storyline_cooldown(
+        self,
+        scope_key: str,
+        last_scout_at: float,
+        last_result: Optional[dict] = None,
+    ) -> None:
+        """Idempotent INSERT OR REPLACE. JSON-encodes `last_result`.
+
+        `last_result=None` is recorded as a NULL `last_result_json` —
+        keeps the cooldown gate active so we don't re-scout an
+        unproductive scope every cycle, mirroring the original
+        in-memory miss-result write that the Python-dict implementation
+        used to do.
+        """
+        if last_result is None:
+            payload: Optional[str] = None
+        else:
+            try:
+                payload = json.dumps(last_result, separators=(",", ":"))
+            except (TypeError, ValueError):
+                # If the caller hands us something non-serializable
+                # (shouldn't happen — StorylineItem.model_dump is JSON-safe)
+                # fall through to NULL rather than crash the cooldown
+                # write. We'd rather memoize the timestamp and lose the
+                # cached payload than re-fire the LLM call.
+                payload = None
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO storyline_cooldown
+                    (scope_key, last_scout_at, last_result_json)
+                VALUES (?, ?, ?)
+                """,
+                (scope_key, float(last_scout_at), payload),
+            )
+            await db.commit()
+
+    async def clear_storyline_cooldown(self, scope_key: str) -> None:
+        """Force-clear a single cooldown row.
+
+        Exposed for an /admin endpoint to be added in a follow-up PR
+        (force-rescan a misbehaving scope without a redeploy). No-op
+        when the row doesn't exist.
+        """
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM storyline_cooldown WHERE scope_key = ?",
+                (scope_key,),
             )
             await db.commit()
 

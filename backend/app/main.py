@@ -2441,6 +2441,12 @@ async def _run_candidate_engine(
                 model=os.getenv("PULSE_STORYLINE_MODEL", "claude-haiku-4-5"),
                 min_participants=PULSE_STORYLINE_MIN_PARTICIPANTS,
                 cost_tracker=_cost_tracker_storyline,
+                # SQLite-backed cooldown gate (PR fix/storyline-cooldown-sqlite,
+                # 2026-04-28). Persists per-(type, scope) last-scout timestamps
+                # so the 6h cooldown survives container restarts. Without this
+                # the in-memory dict was wiped on every redeploy — the same
+                # leak class as the $407 incident.
+                store=candidate_store,
             )
             xbuilder = CrossEventBuilder(catalog)
             author = CombinedNarrativeAuthor(
