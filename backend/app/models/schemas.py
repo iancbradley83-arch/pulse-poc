@@ -79,6 +79,19 @@ class Game(BaseModel):
     # if Rogue mis-reports.
     is_bet_builder_enabled: bool = False
 
+    # ── Fixture importance signals (Phase 1, fixture-importance.md) ──
+    # All optional / sensible defaults — old serialized snapshots in
+    # candidate_store.published_cards (Card.snapshot_json contains a Game)
+    # deserialize cleanly without migration. Phase 1 is plumbing only;
+    # Phase 2 will compute an importance score from these.
+    league_order: Optional[int] = None         # Rogue: lower = higher operator-priority
+    is_early_payout: bool = False              # Rogue: cashout promo enabled on this fixture
+    early_payout_value: Optional[float] = None # Rogue: cashout multiplier (typically 2)
+    is_top_league: bool = False                # Rogue: per-operator top-league flag (filter, NOT a ranker — see feedback_rogue_api_gotchas.md #4)
+    region_code: Optional[str] = None          # Rogue: "EU", "SAM", "EN", "ZZ", etc.
+    league_group_id: Optional[str] = None      # Rogue: groups related leagues (e.g. UCL + UEL + UECL)
+    is_operator_featured: bool = False         # Computed: fixture appears in this cycle's getFeaturedEvents response
+
 
 # ── Market ──
 
