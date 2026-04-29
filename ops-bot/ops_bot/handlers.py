@@ -58,6 +58,8 @@ from .railway_client import RailwayClient, RailwayError
 from . import runbook as _runbook
 from . import confirm as _confirm
 from . import snooze as _snooze
+from . import incidents as _incidents
+from .preview import build_preview
 from . import write_actions as _actions
 
 logger = logging.getLogger(__name__)
@@ -753,6 +755,138 @@ async def cmd_snooze(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stage 4 lite — /preview
+# ---------------------------------------------------------------------------
+
+@router.message(Command("preview"))
+async def cmd_preview(message: Message) -> None:
+    """/preview — data-view of the live widget: top 5 cards by relevance_score."""
+    text = await build_preview(_pulse_client)
+    await message.answer(text)
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 lite — /incident start|note|close
+# ---------------------------------------------------------------------------
+
+@router.message(Command("incident"))
+async def cmd_incident(message: Message) -> None:
+    """/incident start "<title>" | note "<text>" | close"""
+    text = message.text or ""
+    # Parse: /incident <subcommand> [rest]
+    parts = text.strip().split(None, 2)
+
+    if len(parts) < 2:
+        await message.answer(
+            "usage:\n"
+            "  /incident start \"<title>\"  — open a new incident\n"
+            "  /incident note \"<text>\"   — append a note\n"
+            "  /incident close            — finalise and post postmortem"
+        )
+        return
+
+    subcommand = parts[1].strip().lower()
+    rest = parts[2].strip().strip('"').strip("'") if len(parts) >= 3 else ""
+
+    chat_id = message.chat.id
+
+    # --- start ---
+    if subcommand == "start":
+        if not rest:
+            await message.answer("usage: /incident start \"<title>\"")
+            return
+        try:
+            slug = _incidents.start(chat_id, rest)
+        except ValueError as exc:
+            await message.answer(f"error: {exc}")
+            return
+        await message.answer(
+            f"incident started: {slug}\n"
+            "every /incident note you send is captured. /incident close to finalise."
+        )
+        return
+
+    # --- note ---
+    if subcommand == "note":
+        if not rest:
+            await message.answer("usage: /incident note \"<text>\"")
+            return
+        try:
+            _incidents.note(chat_id, rest)
+        except _incidents.NoOpenIncident:
+            await message.answer("no open incident — start one with /incident start \"<title>\"")
+            return
+        log = _incidents.get_open(chat_id)
+        await message.answer(f"note added to {log.slug}")
+        return
+
+    # --- close ---
+    if subcommand == "close":
+        try:
+            log = _incidents.close(chat_id)
+        except _incidents.NoOpenIncident:
+            await message.answer("no open incident to close")
+            return
+
+        import base64
+        import os
+        import httpx as _httpx
+
+        github_token = os.environ.get("GITHUB_TOKEN", "")
+        if not github_token:
+            await message.answer(
+                f"incident {log.slug} finalised in memory.\n"
+                "set GITHUB_TOKEN env var (repo scope) to enable postmortem commits."
+            )
+            return
+
+        # Commit the postmortem to GitHub.
+        md_content = _incidents.render_markdown(log)
+        filename = f"incidents/{log.slug}.md"
+        api_url = f"https://api.github.com/repos/iancbradley83-arch/pulse-poc/contents/{filename}"
+
+        payload = {
+            "message": f"incident: {log.slug}",
+            "content": base64.b64encode(md_content.encode()).decode(),
+            "branch": "main",
+        }
+        headers = {
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        try:
+            async with _httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.put(api_url, json=payload, headers=headers)
+        except Exception as exc:
+            logger.error("incident close: GitHub API error: %s", exc)
+            await message.answer(
+                f"incident {log.slug} finalised but GitHub commit failed: {exc}"
+            )
+            return
+
+        if resp.status_code in (200, 201):
+            try:
+                html_url = resp.json().get("content", {}).get("html_url", api_url)
+            except Exception:
+                html_url = api_url
+            await message.answer(
+                f"incident {log.slug} closed.\npostmortem committed: {html_url}"
+            )
+        else:
+            await message.answer(
+                f"incident {log.slug} finalised but GitHub commit returned {resp.status_code}.\n"
+                f"check GITHUB_TOKEN has repo scope."
+            )
+        return
+
+    # Unknown subcommand.
+    await message.answer(
+        f"unknown subcommand '{subcommand}'. use: start | note | close"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Stage 3 — 'yes' text fallback for pending confirms
 # ---------------------------------------------------------------------------
 
@@ -1045,6 +1179,16 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
             text = format_feed_audit(summary)
             if cards:
                 text += "\n\nuse /cards to scroll the actual cards"
+            await callback.message.answer(text)
+        return
+
+    # -----------------------------------------------------------------------
+    # action:preview — tapped [PREVIEW] on a deeplink alert
+    # -----------------------------------------------------------------------
+    if data == "action:preview":
+        await callback.answer()
+        if callback.message:
+            text = await build_preview(_pulse_client)
             await callback.message.answer(text)
         return
 
