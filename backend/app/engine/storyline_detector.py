@@ -773,14 +773,16 @@ class StorylineDetector:
             StorylineType.GOAL_MACHINES: bool(PULSE_STORYLINE_GOAL_MACHINES_ENABLED),
         }
 
-        # Side-channel cache — when main.py calls detect() for one of the
-        # three "original" types (GOLDEN_BOOT / RELEGATION / EUROPE_CHASE)
-        # we opportunistically run the five new detectors in parallel on
-        # the same fixture set and return their output alongside the
-        # requested type. This keeps main.py (MUST NOT touch list) unaware
-        # of the new types while still getting them on the feed. Keyed by
-        # id(games) so we only detect each new type once per cycle.
-        self._cycle_expansion_done: set[int] = set()
+        # Decoupling note (PR fix/storyline-independent-types,
+        # 2026-04-28): the previous implementation cached an "expansion
+        # pass already done this cycle" set keyed off id(games), and a
+        # tuple of the five new types it would piggy-back on the first
+        # original-type detect() call per cycle. Both are gone now —
+        # main.py iterates all 8 enabled types directly, so each call
+        # is responsible only for its own type. `_new_types` is kept
+        # below as a class constant for the bulk-cooldown helper, which
+        # still needs to know the full set of expansion scope keys it
+        # might be asked about.
         self._new_types: tuple[StorylineType, ...] = (
             StorylineType.TITLE_RACE,
             StorylineType.DERBY_WEEKEND,
@@ -807,14 +809,16 @@ class StorylineDetector:
         when no within-league storyline has >=2 valid participants.
         GOLDEN_BOOT is unchanged — it was already league-scoped implicitly.
 
-        Side-channel (storyline-expansion-top5 PR): when the caller
-        asks for one of the three original types, we piggy-back the
-        five new detectors (TITLE_RACE, DERBY_WEEKEND, EUROPEAN_WEEK,
-        HOME_FORTRESS, GOAL_MACHINES) onto the same call and return
-        their output in the same list. main.py iterates the
-        (story, score) pairs and dedupes by type before picking, so
-        returning multiple types here is safe. Each cycle's expansion
-        runs exactly once — we key off id(games).
+        Decoupling note (PR fix/storyline-independent-types,
+        2026-04-28): previously, when the caller asked for one of the
+        three original types we piggy-backed the five expansion
+        detectors (TITLE_RACE, DERBY_WEEKEND, EUROPEAN_WEEK,
+        HOME_FORTRESS, GOAL_MACHINES) onto the same call. That coupled
+        each expansion type to "at least one original is enabled" —
+        flipping ONLY an expansion env var was a silent no-op. main.py
+        now iterates ALL enabled types directly, so this method
+        returns 0 or 1 storylines for the requested type and nothing
+        else. The side-channel has been removed.
         """
         system_prompt = _PROMPT_REGISTRY.get(storyline_type)
         user_hint_tpl = _USER_HINT.get(storyline_type)
@@ -879,65 +883,24 @@ class StorylineDetector:
                 storyline_type.value,
             )
 
+        # Per-type kill switch — if the operator disabled this specific
+        # type via env, return [] without an LLM call. main.py also
+        # filters before iterating, so this is a defence-in-depth check
+        # for direct callers (tests, future internal callers).
+        if not self._type_enabled.get(storyline_type, True):
+            logger.info(
+                "StorylineDetector: type=%s disabled — skipping",
+                storyline_type.value,
+            )
+            return []
+
         item = await self._detect_once(
             storyline_type, fixtures,
             system_prompt, user_hint_tpl,
             scope_label="cross-league",
             cooldown_view=cooldown_view,
         )
-        results: list[StorylineItem] = [item] if item is not None else []
-
-        # Side-channel expansion — opportunistically detect the five new
-        # storyline types while we're here (main.py only knows the
-        # three originals). Run once per cycle, in parallel.
-        cycle_key = id(games)
-        if cycle_key not in self._cycle_expansion_done:
-            self._cycle_expansion_done.add(cycle_key)
-            # Keep the cache bounded — only the last 4 cycles matter.
-            if len(self._cycle_expansion_done) > 4:
-                self._cycle_expansion_done.pop()
-            import asyncio as _asyncio
-            expansion_tasks: list = []
-            expansion_types: list[StorylineType] = []
-            for nt in self._new_types:
-                if not self._type_enabled.get(nt, True):
-                    continue
-                nt_prompt = _PROMPT_REGISTRY.get(nt)
-                nt_hint = _USER_HINT.get(nt)
-                if nt_prompt is None or nt_hint is None:
-                    continue
-                expansion_tasks.append(self._detect_once(
-                    nt, fixtures, nt_prompt, nt_hint,
-                    scope_label="cross-league(expansion)",
-                    cooldown_view=cooldown_view,
-                ))
-                expansion_types.append(nt)
-            if expansion_tasks:
-                logger.info(
-                    "StorylineDetector: expansion pass — running %d new "
-                    "detectors: %s",
-                    len(expansion_tasks),
-                    [t.value for t in expansion_types],
-                )
-                try:
-                    gathered = await _asyncio.gather(
-                        *expansion_tasks, return_exceptions=True,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "StorylineDetector: expansion gather failed: %s", exc,
-                    )
-                    gathered = []
-                for nt, res in zip(expansion_types, gathered):
-                    if isinstance(res, Exception):
-                        logger.warning(
-                            "StorylineDetector: expansion %s errored: %s",
-                            nt.value, res,
-                        )
-                        continue
-                    if res is not None:
-                        results.append(res)
-        return results
+        return [item] if item is not None else []
 
     # ── Core scout + verify pipeline ───────────────────────────────────
 

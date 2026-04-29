@@ -113,10 +113,15 @@ from app.config import (
     PULSE_NEWS_MAX_SEARCHES,
     PULSE_NEWS_MODEL,
     PULSE_PUBLISH_THRESHOLD,
+    PULSE_STORYLINE_DERBY_WEEKEND_ENABLED,
     PULSE_STORYLINE_EUROPE_CHASE_ENABLED,
+    PULSE_STORYLINE_EUROPEAN_WEEK_ENABLED,
+    PULSE_STORYLINE_GOAL_MACHINES_ENABLED,
     PULSE_STORYLINE_GOLDEN_BOOT_ENABLED,
+    PULSE_STORYLINE_HOME_FORTRESS_ENABLED,
     PULSE_STORYLINE_MIN_PARTICIPANTS,
     PULSE_STORYLINE_RELEGATION_ENABLED,
+    PULSE_STORYLINE_TITLE_RACE_ENABLED,
     ROGUE_BASE_URL,
     ROGUE_CATALOGUE_DAYS_AHEAD,
     ROGUE_CATALOGUE_MAX_EVENTS,
@@ -2462,8 +2467,21 @@ async def _run_candidate_engine(
 
             # Enabled types — each with its own kill switch so ops can
             # disable a misbehaving detector without a redeploy. Insertion
-            # order is the newsworthiness tiebreaker if all three have
-            # equal participant counts.
+            # order is the newsworthiness tiebreaker if all enabled types
+            # produce stories with equal participant counts.
+            #
+            # Decoupling note (PR fix/storyline-independent-types): the
+            # original 3 (RELEGATION / EUROPE_CHASE / GOLDEN_BOOT) and the
+            # 5 expansion types (TITLE_RACE / DERBY_WEEKEND / EUROPEAN_WEEK
+            # / HOME_FORTRESS / GOAL_MACHINES) are all driven from this
+            # list now. Previously the expansion types only fired via a
+            # side-channel inside `detect()` invoked off one of the 3
+            # originals — flipping ONLY an expansion env var was a silent
+            # no-op. Each detector is its own independent Haiku+web_search
+            # call plus a SQLite cooldown lookup; there is no shared
+            # expensive step that requires a "carrier", so seeding from
+            # the full set is safe. Per-type 6h SQLite cooldown (PR #99)
+            # keeps each type bounded.
             enabled_types: list = []
             if PULSE_STORYLINE_RELEGATION_ENABLED:
                 enabled_types.append(_SType.RELEGATION)
@@ -2471,6 +2489,16 @@ async def _run_candidate_engine(
                 enabled_types.append(_SType.EUROPE_CHASE)
             if PULSE_STORYLINE_GOLDEN_BOOT_ENABLED:
                 enabled_types.append(_SType.GOLDEN_BOOT)
+            if PULSE_STORYLINE_TITLE_RACE_ENABLED:
+                enabled_types.append(_SType.TITLE_RACE)
+            if PULSE_STORYLINE_DERBY_WEEKEND_ENABLED:
+                enabled_types.append(_SType.DERBY_WEEKEND)
+            if PULSE_STORYLINE_EUROPEAN_WEEK_ENABLED:
+                enabled_types.append(_SType.EUROPEAN_WEEK)
+            if PULSE_STORYLINE_HOME_FORTRESS_ENABLED:
+                enabled_types.append(_SType.HOME_FORTRESS)
+            if PULSE_STORYLINE_GOAL_MACHINES_ENABLED:
+                enabled_types.append(_SType.GOAL_MACHINES)
 
             # Detect across all enabled types FIRST, score + select AFTER.
             # This way we don't burn the cap on the first type detected

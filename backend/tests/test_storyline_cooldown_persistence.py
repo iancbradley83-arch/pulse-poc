@@ -272,9 +272,14 @@ async def test_detect_with_persistent_cooldown_skips_within_window():
             verify_enabled=False,  # no second LLM verify call to mock
             store=store,
         )
-        # Disable expansion types so we only count the primary call —
-        # keeps the LLM-hit assertion tight.
-        det_a._type_enabled = {t: False for t in det_a._type_enabled}
+        # Enable only the primary type. Pre-decoupling this disabled
+        # everything to suppress the side-channel expansion pass; with
+        # main.py now iterating each type independently and detect()
+        # gating on its own _type_enabled flag, the primary call needs
+        # its flag true to fire. Keeps the LLM-hit assertion tight.
+        det_a._type_enabled = {
+            t: (t == StorylineType.GOLDEN_BOOT) for t in det_a._type_enabled
+        }
         result_a = await det_a.detect(StorylineType.GOLDEN_BOOT, games)
         assert len(result_a) == 1
         assert result_a[0].storyline_type == StorylineType.GOLDEN_BOOT
@@ -302,7 +307,9 @@ async def test_detect_with_persistent_cooldown_skips_within_window():
             verify_enabled=False,
             store=store,
         )
-        det_b._type_enabled = {t: False for t in det_b._type_enabled}
+        det_b._type_enabled = {
+            t: (t == StorylineType.GOLDEN_BOOT) for t in det_b._type_enabled
+        }
         result_b = await det_b.detect(StorylineType.GOLDEN_BOOT, games)
         assert len(result_b) == 1, (
             "second detect() should return the cached storyline"
