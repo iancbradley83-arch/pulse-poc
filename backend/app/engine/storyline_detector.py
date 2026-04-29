@@ -45,12 +45,15 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from anthropic import AsyncAnthropic
 
 from app.models.news import StorylineItem, StorylineParticipant, StorylineType
 from app.models.schemas import Game
+
+if TYPE_CHECKING:
+    from app.services.candidate_store import CandidateStore
 
 logger = logging.getLogger(__name__)
 
@@ -508,17 +511,29 @@ def get_standings_cache_counters() -> tuple[int, int]:
 
 # Per-(storyline_type, league) cooldown. Detectors that finished a scout
 # in the last cooldown window reuse the previously-detected participants
-# instead of paying for another LLM round-trip. Keyed by
-# (storyline_type.value, league_name_lower) so within-league and
-# cross-league passes are independent.
-_STORYLINE_LAST_SCOUT_AT: dict[tuple[str, str], float] = {}
-_STORYLINE_LAST_RESULT: dict[tuple[str, str], "Optional[StorylineItem]"] = {}
+# instead of paying for another LLM round-trip. Persisted to SQLite via
+# CandidateStore.{get,set,clear}_storyline_cooldown so the gate survives
+# container restarts (PR fix/storyline-cooldown-sqlite, 2026-04-28). The
+# previous module-level dicts evaporated on every redeploy and re-armed
+# the cooldown — yesterday's 11 deploys meant we paid for the same scout
+# multiple times. Same leak class as the $407 incident.
+#
+# `scope_key` is the flattened tuple key: `f"{type.value}|{scope.lower()}"`.
+# StorylineDetector loads the relevant rows once at the start of each
+# `detect()` call (bulk read) and gates against the local snapshot,
+# writing back per-scope as scouts complete.
 
 
 def _storyline_cooldown_key(
     storyline_type: "StorylineType", scope_label: str,
-) -> tuple[str, str]:
-    return (storyline_type.value, (scope_label or "").lower())
+) -> str:
+    """Flat string key for the SQLite-backed cooldown row.
+
+    Mirrors the original tuple `(storyline_type.value, scope_label.lower())`
+    semantics — within-league and cross-league passes for the same type
+    are independent, keys are case-insensitive on the scope.
+    """
+    return f"{storyline_type.value}|{(scope_label or '').lower()}"
 
 
 def _storyline_cooldown_seconds(storyline_type: "StorylineType") -> float:
@@ -654,10 +669,18 @@ class StorylineDetector:
         europe_chase_max_position: Optional[int] = None,
         europe_chase_max_points_from_spot: Optional[int] = None,
         cost_tracker: Optional[Any] = None,
+        store: Optional["CandidateStore"] = None,
     ):
         self._client = client
         self._model = model
         self._cost_tracker = cost_tracker
+        # SQLite-backed cooldown store. Optional only so older test
+        # rigs that don't care about cooldown persistence still build —
+        # production main.py always passes the real candidate_store.
+        # When None, every `_detect_once` call is a cooldown miss
+        # (no gate, no persistence); a one-time WARN logs at first use.
+        self._store = store
+        self._cooldown_store_warned = False
         self._max_searches = max_searches
         # Minimum participants required for a storyline to be considered
         # viable. 2 is the supply-friendly floor — a Golden Boot race with
@@ -810,6 +833,16 @@ class StorylineDetector:
             )
             return []
 
+        # Bulk-load every cooldown row this `detect()` call could
+        # consult, in one round-trip. Approach (A) from the PR spec —
+        # tier loops are serialized so the snapshot is consistent within
+        # a cycle, and the table is bounded (~9 types × ~10 scopes).
+        # `_detect_once` reads from this local snapshot and writes back
+        # both to it AND to SQLite as scouts complete.
+        cooldown_view = await self._bulk_load_cooldown_view(
+            storyline_type, fixtures,
+        )
+
         # For RELEGATION / EUROPE_CHASE: try each league group first.
         # Within-league storylines frame more cohesively than cross-league
         # mashups (the "Mallorca + Forest" bug the standings-verification
@@ -828,6 +861,7 @@ class StorylineDetector:
                     storyline_type, league_fixtures,
                     system_prompt, user_hint_tpl,
                     scope_label=f"league={league_name}",
+                    cooldown_view=cooldown_view,
                 )
                 if item is not None:
                     logger.info(
@@ -849,6 +883,7 @@ class StorylineDetector:
             storyline_type, fixtures,
             system_prompt, user_hint_tpl,
             scope_label="cross-league",
+            cooldown_view=cooldown_view,
         )
         results: list[StorylineItem] = [item] if item is not None else []
 
@@ -874,6 +909,7 @@ class StorylineDetector:
                 expansion_tasks.append(self._detect_once(
                     nt, fixtures, nt_prompt, nt_hint,
                     scope_label="cross-league(expansion)",
+                    cooldown_view=cooldown_view,
                 ))
                 expansion_types.append(nt)
             if expansion_tasks:
@@ -905,6 +941,117 @@ class StorylineDetector:
 
     # ── Core scout + verify pipeline ───────────────────────────────────
 
+    async def _bulk_load_cooldown_view(
+        self,
+        primary_type: StorylineType,
+        fixtures: list[Game],
+    ) -> dict[str, dict[str, Any]]:
+        """Bulk-load all cooldown rows this `detect()` call could consult.
+
+        One round-trip at the start of the cycle so per-scope gating is
+        a local-dict lookup. Tier loops are serialized — no two
+        concurrent `detect()` calls compete on the same view.
+        Returns `{scope_key: {"last_scout_at": float, "last_result": dict|None}}`.
+        Missing keys mean "no cooldown row exists" (always-scout).
+        """
+        if self._store is None:
+            if not self._cooldown_store_warned:
+                logger.warning(
+                    "StorylineDetector: no candidate_store wired — cooldown "
+                    "gate disabled. Every detect() will hit the LLM. Pass "
+                    "store=candidate_store to the constructor in production.",
+                )
+                self._cooldown_store_warned = True
+            return {}
+        # Compose the superset of scope_keys this detect() could touch:
+        #   - cross-league for the primary type
+        #   - cross-league(expansion) for each new_type
+        #   - league={name} for each league group (RELEGATION/EUROPE_CHASE)
+        candidate_keys: list[str] = []
+        types_to_consider: list[StorylineType] = [primary_type]
+        types_to_consider.extend(
+            t for t in self._new_types if self._type_enabled.get(t, True)
+        )
+        for t in types_to_consider:
+            candidate_keys.append(_storyline_cooldown_key(t, "cross-league"))
+            candidate_keys.append(_storyline_cooldown_key(t, "cross-league(expansion)"))
+        if primary_type in (StorylineType.RELEGATION, StorylineType.EUROPE_CHASE):
+            for league_name in _group_fixtures_by_league(fixtures).keys():
+                candidate_keys.append(
+                    _storyline_cooldown_key(primary_type, f"league={league_name}"),
+                )
+        try:
+            return await self._store.get_storyline_cooldowns_bulk(candidate_keys)
+        except Exception as exc:
+            # If the store read fails (rare — disk error, DB corruption)
+            # treat as a full miss. Better to overspend on one cycle's
+            # scouts than crash the engine.
+            logger.warning(
+                "StorylineDetector: bulk cooldown load failed (%s); "
+                "treating as all-miss for this cycle", exc,
+            )
+            return {}
+
+    @staticmethod
+    def _hydrate_storyline_item(payload: Optional[dict]) -> Optional[StorylineItem]:
+        """Rebuild a StorylineItem from the JSON-decoded blob in the DB.
+
+        Returns None if `payload` is None or fails validation — callers
+        already handle "miss-result memoized" as a None return, so this
+        falls through to the same code path. Pydantic v2 validate_python
+        is forgiving on extra/missing fields.
+        """
+        if not payload:
+            return None
+        try:
+            return StorylineItem.model_validate(payload)
+        except Exception as exc:
+            logger.warning(
+                "StorylineDetector: failed to hydrate cached StorylineItem "
+                "(%s); treating as miss-result", exc,
+            )
+            return None
+
+    async def _record_cooldown(
+        self,
+        cooldown_view: dict[str, dict[str, Any]],
+        cooldown_key: str,
+        item: Optional[StorylineItem],
+    ) -> None:
+        """Persist a scout result and update the local view.
+
+        `item=None` is recorded too — memoizes the empty outcome so we
+        don't re-scout an unproductive scope every cycle (matches the
+        original in-memory miss-result write that the Python-dict
+        implementation used to do).
+        """
+        now = time.time()
+        result_payload: Optional[dict] = None
+        if item is not None:
+            try:
+                result_payload = item.model_dump(mode="json")
+            except Exception as exc:
+                logger.warning(
+                    "StorylineDetector: model_dump failed (%s); persisting "
+                    "timestamp only", exc,
+                )
+                result_payload = None
+        cooldown_view[cooldown_key] = {
+            "last_scout_at": now,
+            "last_result": result_payload,
+        }
+        if self._store is None:
+            return
+        try:
+            await self._store.set_storyline_cooldown(
+                cooldown_key, now, result_payload,
+            )
+        except Exception as exc:
+            logger.warning(
+                "StorylineDetector: cooldown write failed (key=%s, %s)",
+                cooldown_key, exc,
+            )
+
     async def _detect_once(
         self,
         storyline_type: StorylineType,
@@ -913,6 +1060,7 @@ class StorylineDetector:
         user_hint_tpl: str,
         *,
         scope_label: str,
+        cooldown_view: Optional[dict[str, dict[str, Any]]] = None,
     ) -> Optional[StorylineItem]:
         """Run one scout + verify pass over the given fixture subset.
 
@@ -922,14 +1070,26 @@ class StorylineDetector:
         Standings only change once a day; scouting them every 30-60min
         burns Haiku+web_search for zero new info. See feedback memory
         on cost-leak fix (2026-04-26).
+
+        `cooldown_view` is the bulk-loaded snapshot from the SQLite
+        `storyline_cooldown` table populated at the start of `detect()`.
+        Defaults to {} for callers that haven't yet been threaded
+        through (none in production — main.py always goes through
+        `detect()`); in that case we go straight to the LLM and still
+        persist the result.
         """
         global _STORYLINE_COOLDOWN_HITS, _STORYLINE_COOLDOWN_MISSES
+        if cooldown_view is None:
+            cooldown_view = {}
         cooldown_key = _storyline_cooldown_key(storyline_type, scope_label)
         cooldown_s = _storyline_cooldown_seconds(storyline_type)
-        last_at = _STORYLINE_LAST_SCOUT_AT.get(cooldown_key)
+        cached_row = cooldown_view.get(cooldown_key)
+        last_at = cached_row.get("last_scout_at") if cached_row else None
         if last_at is not None and (time.time() - last_at) < cooldown_s:
             _STORYLINE_COOLDOWN_HITS += 1
-            cached_item = _STORYLINE_LAST_RESULT.get(cooldown_key)
+            cached_item = self._hydrate_storyline_item(
+                cached_row.get("last_result") if cached_row else None,
+            )
             age_min = (time.time() - last_at) / 60.0
             logger.info(
                 "[storylines] type=%s scope=%s cache_hit (cooldown %.0fm "
@@ -1083,8 +1243,7 @@ class StorylineDetector:
             )
             # Record cooldown miss-result so we don't re-scout an empty
             # outcome immediately next cycle.
-            _STORYLINE_LAST_SCOUT_AT[cooldown_key] = time.time()
-            _STORYLINE_LAST_RESULT[cooldown_key] = None
+            await self._record_cooldown(cooldown_view, cooldown_key, None)
             return None
 
         # Standings verification — only for RELEGATION and EUROPE_CHASE,
@@ -1117,8 +1276,7 @@ class StorylineDetector:
                 len(participants), self._min_participants,
                 storyline_type.value, scope_label,
             )
-            _STORYLINE_LAST_SCOUT_AT[cooldown_key] = time.time()
-            _STORYLINE_LAST_RESULT[cooldown_key] = None
+            await self._record_cooldown(cooldown_view, cooldown_key, None)
             return None
 
         item = StorylineItem(
@@ -1131,8 +1289,7 @@ class StorylineDetector:
             item.storyline_type.value, len(participants), scope_label,
             [p.player_name or p.team_name for p in participants],
         )
-        _STORYLINE_LAST_SCOUT_AT[cooldown_key] = time.time()
-        _STORYLINE_LAST_RESULT[cooldown_key] = item
+        await self._record_cooldown(cooldown_view, cooldown_key, item)
         return item
 
     # ── Standings verification ─────────────────────────────────────────
