@@ -31,6 +31,7 @@ from ops_bot.formatting import format_help
     "embed",
     "logs",
     "runbook",
+    "playbook",
     "env",
 ])
 def test_each_topic_returns_nonempty_text_containing_command_name(command):

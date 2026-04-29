@@ -54,6 +54,7 @@ def format_help() -> str:
         "  /embed [slug]        embed config; bare lists configured slugs\n"
         "  /logs [n]            last n WARN/ERROR from pulse-poc (default 20)\n"
         "  /runbook [topic]     RUNBOOK.md section; bare lists topics\n"
+        "  /playbook [topic]    operational playbook — what to do when X happens\n"
         "  /env <key>           current env var on pulse-poc (secrets scrubbed)\n"
         "\n"
         "stage 3 (act)\n"
