@@ -110,8 +110,8 @@ class EmbedTokenMiddleware:
     a valid embed token + origin allowlist match.
 
     Only intercepts GET/HEAD on /api/feed paths. Every other route
-    (including /admin/*, /reactions, /, /health, websockets) passes
-    through untouched.
+    (including /admin/*, /reactions, /, /health) passes through
+    untouched.
 
     Kill switch: PULSE_EMBED_TOKEN_REQUIRED defaults to "false". When
     "false" the middleware is a no-op; when "true" it enforces:
