@@ -756,10 +756,11 @@ async def cmd_yes(message: Message) -> None:
         await message.answer("no pending confirmation (or it expired after 30s)")
         return
 
-    action_id, _, args = entry
-    # Consume the pending confirm via resolve.
-    resolved_args = _confirm.resolve(chat_id, action_id)
-    if resolved_args is None:
+    action_id, _, _ = entry
+    # Consume the pending confirm via resolve. found vs not-found is the
+    # signal here — args may legitimately be None (e.g. /pause).
+    found, resolved_args = _confirm.resolve(chat_id, action_id)
+    if not found:
         await message.answer("confirmation expired (30s window)")
         return
 
@@ -805,6 +806,7 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
             # Remove any pending confirm for this chat.
             entry = _confirm.peek(chat_id)
             if entry is not None:
+                # entry is (action_id, expires_at, args); discard the result.
                 _confirm.resolve(chat_id, entry[0])
             await callback.answer("cancelled")
             if callback.message:
@@ -815,9 +817,9 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
             return
 
         # Resolve the pending confirm.
-        args = _confirm.resolve(chat_id, action_id)
-        if args is None:
-            # Check if the entry existed but expired.
+        found, args = _confirm.resolve(chat_id, action_id)
+        if not found:
+            # Either no pending confirm, action_id mismatch, or expired.
             await callback.answer("expired — send the command again", show_alert=True)
             if callback.message:
                 try:
@@ -850,10 +852,7 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
             await callback.answer("Railway API unavailable", show_alert=True)
             return
         # Register a fresh confirm (same flow as /pause).
-        _confirm.register(
-            chat_id, "pause",
-            detail="sets PULSE_RERUN_ENABLED=false, PULSE_NEWS_INGEST_ENABLED=false",
-        )
+        _confirm.register(chat_id, "pause")
         await callback.answer()
         if callback.message:
             text = format_confirm_prompt(
