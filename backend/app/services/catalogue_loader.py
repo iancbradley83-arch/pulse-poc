@@ -456,6 +456,23 @@ def _map_event_to_game(event: dict[str, Any]) -> Optional[Game]:
     settings = event.get("Settings") or {}
     bb_enabled = bool(settings.get("IsBetBuilderEnabled", False)) if isinstance(settings, dict) else False
 
+    # ── Fixture importance signals (Phase 1) ──
+    # All Rogue-native fields. Stamped here so downstream Phase 2 scorer
+    # can read them off Game without re-fetching the raw event.
+    # `is_operator_featured` is set later in `fetch_soccer_snapshot` after
+    # we cross-reference the getFeaturedEvents response.
+    league_order_raw = event.get("LeagueOrder")
+    try:
+        league_order = int(league_order_raw) if league_order_raw is not None else None
+    except (TypeError, ValueError):
+        league_order = None
+
+    early_payout_value_raw = event.get("EarlyPayoutValue")
+    try:
+        early_payout_value = float(early_payout_value_raw) if early_payout_value_raw is not None else None
+    except (TypeError, ValueError):
+        early_payout_value = None
+
     return Game(
         id=str(event_id),
         sport=Sport.SOCCER,
@@ -469,6 +486,13 @@ def _map_event_to_game(event: dict[str, Any]) -> Optional[Game]:
         broadcast=str(event.get("LeagueName") or ""),
         start_time=_start_time(event),
         is_bet_builder_enabled=bb_enabled,
+        league_order=league_order,
+        is_early_payout=bool(event.get("IsEarlyPayout", False)),
+        early_payout_value=early_payout_value,
+        is_top_league=bool(event.get("IsTopLeague", False)),
+        region_code=(str(event["RegionCode"]) if event.get("RegionCode") else None),
+        league_group_id=(str(event["LeagueGroupId"]) if event.get("LeagueGroupId") else None),
+        is_operator_featured=False,  # set downstream in fetch_soccer_snapshot
     )
 
 
@@ -590,4 +614,65 @@ async def fetch_soccer_snapshot(
         "[catalogue] loaded %d fixtures, %d with BB-enabled (%d%% of total)",
         len(games), bb_on, pct,
     )
+
+    # ── Tag operator-featured fixtures (Phase 1, fixture-importance.md) ──
+    # Cross-reference the operator's curated featured-events list against
+    # our loaded catalogue. A match is the strongest single importance
+    # signal we have — no Pulse-side admin needed; the operator's normal
+    # merchandising flow IS the configuration.
+    await _tag_operator_featured(client, games)
+
+    # Boot-time visibility: prove Phase 1 captured the importance signals.
+    _log_importance_signal_summary(games)
+
     return games, markets, raw_detailed
+
+
+async def _tag_operator_featured(client: RogueClient, games: list[Game]) -> None:
+    """Set `Game.is_operator_featured=True` for fixtures in the operator's
+    featured-events list. Failure-tolerant — on any error, every Game
+    keeps `is_operator_featured=False` and engine continues.
+    """
+    try:
+        featured = await client.get_featured_events(locale="en")
+    except Exception as exc:
+        logger.warning("[catalogue] featured-events tagging skipped (fetch failed): %s", exc)
+        return
+
+    featured_ids = {str(e.get("_id")) for e in featured if e.get("_id")}
+    if not featured_ids:
+        logger.info("[catalogue] tagged 0 fixtures as operator-featured (out of %d total catalogued)", len(games))
+        return
+
+    tagged = 0
+    for g in games:
+        if g.id in featured_ids:
+            g.is_operator_featured = True
+            tagged += 1
+
+    logger.info(
+        "[catalogue] tagged %d fixtures as operator-featured (out of %d total catalogued)",
+        tagged, len(games),
+    )
+
+
+def _log_importance_signal_summary(games: list[Game]) -> None:
+    """One-line boot-log summary so anyone reading runtime logs can verify
+    Phase 1 plumbing actually captured the signals from Rogue.
+    """
+    if not games:
+        return
+    featured_n = sum(1 for g in games if g.is_operator_featured)
+    top_league_n = sum(1 for g in games if g.is_top_league)
+    early_payout_n = sum(1 for g in games if g.is_early_payout)
+    league_orders = [g.league_order for g in games if g.league_order is not None]
+    if league_orders:
+        lo_min, lo_max = min(league_orders), max(league_orders)
+        lo_range = f"[{lo_min}, {lo_max}]"
+    else:
+        lo_range = "[none]"
+    logger.info(
+        "[catalogue] importance signals: featured=%d, top_league=%d, early_payout=%d "
+        "(league_order range: %s, n=%d)",
+        featured_n, top_league_n, early_payout_n, lo_range, len(league_orders),
+    )

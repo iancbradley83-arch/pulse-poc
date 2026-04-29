@@ -157,6 +157,10 @@ class RogueClient:
             await client.close()
     """
 
+    # Featured-events list refreshes slowly (operator merchandising) — cache
+    # so repeated calls within one tier cycle don't re-hit the API.
+    _FEATURED_EVENTS_TTL_S: float = 300.0  # 5 minutes
+
     def __init__(
         self,
         base_url: str,
@@ -168,6 +172,8 @@ class RogueClient:
         self._http = httpx.AsyncClient(timeout=timeout_s)
         self._auth = RogueAuth(self._base_url, config_jwt, self._http)
         self._limiter = RateLimiter(per_second)
+        # Per-locale cache of featured-events results: locale -> (fetched_at, list)
+        self._featured_events_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -341,6 +347,63 @@ class RogueClient:
             "/v1/featured/multilanguage/boostedSelections",
             {"locale": locale},
         )
+
+    async def get_featured_events(self, *, locale: str = "en") -> list[dict[str, Any]]:
+        """Operator-curated featured events (merchandising signal).
+
+        Endpoint: `GET /v1/sportsdata/featured/events` (operationId
+        `EventsController_getFeaturedEvents`). Returns the raw event dicts
+        the operator has hand-picked for surfacing on their landing pages.
+        For Pulse, intersecting these IDs with our catalogue gives us the
+        strongest single importance signal — without any operator-side
+        configuration on our end (the operator's existing merchandising
+        flow IS the configuration).
+
+        Caching:
+            Results cached per-locale for ``_FEATURED_EVENTS_TTL_S`` (5 min)
+            because the list churns slowly relative to one tier cycle.
+
+        Failure handling:
+            Any 4xx/5xx/network failure logs a warning and returns ``[]``.
+            Downstream tagging then leaves all fixtures
+            ``is_operator_featured=False`` — engine continues to function.
+
+        Returns:
+            list[dict]: raw event dicts (as returned by Rogue, with name
+            fields flattened via `_normalize_event`). Caller picks ``_id``
+            out of each.
+        """
+        now = time.monotonic()
+        cached = self._featured_events_cache.get(locale)
+        if cached is not None:
+            fetched_at, events = cached
+            if (now - fetched_at) < self._FEATURED_EVENTS_TTL_S:
+                return events
+
+        try:
+            data = await self._request(
+                "/v1/sportsdata/featured/events",
+                {"includeMarkets": "none", "locale": locale},
+            )
+        except Exception as exc:  # RogueApiError, httpx errors, anything
+            logger.warning("[catalogue] get_featured_events failed: %s", exc)
+            # Cache the empty result briefly so we don't retry-storm on a
+            # broken upstream within the same cycle.
+            self._featured_events_cache[locale] = (now, [])
+            return []
+
+        # FeaturedEventsResponse: {Events: [...], TotalCount: N}. Defensive
+        # against shape drift — accept a bare list too.
+        if isinstance(data, dict):
+            events_raw = data.get("Events") or []
+        elif isinstance(data, list):
+            events_raw = data
+        else:
+            events_raw = []
+
+        events = [_normalize_event(e) for e in events_raw if isinstance(e, dict)]
+        self._featured_events_cache[locale] = (now, events)
+        return events
 
     async def calculate_bets(
         self,
