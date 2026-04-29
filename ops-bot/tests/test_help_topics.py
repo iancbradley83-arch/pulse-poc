@@ -103,9 +103,12 @@ def test_format_help_includes_stage2_commands():
     assert "/env" in out
 
 
-def test_format_help_includes_stage3_coming_line():
+def test_format_help_lists_stage3_commands():
+    """Stage 3 is now live (PR #97). /help should list each act-command, not 'coming'."""
     out = format_help()
-    assert "stage 3 coming" in out
+    assert "stage 3" in out
+    for cmd in ("/pause", "/resume", "/rerun", "/flag", "/redeploy", "/snooze"):
+        assert cmd in out
 
 
 def test_format_help_includes_new_footer():

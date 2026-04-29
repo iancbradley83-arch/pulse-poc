@@ -11,24 +11,42 @@ On boot:
 
 At UTC midnight:
   - Resets the dedup set and last-seen total.
+
+Stage 3 additions:
+  - Accepts optional Bot instance; when present, attaches an inline keyboard
+    to every cost alert with [PAUSE] [BREAKDOWN] [DISMISS] buttons.
+  - Respects snooze state: if 'cost' is snoozed, skips sending the alert.
 """
 import asyncio
 import logging
-from datetime import date, timezone, datetime
-from typing import Callable, Awaitable, List, Set
+from datetime import date
+from typing import Awaitable, Callable, List, Optional, Set
+
+from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .config import COST_THRESHOLDS, DAILY_BUDGET, COST_POLL_INTERVAL
 from .formatting import format_cost_alert, format_boot_ping
 from .pulse_client import PulseClient, PulseError
+from . import snooze as _snooze
 
 logger = logging.getLogger(__name__)
 
-# Type alias for the send-message callback.
+# Type alias for the plain-text send-message callback (used when no Bot provided).
 SendFn = Callable[[str], Awaitable[None]]
 
 
 def _today_iso() -> str:
     return date.today().isoformat()
+
+
+def _cost_alert_keyboard() -> InlineKeyboardMarkup:
+    """Return the inline keyboard appended to cost threshold alerts."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="PAUSE", callback_data="action:pause"),
+        InlineKeyboardButton(text="BREAKDOWN", callback_data="action:breakdown"),
+        InlineKeyboardButton(text="DISMISS", callback_data="action:dismiss"),
+    ]])
 
 
 class CostAlerter:
@@ -37,10 +55,12 @@ class CostAlerter:
 
     Parameters
     ----------
-    pulse_client : PulseClient
-    send_fn      : async callable(text) — sends message to all allowed chat IDs
-    thresholds   : ordered list of USD thresholds (default from config)
-    poll_interval: seconds between polls (default from config)
+    pulse_client  : PulseClient
+    send_fn       : async callable(text) — plain-text broadcast to all allowed chat IDs
+    thresholds    : ordered list of USD thresholds (default from config)
+    poll_interval : seconds between polls (default from config)
+    bot           : optional Bot instance for sending messages with inline keyboards
+    allowed_ids   : list of chat IDs to broadcast to (needed when bot is provided)
     """
 
     def __init__(
@@ -50,17 +70,21 @@ class CostAlerter:
         thresholds: List[float] = COST_THRESHOLDS,
         poll_interval: int = COST_POLL_INTERVAL,
         daily_budget: float = DAILY_BUDGET,
+        bot: Optional[Bot] = None,
+        allowed_ids: Optional[List[int]] = None,
     ) -> None:
         self._pulse = pulse_client
         self._send = send_fn
         self._thresholds = sorted(thresholds)
         self._poll_interval = poll_interval
         self._daily_budget = daily_budget
+        self._bot = bot
+        self._allowed_ids: List[int] = allowed_ids or []
 
         # Dedup set of "date_iso:threshold_str" keys.
         self._fired: Set[str] = set()
         self._current_day = _today_iso()
-        self._task: asyncio.Task | None = None
+        self._task: Optional[asyncio.Task] = None
 
     def _dedup_key(self, threshold: float) -> str:
         return f"{self._current_day}:{threshold:.2f}"
@@ -74,7 +98,10 @@ class CostAlerter:
     def _check_day_rollover(self) -> None:
         today = _today_iso()
         if today != self._current_day:
-            logger.info("cost_alerter: day rollover %s -> %s, resetting dedup set", self._current_day, today)
+            logger.info(
+                "cost_alerter: day rollover %s -> %s, resetting dedup set",
+                self._current_day, today,
+            )
             self._current_day = today
             self._fired = set()
 
@@ -82,6 +109,31 @@ class CostAlerter:
         """Return today's spend in USD, or raise PulseError."""
         cost = await self._pulse.cost(days=1)
         return float(cost.get("total_usd", 0.0))
+
+    async def _send_alert(self, text: str) -> None:
+        """
+        Broadcast a cost alert.
+
+        If a Bot instance is available, send with inline keyboard to each
+        allowed chat ID directly. Otherwise fall back to the plain send_fn.
+        """
+        if self._bot is not None and self._allowed_ids:
+            keyboard = _cost_alert_keyboard()
+            for chat_id in self._allowed_ids:
+                try:
+                    await self._bot.send_message(
+                        chat_id, text, reply_markup=keyboard
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "cost_alerter: failed to send alert with keyboard to %s: %s",
+                        chat_id, exc,
+                    )
+        else:
+            try:
+                await self._send(text)
+            except Exception as exc:
+                logger.error("cost_alerter: failed to send alert: %s", exc)
 
     async def initialise(self) -> float:
         """
@@ -98,7 +150,8 @@ class CostAlerter:
             if spend >= threshold:
                 self._mark_fired(threshold)
                 logger.info(
-                    "cost_alerter: boot-recovery — threshold $%.2f already crossed (spend $%.2f), marked as fired",
+                    "cost_alerter: boot-recovery — threshold $%.2f already crossed "
+                    "(spend $%.2f), marked as fired",
                     threshold,
                     spend,
                 )
@@ -107,6 +160,12 @@ class CostAlerter:
     async def _check_and_alert(self) -> None:
         """Single poll cycle — fetch spend and fire any new threshold alerts."""
         self._check_day_rollover()
+
+        # Respect snooze — skip the entire poll if cost alerts are snoozed.
+        if _snooze.is_snoozed("cost"):
+            logger.debug("cost_alerter: cost alerts snoozed — skipping poll")
+            return
+
         try:
             spend = await self._get_today_spend()
         except PulseError as exc:
@@ -122,10 +181,7 @@ class CostAlerter:
                     threshold,
                     spend,
                 )
-                try:
-                    await self._send(msg)
-                except Exception as exc:
-                    logger.error("cost_alerter: failed to send alert: %s", exc)
+                await self._send_alert(msg)
 
     async def _poll_loop(self) -> None:
         """Background poll loop. Runs until cancelled."""

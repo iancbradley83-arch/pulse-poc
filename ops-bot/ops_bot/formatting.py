@@ -39,9 +39,8 @@ def format_help() -> str:
         "pulse-ops-bot — Pulse ops from your phone\n"
         "\n"
         "Telegram console for the Pulse content widget. Monitor health,\n"
-        "cost, and deploys. Inspect cards and operator embeds. Pull logs\n"
-        "and runbook sections — all without opening a laptop. Read-only\n"
-        "today; pause / resume / redeploy / blacklist land in stage 3.\n"
+        "cost, and deploys. Flip kill switches and redeploy — all from\n"
+        "a phone. Destructive actions require a 30s confirm tap or 'yes'.\n"
         "\n"
         "stage 1 (read-only)\n"
         "  /status              pulse health + cost + deploy + cards/$ per card\n"
@@ -57,11 +56,49 @@ def format_help() -> str:
         "  /runbook [topic]     RUNBOOK.md section; bare lists topics\n"
         "  /env <key>           current env var on pulse-poc (secrets scrubbed)\n"
         "\n"
-        "stage 3 coming: /pause /resume /rerun /flag /redeploy /blacklist /snooze\n"
+        "stage 3 (act)\n"
+        "  /pause               PULSE_RERUN_ENABLED=false, PULSE_NEWS_INGEST_ENABLED=false\n"
+        "  /resume              same vars -> true\n"
+        "  /rerun               POST /admin/rerun — trigger engine cycle\n"
+        "  /flag <NAME> <val>   set any env var on pulse-poc\n"
+        "  /redeploy            Railway deploymentRedeploy on latest deployment\n"
+        "  /snooze [kind] [dur] suppress alert class (cost). dur: 30m 1h 2h off\n"
+        "\n"
+        "  cost alerts now have [PAUSE] [BREAKDOWN] [DISMISS] buttons\n"
+        "  /blacklist deferred — needs Pulse /admin/blacklist endpoint\n"
+        "\n"
         "stage 4 coming: /preview /restore /incident /contact\n"
         "\n"
         "type /help <command> for details on any command  ·  e.g. /help_status"
     )
+
+
+def format_confirm_prompt(action_id: str, detail: str) -> str:
+    """
+    Format the confirmation prompt sent before a destructive action.
+
+    action_id: short identifier, e.g. "pause"
+    detail: human-readable description of what will happen, e.g.
+            "sets PULSE_RERUN_ENABLED=false, PULSE_NEWS_INGEST_ENABLED=false"
+    """
+    return (
+        f"confirm: {action_id} Pulse engine?\n"
+        f"{detail}\n"
+        f"\n"
+        f"tap [confirm {action_id}] or reply 'yes' within 30s"
+    )
+
+
+def format_action_result(action_id: str, success: bool, summary: str) -> str:
+    """
+    Format the result message after a confirmed action executes.
+
+    success: True = action succeeded, False = action failed
+    summary: what happened, from write_actions.*
+    """
+    if success:
+        return f"{action_id}: done — {summary}"
+    return f"{action_id}: failed — {summary}"
 
 
 def format_status(
