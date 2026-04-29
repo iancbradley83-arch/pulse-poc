@@ -630,6 +630,20 @@ def format_health_recovery(down_minutes: int) -> str:
     return f"[ops-bot] Pulse recovered — was down ~{down_minutes}m"
 
 
+def format_widget_alert(down_minutes: int, reason: str) -> str:
+    """Format a CRITICAL push alert for widget-render failure."""
+    return (
+        f"[ops-bot] CRITICAL — Pulse widget broken for ~{down_minutes}m\n"
+        f"  reason: {reason}\n"
+        f"  /preview to inspect  ·  /redeploy to recycle"
+    )
+
+
+def format_widget_recovery(down_minutes: int) -> str:
+    """Format the recovery notice after widget renders cleanly again."""
+    return f"[ops-bot] Pulse widget recovered — was broken ~{down_minutes}m"
+
+
 def format_feed_alert_low_cards(count: int) -> str:
     """Format a WARN push alert for low card count."""
     return (

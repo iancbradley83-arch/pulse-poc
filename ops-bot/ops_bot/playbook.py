@@ -87,6 +87,11 @@ _HEADING_TO_SLUG_HINTS = (
     ("anthropic", "api"),
     ("rogue", "api"),
     ("operator", "operator"),
+    # Note: "frontend / widget broken" must come before "health" because
+    # the heading reads "Scenario: frontend / widget broken (200 OK, page
+    # won't render)" — and "OK" doesn't trigger but "health" elsewhere could.
+    ("frontend", "frontend"),
+    ("widget broken", "frontend"),
     ("health", "health"),
     ("learning", "learning"),
     ("loop", "learning"),

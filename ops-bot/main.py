@@ -29,6 +29,7 @@ from ops_bot.formatting import format_boot_ping
 from ops_bot.handlers import router, set_clients
 from ops_bot.deeplink_alerter import DeeplinkAlerter
 from ops_bot.health_alerter import HealthAlerter
+from ops_bot.widget_alerter import WidgetAlerter
 from ops_bot.pulse_client import PulseClient, PulseError
 from ops_bot.railway_client import RailwayClient
 from ops_bot import webhooks as _webhooks
@@ -188,6 +189,7 @@ async def main() -> None:
     health_alerter = HealthAlerter(pulse_client, broadcast_with_kb)
     feed_alerter = FeedAlerter(pulse_client, broadcast_with_kb)
     deeplink_alerter = DeeplinkAlerter(pulse_client, broadcast_with_kb)
+    widget_alerter = WidgetAlerter(pulse_base_url.rstrip("/") + "/", broadcast_with_kb)
 
     # --- Digest scheduler ---
     digest_scheduler = DigestScheduler(bot, allowed_ids, pulse_client, railway_client)
@@ -212,6 +214,7 @@ async def main() -> None:
     health_alerter.start()
     feed_alerter.start()
     deeplink_alerter.start()
+    widget_alerter.start()
     if deploy_alerter is not None:
         deploy_alerter.start()
     digest_scheduler.start()
@@ -226,6 +229,7 @@ async def main() -> None:
         health_alerter.stop()
         feed_alerter.stop()
         deeplink_alerter.stop()
+        widget_alerter.stop()
         if deploy_alerter is not None:
             deploy_alerter.stop()
         digest_scheduler.stop()
