@@ -56,6 +56,7 @@ from .feed_audit import build_feed_summary, get_page
 from .pulse_client import PulseClient, PulseError
 from .railway_client import RailwayClient, RailwayError
 from . import runbook as _runbook
+from . import playbook as _playbook
 from . import confirm as _confirm
 from . import snooze as _snooze
 from . import incidents as _incidents
@@ -472,6 +473,34 @@ async def cmd_runbook(message: Message) -> None:
 
     topic = parts[1].strip()
     result = await _runbook.lookup(topic)
+    await message.answer(result)
+
+
+# ---------------------------------------------------------------------------
+# Phone-only ops — /playbook [topic]
+# ---------------------------------------------------------------------------
+
+@router.message(Command("playbook"))
+async def cmd_playbook(message: Message) -> None:
+    """/playbook [topic] — operational scenario lookup from PLAYBOOK.md."""
+    text = message.text or ""
+    parts = text.strip().split(None, 1)
+
+    if len(parts) < 2 or not parts[1].strip():
+        topics = await _playbook.list_topics()
+        if topics is None:
+            await message.answer(
+                "usage: /playbook <topic>  — playbook unavailable, try later"
+            )
+            return
+        body = "\n".join(f"  {t}" for t in topics) or "  (none)"
+        await message.answer(
+            f"usage: /playbook <topic>\n\navailable scenarios:\n{body}"
+        )
+        return
+
+    topic = parts[1].strip()
+    result = await _playbook.lookup(topic)
     await message.answer(result)
 
 

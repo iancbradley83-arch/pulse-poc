@@ -173,6 +173,34 @@ TOPICS: dict[str, str] = {
         "  /runbook rate limit    multi-word keyword"
     ),
 
+    "playbook": (
+        "/playbook [topic] — what to do when X happens\n"
+        "\n"
+        "When to use:\n"
+        "  - A push alert just fired and you want a triage sequence\n"
+        "  - Operator reports a problem and you need a checklist\n"
+        "  - 3am wake-up: 'is this worth waking up for?' — see the wake-up matrix\n"
+        "  - You just hit a new failure mode — read after the fix and add a section\n"
+        "\n"
+        "What it shows:\n"
+        "  Sections from pulse-poc/docs/PLAYBOOK.md matching your keyword.\n"
+        "  Each scenario covers symptom, first move, common causes, phone fix,\n"
+        "  when to escalate to a laptop, and the learning step (open an incident).\n"
+        "  Bare /playbook lists every scenario.\n"
+        "\n"
+        "Special sections:\n"
+        "  /playbook coverage     phone-only vs laptop matrix for each scenario\n"
+        "  /playbook learning     the incident → postmortem → review loop\n"
+        "  /playbook wake         when to wake up at 3am vs sleep through\n"
+        "\n"
+        "Examples:\n"
+        "  /playbook              list all scenarios\n"
+        "  /playbook cost         cost ladder triage\n"
+        "  /playbook down         pulse health 5xx triage\n"
+        "  /playbook deploy       deploy fail triage\n"
+        "  /playbook bad card     bad-card-visible scenario"
+    ),
+
     "env": (
         "/env <key> — read a Railway env var on pulse-poc\n"
         "\n"
