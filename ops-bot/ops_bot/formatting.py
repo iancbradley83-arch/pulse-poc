@@ -58,7 +58,9 @@ def format_help() -> str:
         "  /env <key>           current env var on pulse-poc (secrets scrubbed)\n"
         "\n"
         "stage 3 coming: /pause /resume /rerun /flag /redeploy /blacklist /snooze\n"
-        "stage 4 coming: /preview /restore /incident /contact"
+        "stage 4 coming: /preview /restore /incident /contact\n"
+        "\n"
+        "type /help <command> for details on any command  ·  e.g. /help_status"
     )
 
 
