@@ -7,7 +7,7 @@ import secrets
 import time
 import uuid
 from pathlib import Path
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
@@ -421,7 +421,8 @@ class SecurityHeadersMiddleware:
     _CSP = (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
         "img-src 'self' data: https:; "
         "connect-src 'self'; "
         "frame-ancestors 'none'; "
@@ -794,18 +795,6 @@ async def debug_boosted(locale: str = "en"):
         await client.close()
 
 
-# ── WebSocket ──
-@app.websocket("/ws/feed")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    feed.register_ws(websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        feed.unregister_ws(websocket)
-
-
 # ── Generate pre-match cards on startup ──
 _rerun_task: _Optional["asyncio.Task"] = None  # noqa: F821
 # Long-lived RogueClient + SSE manager for live price updates. Distinct
@@ -1002,8 +991,8 @@ async def admin_rerun():
     """On-demand candidate-engine rerun for demos. Fires-and-forgets so
     the HTTP response returns immediately (rerun takes ~3 min; Railway's
     edge cuts at 60s). Status of the most recent run is available at
-    GET /admin/rerun/status. Frontend clients listen on the existing
-    `/ws/feed` socket for `{type:"feed_refresh"}` to know when to re-pull.
+    GET /admin/rerun/status. Frontend clients pick up the new feed via
+    the 60s background poll on /api/feed.
 
     Guarded against parallel invocations — second call while one is in
     flight returns 409.
