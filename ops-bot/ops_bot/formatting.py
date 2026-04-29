@@ -62,7 +62,7 @@ def format_help() -> str:
         "  /rerun               POST /admin/rerun — trigger engine cycle\n"
         "  /flag <NAME> <val>   set any env var on pulse-poc\n"
         "  /redeploy            Railway deploymentRedeploy on latest deployment\n"
-        "  /snooze [kind] [dur] suppress alert class (cost). dur: 30m 1h 2h off\n"
+        "  /snooze [kind] [dur] suppress alerts: cost deploy health feed all\n"
         "\n"
         "  cost alerts now have [PAUSE] [BREAKDOWN] [DISMISS] buttons\n"
         "  /blacklist deferred — needs Pulse /admin/blacklist endpoint\n"
@@ -598,3 +598,158 @@ def format_env_var(key: str, value: Optional[str], railway_unreachable: bool = F
         return f"{key} = {scrubbed}  <scrubbed>"
 
     return f"{key} = {value}"
+
+
+# ---------------------------------------------------------------------------
+# Stage 2B — push alert formatters
+# ---------------------------------------------------------------------------
+
+def format_deploy_alert(commit7: str, status: str) -> str:
+    """Format a CRITICAL push alert for a failed/crashed deployment."""
+    return (
+        f"[ops-bot] CRITICAL — pulse-poc deploy {commit7} {status}\n"
+        f"  /logs for details  ·  /redeploy to retry"
+    )
+
+
+def format_health_alert(down_minutes: int) -> str:
+    """Format a CRITICAL push alert for consecutive /health failures."""
+    return (
+        f"[ops-bot] CRITICAL — Pulse /health failing for ~{down_minutes}m\n"
+        f"  /status to check  ·  /redeploy to recycle"
+    )
+
+
+def format_health_recovery(down_minutes: int) -> str:
+    """Format the recovery notice after /health comes back up."""
+    return f"[ops-bot] Pulse recovered — was down ~{down_minutes}m"
+
+
+def format_feed_alert_low_cards(count: int) -> str:
+    """Format a WARN push alert for low card count."""
+    return (
+        f"[ops-bot] WARN — feed has {count} cards (<5)\n"
+        f"  /feed for audit  ·  /rerun to refresh"
+    )
+
+
+def format_feed_alert_hook_collapse(hook_type: str, pct: int, total: int) -> str:
+    """Format a WARN push alert for hook-type diversity collapse."""
+    return (
+        f"[ops-bot] WARN — feed hook diversity collapse: "
+        f"{pct}% of {total} cards are {hook_type}\n"
+        f"  /feed for audit  ·  /rerun to refresh"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 2B — daily digest
+# ---------------------------------------------------------------------------
+
+def format_digest(
+    digest_kind: str,
+    health: Optional[Dict[str, Any]],
+    cost_today: Optional[Dict[str, Any]],
+    cost_yesterday: Optional[Dict[str, Any]],
+    deployment: Optional[Dict[str, Any]],
+    cost_detail: Optional[Dict[str, Any]],
+    engine_vars: Optional[Dict[str, str]],
+    active_snoozes: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Compose a morning or evening digest.
+
+    digest_kind: "morning" or "evening"
+    cost_yesterday is only rendered for the morning digest.
+    active_snoozes: from snooze.current() — rendered if non-empty.
+    """
+    import math as _math
+
+    lines: List[str] = [f"[ops-bot] {digest_kind} digest", ""]
+
+    # --- Pulse health ---
+    if health is not None:
+        ok = health.get("ok", False)
+        pulse_state = "ok" if ok else "DOWN"
+        lines.append(f"Pulse: {pulse_state}")
+    else:
+        lines.append("Pulse: (unreachable)")
+
+    # --- Today's cost ---
+    if cost_today is not None:
+        total_usd = float(cost_today.get("total_usd", 0.0))
+        total_calls = int(cost_today.get("total_calls", 0))
+        limit_usd = float(cost_today.get("limit_usd", 3.0))
+        pct = _math.floor(total_usd / limit_usd * 100) if limit_usd > 0 else 0
+        lines.append(
+            f"Cost today: ${total_usd:.2f} / ${limit_usd:.2f} ({pct}%) — {total_calls} calls"
+        )
+    else:
+        lines.append("Cost today: (unavailable)")
+
+    # --- Yesterday's cost (morning digest only) ---
+    if digest_kind == "morning" and cost_yesterday is not None:
+        ydays = cost_yesterday.get("days", [])
+        if len(ydays) >= 2:
+            # days[0] is today, days[1] is yesterday for a days=2 fetch
+            yesterday_row = ydays[1]
+        elif len(ydays) == 1:
+            yesterday_row = ydays[0]
+        else:
+            yesterday_row = None
+
+        if yesterday_row:
+            y_usd = float(yesterday_row.get("usd", 0.0))
+            y_calls = int(yesterday_row.get("calls", 0))
+            y_limit = float(yesterday_row.get("limit_usd", 3.0))
+            y_date = yesterday_row.get("date", "yesterday")
+            y_pct = _math.floor(y_usd / y_limit * 100) if y_limit > 0 else 0
+            lines.append(
+                f"Cost {y_date}: ${y_usd:.2f} / ${y_limit:.2f} ({y_pct}%) — {y_calls} calls"
+            )
+
+    # --- Latest deploy ---
+    if deployment is not None:
+        status = deployment.get("status", "UNKNOWN")
+        commit = (deployment.get("commitHash", "") or "")[:7] or "unknown"
+        created_at = deployment.get("createdAt", "")
+        age = _age_str(created_at) if created_at else "unknown"
+        lines.append(f"Deploy: {status} — {commit} — {age}")
+    else:
+        lines.append("Deploy: (unavailable)")
+
+    # --- Cards in feed ---
+    if cost_detail is not None:
+        cards_feed = cost_detail.get("cards_in_feed_now")
+        if cards_feed is not None:
+            lines.append(f"Cards in feed: {cards_feed}")
+    elif cost_today is not None:
+        # Fallback: no detail endpoint but we can show nothing
+        pass
+
+    # --- Engine kill switches ---
+    if engine_vars is not None:
+        def _flag(var: str, label: str) -> str:
+            val = engine_vars.get(var, "")
+            state = "on" if val.lower() in ("true", "1", "yes") else "off"
+            return f"{label}={state}"
+
+        rerun = _flag("PULSE_RERUN_ENABLED", "rerun")
+        news = _flag("PULSE_NEWS_INGEST_ENABLED", "news")
+        storylines = _flag("PULSE_TIERED_FRESHNESS_ENABLED", "storylines")
+        lines.append(f"Engine: {rerun}  {news}  {storylines}")
+    else:
+        lines.append("Engine: (unavailable)")
+
+    # --- Active snoozes ---
+    if active_snoozes:
+        snooze_parts: List[str] = []
+        for kind, info in sorted(active_snoozes.items()):
+            remaining = info["remaining_seconds"]
+            h = remaining // 3600
+            m = (remaining % 3600) // 60
+            dur_str = f"{h}h {m}m" if h else f"{m}m"
+            snooze_parts.append(f"{kind} ({dur_str})")
+        lines.append("Snoozed: " + ", ".join(snooze_parts))
+
+    return "\n".join(lines)

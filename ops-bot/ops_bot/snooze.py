@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-VALID_KINDS = {"cost", "health"}
+VALID_KINDS = {"cost", "deploy", "health", "feed"}
 
 # In-memory state: kind -> expires_at (monotonic)
 _snoozed: Dict[str, float] = {}

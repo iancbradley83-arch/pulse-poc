@@ -190,6 +190,29 @@ TOPICS: dict[str, str] = {
         "  /env PULSE_NEWS_INGEST_ENABLED\n"
         "  /env TELEGRAM_BOT_TOKEN       (scrubbed — shows first 8 chars + ***)"
     ),
+
+    "snooze": (
+        "/snooze [kind] [duration] — suppress alert classes temporarily\n"
+        "\n"
+        "When to use:\n"
+        "  - Planned maintenance: silence everything for 1h with /snooze all 1h\n"
+        "  - Deploy is expected to fail: /snooze deploy 30m before triggering it\n"
+        "  - Feed is intentionally thin during off-peak: /snooze feed 2h\n"
+        "\n"
+        "Kinds:  cost  deploy  health  feed  all\n"
+        "  'all' applies the snooze to every kind at once.\n"
+        "\n"
+        "Durations:  30m  1h  2h  off  (off = clear immediately)\n"
+        "\n"
+        "Bare /snooze shows all active snoozes and remaining time.\n"
+        "\n"
+        "Examples:\n"
+        "  /snooze                  show active snoozes\n"
+        "  /snooze cost 1h          silence cost alerts for 1 hour\n"
+        "  /snooze deploy 30m       silence deploy alerts for 30 minutes\n"
+        "  /snooze all 1h           silence ALL alerts for 1 hour\n"
+        "  /snooze feed off         clear feed snooze immediately"
+    ),
 }
 
 # Canonical command names in display order (matches /help listing).
@@ -197,6 +220,7 @@ _COMMAND_ORDER = [
     "status", "cost", "breakdown",
     "feed", "cards", "card", "embed",
     "logs", "runbook", "env",
+    "snooze",
 ]
 
 

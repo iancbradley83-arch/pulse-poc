@@ -150,8 +150,9 @@ def test_parse_duration_unknown():
 # ---------------------------------------------------------------------------
 
 def test_invalid_kind_raises():
+    # "deploy", "health", "feed" are now valid; use a truly invalid kind.
     with pytest.raises(ValueError, match="unknown snooze kind"):
-        s.snooze("deploy", 3600)
+        s.snooze("sentry", 3600)
 
 
 # ---------------------------------------------------------------------------

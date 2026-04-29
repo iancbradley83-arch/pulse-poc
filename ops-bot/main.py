@@ -22,8 +22,12 @@ from aiogram import Bot, Dispatcher
 import ops_bot.config as cfg
 from ops_bot.auth import AllowlistMiddleware
 from ops_bot.cost_alerter import CostAlerter
+from ops_bot.deploy_alerter import DeployAlerter
+from ops_bot.digests import DigestScheduler
+from ops_bot.feed_alerter import FeedAlerter
 from ops_bot.formatting import format_boot_ping
 from ops_bot.handlers import router, set_clients
+from ops_bot.health_alerter import HealthAlerter
 from ops_bot.pulse_client import PulseClient, PulseError
 from ops_bot.railway_client import RailwayClient
 
@@ -154,6 +158,26 @@ async def main() -> None:
         allowed_ids=allowed_ids,
     )
 
+    # broadcast_with_kb is used by the new alerters which send inline keyboards.
+    async def broadcast_with_kb(text: str, reply_markup=None) -> None:
+        from aiogram.types import InlineKeyboardMarkup
+        for chat_id in allowed_ids:
+            try:
+                await bot.send_message(chat_id, text, reply_markup=reply_markup)
+            except Exception as exc:
+                logger.error("broadcast_with_kb: could not send to %s: %s", chat_id, exc)
+
+    # --- Stage 2B alerters ---
+    deploy_alerter: DeployAlerter | None = None
+    if railway_client is not None:
+        deploy_alerter = DeployAlerter(railway_client, broadcast_with_kb)
+
+    health_alerter = HealthAlerter(pulse_client, broadcast_with_kb)
+    feed_alerter = FeedAlerter(pulse_client, broadcast_with_kb)
+
+    # --- Digest scheduler ---
+    digest_scheduler = DigestScheduler(bot, allowed_ids, pulse_client, railway_client)
+
     # --- Health server ---
     health_runner = await start_health_server(health_port)
 
@@ -161,13 +185,21 @@ async def main() -> None:
     spend = await alerter.initialise()
     logger.info("boot: current spend $%.2f", spend)
 
+    if deploy_alerter is not None:
+        await deploy_alerter.initialise()
+
     if allowed_ids:
         await send_boot_ping(bot, allowed_ids, pulse_client)
     else:
         logger.warning("OPS_BOT_ALLOWED_CHAT_IDS is empty — boot ping skipped")
 
-    # Start background cost polling.
+    # Start background polling tasks.
     alerter.start()
+    health_alerter.start()
+    feed_alerter.start()
+    if deploy_alerter is not None:
+        deploy_alerter.start()
+    digest_scheduler.start()
 
     logger.info("ops-bot ready — starting long-poll")
 
@@ -176,6 +208,11 @@ async def main() -> None:
     finally:
         logger.info("ops-bot shutting down")
         alerter.stop()
+        health_alerter.stop()
+        feed_alerter.stop()
+        if deploy_alerter is not None:
+            deploy_alerter.stop()
+        digest_scheduler.stop()
         await pulse_client.close()
         if railway_client:
             await railway_client.close()
