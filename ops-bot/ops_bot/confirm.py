@@ -29,21 +29,24 @@ def register(chat_id: int, action_id: str, args: Any = None) -> None:
     _pending[chat_id] = (action_id, expires_at, args)
 
 
-def resolve(chat_id: int, action_id: str) -> Optional[Any]:
+def resolve(chat_id: int, action_id: str) -> Tuple[bool, Any]:
     """
     Attempt to resolve a pending confirmation.
 
-    Returns args if chat_id has a live pending confirm for action_id.
-    Returns None if:
+    Returns (found, args) where found is True iff a live pending confirm for
+    action_id existed. args is the value passed to register() (may legitimately
+    be None — callers must not use args is None as the "not found" signal).
+
+    Returns (False, None) if:
       - no pending confirm for chat_id
-      - action_id does not match
+      - action_id does not match (puts the original back and rejects)
       - confirmation has expired
 
     Always removes the pending entry on resolution (successful or expired).
     """
     entry = _pending.pop(chat_id, None)
     if entry is None:
-        return None
+        return False, None
 
     stored_action_id, expires_at, args = entry
 
@@ -52,12 +55,12 @@ def resolve(chat_id: int, action_id: str) -> Optional[Any]:
         # (Edge case: user typed /pause, bot asked for confirm, user typed /resume
         # confirm instead — treat as mismatch.)
         _pending[chat_id] = (stored_action_id, expires_at, args)
-        return None
+        return False, None
 
     if time.monotonic() > expires_at:
-        return None  # Expired — already popped above.
+        return False, None  # Expired — already popped above.
 
-    return args
+    return True, args
 
 
 def peek(chat_id: int) -> Optional[Tuple[str, float, Any]]:
