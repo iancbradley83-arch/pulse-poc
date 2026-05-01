@@ -65,8 +65,12 @@ async def start_health_server(port: int, broadcast_fn) -> web.AppRunner:
     async def report_handler(request: web.Request) -> web.Response:
         return await _webhooks.handle_report(request, broadcast_fn)
 
+    async def uptime_handler(request: web.Request) -> web.Response:
+        return await _webhooks.handle_uptime(request, broadcast_fn)
+
     app.router.add_post("/sentry", sentry_handler)
     app.router.add_post("/report", report_handler)
+    app.router.add_post("/uptime", uptime_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()

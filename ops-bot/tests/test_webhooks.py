@@ -242,3 +242,145 @@ def test_get_operator_tokens_returns_empty_on_bad_json():
     with patch.dict(os.environ, {"OPERATOR_REPORT_TOKENS": "not-json"}):
         tokens = wh._get_operator_tokens()
     assert tokens == {}
+
+
+# ---------------------------------------------------------------------------
+# /uptime handler
+# ---------------------------------------------------------------------------
+
+import pytest
+from aiohttp.test_utils import make_mocked_request
+from yarl import URL
+
+
+def _mocked_post(query_string: str, body: bytes, content_type: str):
+    """Build an aiohttp mocked POST request with body + token query."""
+    headers = {"Content-Type": content_type, "Content-Length": str(len(body))}
+    req = make_mocked_request(
+        "POST", f"/uptime?{query_string}", headers=headers, payload=None
+    )
+    # Inject body bytes via the aiohttp request's payload reader
+    req._read_bytes = body  # noqa: SLF001 — test helper
+    async def _read():
+        return body
+    async def _post():
+        from urllib.parse import parse_qs
+        if "json" in content_type:
+            return {}
+        decoded = body.decode("utf-8", errors="replace")
+        parsed = parse_qs(decoded, keep_blank_values=True)
+        return {k: v[0] for k, v in parsed.items()}
+    async def _json():
+        import json as _json
+        return _json.loads(body.decode("utf-8"))
+    req.read = _read
+    req.post = _post
+    req.json = _json
+    return req
+
+
+def test_summarise_uptime_down_event_includes_critical():
+    from ops_bot.webhooks import _summarise_uptime
+    payload = {
+        "monitorFriendlyName": "Pulse — feed",
+        "monitorURL": "https://pulse-poc-production.up.railway.app/api/feed",
+        "alertType": "1",
+        "alertTypeFriendlyName": "Down",
+        "alertDetails": "Connection Timeout",
+        "alertDuration": "0",
+    }
+    out = _summarise_uptime(payload)
+    assert "DOWN" in out
+    assert "CRITICAL" in out
+    assert "Pulse — feed" in out
+    assert "Connection Timeout" in out
+
+
+def test_summarise_uptime_up_event_includes_duration():
+    from ops_bot.webhooks import _summarise_uptime
+    payload = {
+        "monitorFriendlyName": "Pulse — health",
+        "monitorURL": "https://pulse-poc-production.up.railway.app/health",
+        "alertType": "2",
+        "alertTypeFriendlyName": "Up",
+        "alertDetails": "200",
+        "alertDuration": "240",
+    }
+    out = _summarise_uptime(payload)
+    assert "UP" in out
+    assert "INFO" in out
+    assert "Pulse — health" in out
+    assert "after: 4m00s" in out
+
+
+def test_summarise_uptime_handles_missing_fields():
+    from ops_bot.webhooks import _summarise_uptime
+    out = _summarise_uptime({})
+    assert "(unknown monitor)" in out
+
+
+def test_summarise_uptime_unknown_alert_type_falls_back_to_alert():
+    from ops_bot.webhooks import _summarise_uptime
+    out = _summarise_uptime({
+        "monitorFriendlyName": "x",
+        "alertType": "99",
+    })
+    assert "ALERT" in out
+
+
+@pytest.mark.asyncio
+async def test_handle_uptime_503_when_token_unset(monkeypatch):
+    from ops_bot.webhooks import handle_uptime
+    monkeypatch.delenv("UPTIMEROBOT_WEBHOOK_TOKEN", raising=False)
+    req = _mocked_post("token=anything", b"", "application/x-www-form-urlencoded")
+    sent = []
+    async def broadcast(text):
+        sent.append(text)
+    resp = await handle_uptime(req, broadcast)
+    assert resp.status == 503
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_handle_uptime_401_on_wrong_token(monkeypatch):
+    from ops_bot.webhooks import handle_uptime
+    monkeypatch.setenv("UPTIMEROBOT_WEBHOOK_TOKEN", "expected")
+    req = _mocked_post("token=wrong", b"", "application/x-www-form-urlencoded")
+    sent = []
+    async def broadcast(text):
+        sent.append(text)
+    resp = await handle_uptime(req, broadcast)
+    assert resp.status == 401
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_handle_uptime_broadcasts_form_payload(monkeypatch):
+    from ops_bot.webhooks import handle_uptime
+    monkeypatch.setenv("UPTIMEROBOT_WEBHOOK_TOKEN", "tok")
+    body = b"monitorFriendlyName=Pulse+%E2%80%94+feed&alertType=1&alertTypeFriendlyName=Down&alertDetails=Timeout"
+    req = _mocked_post("token=tok", body, "application/x-www-form-urlencoded")
+    sent = []
+    async def broadcast(text):
+        sent.append(text)
+    resp = await handle_uptime(req, broadcast)
+    assert resp.status == 200
+    assert len(sent) == 1
+    assert "Pulse — feed" in sent[0]
+    assert "DOWN" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_uptime_broadcasts_json_payload(monkeypatch):
+    from ops_bot.webhooks import handle_uptime
+    monkeypatch.setenv("UPTIMEROBOT_WEBHOOK_TOKEN", "tok")
+    body = b'{"monitorFriendlyName":"ops-bot","alertType":"2","alertTypeFriendlyName":"Up","alertDuration":"30"}'
+    req = _mocked_post("token=tok", body, "application/json")
+    sent = []
+    async def broadcast(text):
+        sent.append(text)
+    resp = await handle_uptime(req, broadcast)
+    assert resp.status == 200
+    assert len(sent) == 1
+    assert "UP" in sent[0]
+    assert "ops-bot" in sent[0]
