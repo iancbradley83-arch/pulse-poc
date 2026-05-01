@@ -177,7 +177,9 @@ def create_routes(
     simulator: GameSimulator,
 ) -> APIRouter:
 
-    @router.get("/feed")
+    # HEAD support: free-tier uptime monitors (UptimeRobot etc.) default to
+    # HEAD; without this they get 405 and false-alert.
+    @router.api_route("/feed", methods=["GET", "HEAD"])
     async def get_feed(
         type: str = Query("prematch", regex="^(prematch|live)$"),
         sport: Optional[str] = None,
