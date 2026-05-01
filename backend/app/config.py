@@ -41,6 +41,47 @@ PULSE_NEWS_MAX_SEARCHES = int(os.getenv("PULSE_NEWS_MAX_SEARCHES", "5"))
 PULSE_NEWS_MAX_FIXTURES = int(os.getenv("PULSE_NEWS_MAX_FIXTURES", "12"))
 PULSE_NEWS_CACHE_TTL_HOURS = int(os.getenv("PULSE_NEWS_CACHE_TTL_HOURS", "6"))
 
+# ── Phase 2b: gradient routing on fixture importance score ──
+# When enabled, importance_score (rank-percentile + featured signal,
+# stamped at catalogue load) is interpolated linearly between FLOOR and
+# CEILING for each per-fixture knob below. score=1 → ceiling, score=0
+# → floor, no thresholds or buckets. Disabling falls back to the
+# pre-Phase-2b global behaviour (every fixture gets the ceiling).
+#
+# Cost-cap envs are optional ($-0.0 disables that arm of the guard);
+# when set, a fixture's projected scout cost above its per-fixture cap
+# is skipped before the global daily tripwire is consulted.
+PULSE_GRADIENT_ROUTING_ENABLED = (
+    os.getenv("PULSE_GRADIENT_ROUTING_ENABLED", "true").lower() == "true"
+)
+PULSE_GRADIENT_MAX_SEARCHES_FLOOR = int(
+    os.getenv("PULSE_GRADIENT_MAX_SEARCHES_FLOOR", "2")
+)
+PULSE_GRADIENT_MAX_SEARCHES_CEIL = int(
+    os.getenv("PULSE_GRADIENT_MAX_SEARCHES_CEIL", str(PULSE_NEWS_MAX_SEARCHES))
+)
+PULSE_GRADIENT_PER_FIXTURE_CAP_FLOOR = int(
+    os.getenv("PULSE_GRADIENT_PER_FIXTURE_CAP_FLOOR", "2")
+)
+PULSE_GRADIENT_PER_FIXTURE_CAP_CEIL = int(
+    os.getenv("PULSE_GRADIENT_PER_FIXTURE_CAP_CEIL", "5")
+)
+def _parse_optional_float(name: str, default: str) -> "float | None":
+    raw = os.getenv(name, default).strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        return None
+    return v if v > 0.0 else None
+PULSE_GRADIENT_COST_CAP_USD_FLOOR = _parse_optional_float(
+    "PULSE_GRADIENT_COST_CAP_USD_FLOOR", "0.05",
+)
+PULSE_GRADIENT_COST_CAP_USD_CEIL = _parse_optional_float(
+    "PULSE_GRADIENT_COST_CAP_USD_CEIL", "0.40",
+)
+
 # Cost controls.
 #   PULSE_NEWS_INGEST_ENABLED=false  → skip ALL scout calls (kill switch).
 #                                       Featured BBs still load (no LLM).

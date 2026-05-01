@@ -685,16 +685,16 @@ def _log_importance_signal_summary(games: list[Game]) -> None:
 
 
 def _stamp_importance_scores(games: list[Game]) -> None:
-    """Phase 2a: compute and stamp `importance_score` on every Game.
+    """Stamp `importance_score` on every Game using rank-based normalization.
 
-    Pure function over already-captured Game fields; recomputed on every
-    catalogue load. Phase 2b reads `game.importance_score` directly in
-    the tier router — no recomputation in the hot path.
+    Recomputed on every catalogue load. The score is rank-percentile of
+    `league_order` within the loaded catalogue (featured fixtures float
+    to 1.0). Phase 2b's gradient router in CandidateEngine reads
+    `game.importance_score` directly — no recomputation in the hot path.
     """
-    from app.engine.importance_scorer import compute_importance_score
+    from app.engine.importance_scorer import assign_rank_importance_scores
 
-    for g in games:
-        g.importance_score = compute_importance_score(g)
+    assign_rank_importance_scores(games)
 
 
 def _log_importance_score_distribution(games: list[Game]) -> None:
