@@ -625,6 +625,12 @@ async def fetch_soccer_snapshot(
     # Boot-time visibility: prove Phase 1 captured the importance signals.
     _log_importance_signal_summary(games)
 
+    # ── Phase 2a: stamp importance_score + log distribution ──
+    # Pure compute over already-captured Game fields. No engine routing
+    # consumes this yet — observability + future-proof for Phase 2b.
+    _stamp_importance_scores(games)
+    _log_importance_score_distribution(games)
+
     return games, markets, raw_detailed
 
 
@@ -675,4 +681,76 @@ def _log_importance_signal_summary(games: list[Game]) -> None:
         "[catalogue] importance signals: featured=%d, top_league=%d, early_payout=%d "
         "(league_order range: %s, n=%d)",
         featured_n, top_league_n, early_payout_n, lo_range, len(league_orders),
+    )
+
+
+def _stamp_importance_scores(games: list[Game]) -> None:
+    """Phase 2a: compute and stamp `importance_score` on every Game.
+
+    Pure function over already-captured Game fields; recomputed on every
+    catalogue load. Phase 2b reads `game.importance_score` directly in
+    the tier router — no recomputation in the hot path.
+    """
+    from app.engine.importance_scorer import compute_importance_score
+
+    for g in games:
+        g.importance_score = compute_importance_score(g)
+
+
+def _log_importance_score_distribution(games: list[Game]) -> None:
+    """Phase 2a: log score distribution + top-5 fixtures by score.
+
+    Calibration window — one production cycle later we read the actual
+    distribution before flipping on Phase 2b's tier router. Per
+    `feedback_calibrate_before_scoring.md`: capture-and-observe before
+    behaviour-routing.
+    """
+    from app.engine.importance_scorer import (
+        DEFAULT_DEEP_THRESHOLD,
+        DEFAULT_MINIMAL_THRESHOLD,
+        classify_score,
+    )
+
+    if not games:
+        return
+
+    scored = [(g, g.importance_score if g.importance_score is not None else 0.0)
+              for g in games]
+
+    deep_n = standard_n = minimal_n = 0
+    for _, s in scored:
+        bucket = classify_score(s)
+        if bucket == "deep":
+            deep_n += 1
+        elif bucket == "standard":
+            standard_n += 1
+        else:
+            minimal_n += 1
+
+    logger.info(
+        "[importance] score distribution: deep=%d (>=%.1f), standard=%d (%.1f-%.1f), minimal=%d (<%.1f)",
+        deep_n, DEFAULT_DEEP_THRESHOLD,
+        standard_n, DEFAULT_MINIMAL_THRESHOLD, DEFAULT_DEEP_THRESHOLD,
+        minimal_n, DEFAULT_MINIMAL_THRESHOLD,
+    )
+
+    # Top-5 by descending score; tiebreak by ascending league_order
+    # (lower = higher operator priority, design-doc convention).
+    def _sort_key(item: tuple[Game, float]) -> tuple[float, int]:
+        g, s = item
+        # Negate score so descending; positive league_order so ascending.
+        # `league_order is None` sorts last on the tiebreak.
+        lo = g.league_order if g.league_order is not None else 10**12
+        return (-s, lo)
+
+    top5 = sorted(scored, key=_sort_key)[:5]
+    parts = []
+    for g, s in top5:
+        league = g.broadcast or "?"
+        home = g.home_team.name if g.home_team else "?"
+        away = g.away_team.name if g.away_team else "?"
+        parts.append(f"{s:.2f}={league}: {home} vs {away}")
+    logger.info(
+        "[importance] top 5 fixtures by score: %s",
+        "; ".join(parts) if parts else "(none)",
     )

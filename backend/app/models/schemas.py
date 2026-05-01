@@ -92,6 +92,14 @@ class Game(BaseModel):
     league_group_id: Optional[str] = None      # Rogue: groups related leagues (e.g. UCL + UEL + UECL)
     is_operator_featured: bool = False         # Computed: fixture appears in this cycle's getFeaturedEvents response
 
+    # ── Fixture importance score (Phase 2a) ──
+    # Computed once per catalogue load by `app.engine.importance_scorer`
+    # and stamped here so downstream consumers (Phase 2b tier router,
+    # observability tooling) can read it without recomputation. Optional
+    # default keeps old serialized snapshots in candidate_store deserializing
+    # cleanly. Not persisted to SQLite — recomputed fresh on every load.
+    importance_score: Optional[float] = None
+
 
 # ── Market ──
 
