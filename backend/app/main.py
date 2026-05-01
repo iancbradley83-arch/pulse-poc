@@ -705,7 +705,7 @@ STATIC_VERSION = f"{int(time.time())}-{uuid.uuid4().hex[:6]}"
 _INDEX_HTML = (STATIC_DIR / "index.html").read_text().replace("{{ VERSION }}", STATIC_VERSION)
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def serve_index():
     return HTMLResponse(
         _INDEX_HTML,
@@ -715,8 +715,9 @@ async def serve_index():
 
 # Liveness probe. Intentionally trivial — no I/O, no DB, no external calls —
 # so it stays in single-digit ms even when the SSE pricing loop is busy.
-# Use this for Railway healthchecks and uptime monitors.
-@app.get("/health")
+# Use this for Railway healthchecks and uptime monitors. HEAD is included so
+# free-tier monitors (UptimeRobot etc.) that send HEAD by default get 200.
+@app.api_route("/health", methods=["GET", "HEAD"])
 @limiter.exempt
 async def health(request: Request):
     return {"ok": True}
