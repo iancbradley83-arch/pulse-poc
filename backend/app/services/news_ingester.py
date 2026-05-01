@@ -253,8 +253,20 @@ class NewsIngester:
         away: str,
         league: str,
         kickoff_iso: str,
+        max_searches: Optional[int] = None,
+        max_cost_usd: Optional[float] = None,
     ) -> list[NewsItem]:
-        """Return NewsItem list for a fixture. Hits cache first, then the LLM."""
+        """Return NewsItem list for a fixture. Hits cache first, then the LLM.
+
+        `max_searches` overrides the ingester's default for this call only —
+        Phase 2b's gradient router passes a per-fixture value derived from
+        importance score. Falls back to `self._max_searches` when None.
+
+        `max_cost_usd` is a per-call budget guard; if the projected Haiku
+        cost (using the chosen `max_searches`) exceeds it, the call is
+        skipped and `[]` returned. The global cost-tracker tripwire still
+        applies on top of this.
+        """
         cache_key = kickoff_iso[:10] if kickoff_iso else "unknown"
         cached = await self._store.get_cached_ingest(
             fixture_id, cache_key, self._cache_ttl_seconds
@@ -277,7 +289,15 @@ class NewsIngester:
                 )
             return [NewsItem(**row) for row in cached]
 
-        raw_items = await self._call_llm(home=home, away=away, league=league, kickoff_iso=kickoff_iso)
+        effective_searches = (
+            max_searches if max_searches is not None else self._max_searches
+        )
+        raw_items = await self._call_llm(
+            home=home, away=away, league=league, kickoff_iso=kickoff_iso,
+            max_searches=effective_searches,
+            max_cost_usd=max_cost_usd,
+            fixture_id=fixture_id,
+        )
 
         # Relevance filter — drop items that aren't about this fixture's two
         # teams. Prompt-level rule already covers this, but belt-and-braces
@@ -337,8 +357,17 @@ class NewsIngester:
         return news_items
 
     async def _call_llm(
-        self, *, home: str, away: str, league: str, kickoff_iso: str
+        self,
+        *,
+        home: str,
+        away: str,
+        league: str,
+        kickoff_iso: str,
+        max_searches: Optional[int] = None,
+        max_cost_usd: Optional[float] = None,
+        fixture_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
+        eff_searches = max_searches if max_searches is not None else self._max_searches
         user_msg = (
             f"Fixture: {home} vs {away}\n"
             f"League: {league}\n"
@@ -354,15 +383,24 @@ class NewsIngester:
             _bump_cycle_counter("scout_haiku_websearch")
         except Exception:
             pass
-        # Cost-tripwire short-circuit. Scout uses web_search; without
-        # it we cannot do useful research, so when the budget is gone
-        # we silently skip and return [] (no new candidates this cycle).
+        # Cost-tripwire short-circuit. Two checks: per-fixture budget
+        # (Phase 2b gradient routing) AND global daily cap. Per-fixture
+        # check fires first because a low-importance fixture should be
+        # skipped before the global cap is even consulted.
         if self._cost_tracker is not None:
             try:
                 projected = self._cost_tracker.estimate_haiku_call(
                     input_tokens=1500, max_output_tokens=4096,
-                    web_search=True, web_search_calls=self._max_searches,
+                    web_search=True, web_search_calls=eff_searches,
                 )
+                if max_cost_usd is not None and projected > max_cost_usd:
+                    logger.info(
+                        "[cost] news scout skipped — projected $%.4f > "
+                        "per-fixture cap $%.4f (fixture=%s, searches=%d)",
+                        projected, max_cost_usd,
+                        fixture_id or home, eff_searches,
+                    )
+                    return []
                 if not await self._cost_tracker.can_spend(projected):
                     logger.info(
                         "[cost] news scout skipped — daily LLM budget "
@@ -386,7 +424,7 @@ class NewsIngester:
                     {
                         "type": "web_search_20250305",
                         "name": "web_search",
-                        "max_uses": self._max_searches,
+                        "max_uses": eff_searches,
                     },
                     self._submit_tool,
                 ],
@@ -400,7 +438,7 @@ class NewsIngester:
             try:
                 actual = self._cost_tracker.cost_from_usage(
                     getattr(response, "usage", None),
-                    web_search=True, web_search_calls=self._max_searches,
+                    web_search=True, web_search_calls=eff_searches,
                 )
                 await self._cost_tracker.record_call(
                     model=self._model, kind="news_scout",

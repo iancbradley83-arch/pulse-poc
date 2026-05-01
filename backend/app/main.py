@@ -2408,10 +2408,48 @@ async def _run_candidate_engine(
     # API (calculate_bets). Mock mode (no Rogue client) skips BBs entirely.
     combo_builder = ComboBuilder(catalog, rogue_client) if rogue_client is not None else None
 
+    # Phase 2b: gradient routing config — read once per engine run so a
+    # Railway env flip takes effect on the next cycle without redeploy.
+    from app.config import (
+        PULSE_GRADIENT_ROUTING_ENABLED,
+        PULSE_GRADIENT_MAX_SEARCHES_FLOOR,
+        PULSE_GRADIENT_MAX_SEARCHES_CEIL,
+        PULSE_GRADIENT_PER_FIXTURE_CAP_FLOOR,
+        PULSE_GRADIENT_PER_FIXTURE_CAP_CEIL,
+        PULSE_GRADIENT_COST_CAP_USD_FLOOR,
+        PULSE_GRADIENT_COST_CAP_USD_CEIL,
+    )
+    from app.services.candidate_engine import GradientRoutingConfig
+    gradient_routing = GradientRoutingConfig(
+        enabled=PULSE_GRADIENT_ROUTING_ENABLED,
+        max_searches_floor=PULSE_GRADIENT_MAX_SEARCHES_FLOOR,
+        max_searches_ceil=PULSE_GRADIENT_MAX_SEARCHES_CEIL,
+        per_fixture_cap_floor=PULSE_GRADIENT_PER_FIXTURE_CAP_FLOOR,
+        per_fixture_cap_ceil=PULSE_GRADIENT_PER_FIXTURE_CAP_CEIL,
+        cost_cap_usd_floor=PULSE_GRADIENT_COST_CAP_USD_FLOOR,
+        cost_cap_usd_ceil=PULSE_GRADIENT_COST_CAP_USD_CEIL,
+    )
+    if PULSE_GRADIENT_ROUTING_ENABLED:
+        _cost_floor_str = (
+            f"${PULSE_GRADIENT_COST_CAP_USD_FLOOR:.3f}"
+            if PULSE_GRADIENT_COST_CAP_USD_FLOOR is not None else "—"
+        )
+        _cost_ceil_str = (
+            f"${PULSE_GRADIENT_COST_CAP_USD_CEIL:.3f}"
+            if PULSE_GRADIENT_COST_CAP_USD_CEIL is not None else "—"
+        )
+        logger.info(
+            "[gradient] enabled — searches=[%d..%d] cap=[%d..%d] cost=[%s..%s]",
+            PULSE_GRADIENT_MAX_SEARCHES_FLOOR, PULSE_GRADIENT_MAX_SEARCHES_CEIL,
+            PULSE_GRADIENT_PER_FIXTURE_CAP_FLOOR, PULSE_GRADIENT_PER_FIXTURE_CAP_CEIL,
+            _cost_floor_str, _cost_ceil_str,
+        )
+
     candidate_engine = CandidateEngine(
         ingester=ingester, resolver=resolver, builder=builder,
         scorer=scorer, policy=policy, store=candidate_store,
         combo_builder=combo_builder,
+        gradient_routing=gradient_routing,
     )
 
     _cap = max_fixtures if (max_fixtures is not None) else PULSE_NEWS_MAX_FIXTURES

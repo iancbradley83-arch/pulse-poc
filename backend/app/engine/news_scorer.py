@@ -191,7 +191,13 @@ class PolicyLayer:
         """Return 'bb' / 'single' / 'both' for this hook. Default 'both'."""
         return self._hook_pref.get(hook, "both")
 
-    def apply(self, candidates: list[CandidateCard], *, headlines_by_id: Optional[dict[str, str]] = None) -> list[CandidateCard]:
+    def apply(
+        self,
+        candidates: list[CandidateCard],
+        *,
+        headlines_by_id: Optional[dict[str, str]] = None,
+        per_fixture_cap_by_id: Optional[dict[str, int]] = None,
+    ) -> list[CandidateCard]:
         # 0. Per-news-item collapse driven by per-hook preference. BB, single,
         #    or both can survive depending on hook_type. Within a shape (two
         #    BBs or two singles for the same news id) higher score wins.
@@ -289,8 +295,11 @@ class PolicyLayer:
         out: list[CandidateCard] = []
         for fixture_id, group in by_fixture.items():
             group.sort(key=lambda c: c.score, reverse=True)
-            kept = group[: self._per_fixture_cap]
-            dropped = group[self._per_fixture_cap :]
+            cap = self._per_fixture_cap
+            if per_fixture_cap_by_id is not None and fixture_id in per_fixture_cap_by_id:
+                cap = max(0, int(per_fixture_cap_by_id[fixture_id]))
+            kept = group[:cap]
+            dropped = group[cap:]
             out.extend(kept)
             for c in dropped:
                 c.status = CandidateStatus.REJECTED

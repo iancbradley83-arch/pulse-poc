@@ -47,6 +47,8 @@ class MockNewsIngester:
         away: str,
         league: str,
         kickoff_iso: str,
+        max_searches: int | None = None,    # accepted, ignored (no LLM)
+        max_cost_usd: float | None = None,  # accepted, ignored (no LLM)
     ) -> list[NewsItem]:
         """Return 0–4 deterministic-ish news items for the teams in this fixture.
 

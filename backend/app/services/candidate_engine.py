@@ -236,7 +236,12 @@ class NewsIngesterLike(Protocol):
         away: str,
         league: str,
         kickoff_iso: str,
+        max_searches: Optional[int] = None,
+        max_cost_usd: Optional[float] = None,
     ) -> list[NewsItem]: ...
+
+
+from app.engine.importance_scorer import GradientRoutingConfig  # re-exported
 
 
 class CandidateEngine:
@@ -250,6 +255,7 @@ class CandidateEngine:
         policy: PolicyLayer,
         store: CandidateStore,
         combo_builder: Optional[ComboBuilder] = None,
+        gradient_routing: Optional[GradientRoutingConfig] = None,
     ):
         self._ingester = ingester
         self._resolver = resolver
@@ -258,6 +264,7 @@ class CandidateEngine:
         self._policy = policy
         self._store = store
         self._combo_builder = combo_builder
+        self._gradient = gradient_routing
 
     async def run_once(
         self,
@@ -277,14 +284,39 @@ class CandidateEngine:
 
         all_scored: list[CandidateCard] = []
         all_items: list[NewsItem] = []
+        per_fixture_cap_by_id: dict[str, int] = {}
+        gradient_log_lines: list[str] = []
 
         for game in fixtures:
+            knobs: dict[str, Any] = {
+                "max_searches": None,
+                "per_fixture_cap": None,
+                "max_cost_usd": None,
+            }
+            if self._gradient is not None:
+                knobs = self._gradient.for_score(game.importance_score)
+                per_fixture_cap_by_id[game.id] = knobs["per_fixture_cap"]
+                if self._gradient.enabled:
+                    cost_str = (
+                        f"${knobs['max_cost_usd']:.3f}"
+                        if knobs["max_cost_usd"] is not None
+                        else "—"
+                    )
+                    gradient_log_lines.append(
+                        f"{game.id} score={game.importance_score:.2f} -> "
+                        f"searches={knobs['max_searches']} cap={knobs['per_fixture_cap']} "
+                        f"cost_cap={cost_str}"
+                        if game.importance_score is not None
+                        else f"{game.id} score=None -> ceiling"
+                    )
             items = await self._ingester.ingest_for_fixture(
                 fixture_id=game.id,
                 home=game.home_team.name,
                 away=game.away_team.name,
                 league=game.broadcast or "",
                 kickoff_iso=game.start_time or "",
+                max_searches=knobs["max_searches"],
+                max_cost_usd=knobs["max_cost_usd"],
             )
             counts["news"] += len(items)
             all_items.extend(items)
@@ -325,11 +357,24 @@ class CandidateEngine:
                 )
                 all_scored.append(c)
 
+        # Phase 2b: emit per-fixture gradient knobs in one log line so it's
+        # cheap to read at boot. Skipped when gradient routing is disabled
+        # (every fixture got the ceiling and the line carries no signal).
+        if gradient_log_lines:
+            logger.info(
+                "[gradient] per-fixture routing: %s",
+                " | ".join(gradient_log_lines),
+            )
+
         # Global policy pass — sees every candidate from every fixture. Lets
         # the headline-dedupe collapse a story that the scout returned for
         # multiple fixtures (e.g. a weekend injury round-up).
         headlines_by_id = {it.id: it.headline for it in all_items if it.id and it.headline}
-        final = self._policy.apply(all_scored, headlines_by_id=headlines_by_id)
+        final = self._policy.apply(
+            all_scored,
+            headlines_by_id=headlines_by_id,
+            per_fixture_cap_by_id=(per_fixture_cap_by_id or None),
+        )
         counts["candidates"] = len(final)
         counts["published"] = sum(1 for c in final if c.threshold_passed)
 
