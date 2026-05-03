@@ -18,6 +18,7 @@ Only a curated set is surfaced as `Market` objects.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
@@ -631,6 +632,18 @@ async def fetch_soccer_snapshot(
     _stamp_importance_scores(games)
     _log_importance_score_distribution(games)
 
+    # ── Phase 3a: market-depth observability ──
+    # Pure introspection over the raw_detailed dicts we already collected
+    # (each is a `get_event(includeMarkets="all")` response). Picks top-N
+    # fixtures by gradient importance score and logs per-group
+    # `MarketGroupOrder` distribution. Zero new Rogue calls. No behaviour
+    # change. Phase 3b will use the resulting calibration data to size
+    # per-group caps for singles / BB / combos.
+    if os.getenv("PULSE_MARKET_DEPTH_OBSERVE_ENABLED", "true").lower() in (
+        "1", "true", "yes",
+    ):
+        _observe_market_depth(games, raw_detailed)
+
     return games, markets, raw_detailed
 
 
@@ -754,3 +767,24 @@ def _log_importance_score_distribution(games: list[Game]) -> None:
         "[importance] top 5 fixtures by score: %s",
         "; ".join(parts) if parts else "(none)",
     )
+
+
+def _observe_market_depth(
+    games: list[Game],
+    raw_detailed: list[dict[str, Any]],
+) -> None:
+    """Phase 3a: log market-depth report for top-N gradient fixtures.
+
+    Pulled into a helper so the import is local (matches the pattern of
+    the importance helpers above) and the call site in
+    `fetch_soccer_snapshot` stays one line behind a kill switch. Uses
+    the data we already have in memory — no extra Rogue calls.
+    """
+    from app.services.market_depth_observer import observe_top_fixtures
+
+    raw_by_id: dict[str, dict[str, Any]] = {}
+    for r in raw_detailed:
+        rid = r.get("_id") or r.get("Id")
+        if rid:
+            raw_by_id[str(rid)] = r
+    observe_top_fixtures(games, raw_by_id, top_n=3)

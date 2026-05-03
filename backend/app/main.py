@@ -1250,6 +1250,44 @@ def _today_utc_midnight_ts() -> float:
     return float(_cal.timegm(midnight))
 
 
+@app.get("/admin/market-depth/{event_id}", dependencies=[Depends(require_admin)])
+async def admin_market_depth(event_id: str):
+    """Phase 3a market-depth report for a single fixture.
+
+    Calls Rogue with `includeMarkets=all` and runs the same observer the
+    catalogue loader uses for top-N gradient fixtures. Useful for poking
+    at fixtures outside the gradient top-N or after a cycle has logged.
+
+    Returns the JSON report (event_id, label, importance fields, total
+    market count, BB eligibility, per-MarketGroup market count and
+    `MarketGroupOrder` distribution). No persisted state, no LLM cost.
+    Mirrors the data of the `[market_depth_observe]` log block.
+    """
+    if PULSE_DATA_SOURCE != "rogue":
+        raise HTTPException(
+            400, "market-depth only valid when PULSE_DATA_SOURCE=rogue"
+        )
+    if _sse_rogue_client is None:
+        raise HTTPException(
+            503, "Rogue client not initialised (catalogue not yet loaded)"
+        )
+    try:
+        event = await _sse_rogue_client.get_event(
+            event_id, include_markets="all", locale="en"
+        )
+    except Exception as exc:
+        logger.exception(
+            "[admin/market-depth] fetch failed for %s: %s", event_id, exc
+        )
+        raise HTTPException(502, f"Rogue fetch failed: {exc}")
+    if event is None:
+        raise HTTPException(
+            404, f"event {event_id} not found or settled"
+        )
+    from app.services.market_depth_observer import observe_fixture
+    return observe_fixture(event, game=None)
+
+
 @app.get("/admin/cost.json", dependencies=[Depends(require_admin)])
 async def admin_cost_json(days: int = 7, detail: _Optional[str] = None):
     """Machine-readable cost endpoint consumed by ops-bot.
