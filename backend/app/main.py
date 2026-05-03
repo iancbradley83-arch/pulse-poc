@@ -2077,8 +2077,8 @@ def _get_narrative_telemetry():
         return _narrative_telemetry_singleton
     try:
         from app.services.narrative_telemetry import NarrativeTelemetry
-        from app.config import PULSE_CANDIDATE_DB_PATH
-        _narrative_telemetry_singleton = NarrativeTelemetry(PULSE_CANDIDATE_DB_PATH)
+        from app.config import PULSE_DB_PATH
+        _narrative_telemetry_singleton = NarrativeTelemetry(PULSE_DB_PATH)
         # init() is async; we'll lazily init on first save call.
     except Exception:
         logger.exception("[narrative_composer] telemetry init failed (non-fatal)")
