@@ -82,6 +82,35 @@ def test_coerce_group_entry_dict_with_own_order_overrides():
     assert order == 3.0
 
 
+def test_coerce_group_entry_live_shape_uses_market_order():
+    """Regression: the LIVE Rogue shape uses `MarketOrder` (not `Order`),
+    verified 2026-05-03 against MUN vs LIV. Without this fix, the
+    per-group rank silently fell back to the market-level GLOBAL
+    `MarketGroupOrder` (e.g. 161 instead of the per-group 0-28), making
+    the order ranges in the observer log meaningless. `MarketOrder` must
+    be checked first.
+    """
+    name, order = _coerce_group_entry(
+        {
+            "_id": "g-goals", "Name": "Goals",
+            "MarketOrder": 14, "SortingKey": "x",
+        },
+        fallback_order=99999.0,
+    )
+    assert name == "Goals"
+    assert order == 14.0
+
+
+def test_coerce_group_entry_per_group_rank_beats_market_level_fallback():
+    """Per-group MarketOrder must beat the market-level fallback even
+    when the fallback is also numeric — the market-level number is a
+    global rank that's wrong for per-group sampling."""
+    name, order = _coerce_group_entry(
+        {"Name": "Corners", "MarketOrder": 2}, fallback_order=161.0,
+    )
+    assert order == 2.0
+
+
 def test_coerce_group_entry_dict_no_order_falls_back_to_market_order():
     name, order = _coerce_group_entry({"Name": "Corners"}, 7.0)
     assert name == "Corners"

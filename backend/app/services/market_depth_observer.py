@@ -36,9 +36,12 @@ def _coerce_group_entry(entry: Any, fallback_order: Any) -> tuple[Optional[str],
 
     Defensive: Rogue returns ``InMarketGroups`` as either a list of strings
     or a list of ``InMarketGroupsModel`` objects (per the OpenAPI spec).
-    Object form may carry its own ``Order`` field that overrides the
-    market-level ``MarketGroupOrder``. Falls back to the market-level
-    order, then to ``None``.
+    Object form carries its own per-group rank — the live shape uses
+    ``MarketOrder`` (verified 2026-05-03 against MUN vs LIV); ``Order``
+    and ``MarketGroupOrder`` are accepted as defensive aliases. Per-group
+    rank wins over the market-level ``MarketGroupOrder`` (the latter is
+    a GLOBAL rank across all groups, not the per-group rank we want when
+    sampling within `Goals`, `Corners`, etc.).
     """
     if isinstance(entry, dict):
         gname = (
@@ -47,12 +50,14 @@ def _coerce_group_entry(entry: Any, fallback_order: Any) -> tuple[Optional[str],
             or entry.get("name")
             or entry.get("groupName")
         )
-        gorder = (
-            entry.get("Order")
-            if isinstance(entry.get("Order"), (int, float))
-            else entry.get("MarketGroupOrder") if isinstance(entry.get("MarketGroupOrder"), (int, float))
-            else fallback_order
-        )
+        gorder: Any = None
+        for key in ("MarketOrder", "Order", "MarketGroupOrder"):
+            v = entry.get(key)
+            if isinstance(v, (int, float)):
+                gorder = v
+                break
+        if gorder is None:
+            gorder = fallback_order
     else:
         gname = str(entry) if entry else None
         gorder = fallback_order
