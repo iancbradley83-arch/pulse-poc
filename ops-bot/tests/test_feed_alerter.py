@@ -232,3 +232,80 @@ async def test_over_80_pct_hook_fires():
     await alerter._check_and_alert()
     collapse = [c for c in collector.calls if "collapse" in c[0].lower() or "diversity" in c[0].lower()]
     assert len(collapse) == 1
+
+
+# ── Smart-button alert: catalogue-age-aware empty-feed alert ───────────
+
+
+def _client_with_age(cards: list, *, age_seconds=None, raise_on_detail=False) -> MagicMock:
+    """MagicMock pulse_client that also responds to cost_detail() with the given catalogue age."""
+    client = _make_feed_client(cards)
+    if raise_on_detail:
+        client.cost_detail = AsyncMock(side_effect=PulseError("unreachable"))
+    elif age_seconds is None:
+        client.cost_detail = AsyncMock(return_value={"catalogue_age_seconds": None})
+    else:
+        client.cost_detail = AsyncMock(return_value={"catalogue_age_seconds": age_seconds})
+    return client
+
+
+@pytest.mark.asyncio
+async def test_low_cards_with_stale_catalogue_uses_redeploy_button():
+    """Empty feed + catalogue >1h old → REDEPLOY in keyboard, /redeploy in text."""
+    client = _client_with_age([{"id": "c0", "hook_type": "MATCH_RESULT"}], age_seconds=7200)  # 2h
+    collector = AlertCollector()
+    alerter = FeedAlerter(client, collector, poll_interval=0)
+    await alerter._check_and_alert()
+    low = [c for c in collector.calls if "cards (<5)" in c[0]]
+    assert len(low) == 1
+    text, keyboard = low[0]
+    assert "stale" in text.lower()
+    assert "/redeploy" in text
+    button_texts = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert "REDEPLOY" in button_texts
+    assert "RERUN" not in button_texts
+
+
+@pytest.mark.asyncio
+async def test_low_cards_with_fresh_catalogue_uses_rerun_button():
+    """Empty feed + catalogue <1h old → RERUN in keyboard, /rerun in text."""
+    client = _client_with_age([{"id": "c0", "hook_type": "MATCH_RESULT"}], age_seconds=300)  # 5m
+    collector = AlertCollector()
+    alerter = FeedAlerter(client, collector, poll_interval=0)
+    await alerter._check_and_alert()
+    low = [c for c in collector.calls if "cards (<5)" in c[0]]
+    assert len(low) == 1
+    text, keyboard = low[0]
+    assert "fresh" in text.lower()
+    assert "/rerun" in text
+    button_texts = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert "RERUN" in button_texts
+    assert "REDEPLOY" not in button_texts
+
+
+@pytest.mark.asyncio
+async def test_low_cards_falls_back_when_age_missing():
+    """Older Pulse without catalogue_age field → original alert shape (no age hint, RERUN button)."""
+    client = _client_with_age([{"id": "c0", "hook_type": "MATCH_RESULT"}], age_seconds=None)
+    collector = AlertCollector()
+    alerter = FeedAlerter(client, collector, poll_interval=0)
+    await alerter._check_and_alert()
+    low = [c for c in collector.calls if "cards (<5)" in c[0]]
+    assert len(low) == 1
+    text, keyboard = low[0]
+    assert "catalogue" not in text.lower()  # no age hint when data missing
+    button_texts = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert "RERUN" in button_texts
+
+
+@pytest.mark.asyncio
+async def test_low_cards_falls_back_when_cost_detail_errors():
+    """Pulse cost_detail() failure → original alert shape, alert still fires."""
+    client = _client_with_age([{"id": "c0", "hook_type": "MATCH_RESULT"}], raise_on_detail=True)
+    collector = AlertCollector()
+    alerter = FeedAlerter(client, collector, poll_interval=0)
+    await alerter._check_and_alert()
+    low = [c for c in collector.calls if "cards (<5)" in c[0]]
+    assert len(low) == 1
+    button_texts = [b.text for row in low[0][1].inline_keyboard for b in row]
+    assert "RERUN" in button_texts

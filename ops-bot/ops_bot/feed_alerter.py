@@ -25,15 +25,31 @@ logger = logging.getLogger(__name__)
 FEED_POLL_INTERVAL = 300  # 5 minutes
 CARD_COUNT_MIN = 5
 HOOK_COLLAPSE_PCT = 80  # percent
+# Catalogue age (seconds) above which the empty-feed alert infers "stale
+# catalogue" and routes the primary action button at /redeploy. Well below
+# the 4h periodic refresh cadence (PR #113) but above any normal cycle
+# gap, so a transient empty-feed mid-cycle won't trigger the wrong button.
+STALE_CATALOGUE_THRESHOLD = 3600
 
 
 SendFn = Callable[[str, Optional[InlineKeyboardMarkup]], Awaitable[None]]
 
 
-def _feed_keyboard() -> InlineKeyboardMarkup:
+def _feed_keyboard(*, stale_catalogue: bool = False) -> InlineKeyboardMarkup:
+    """Action keyboard for feed alerts.
+
+    `stale_catalogue=True` swaps RERUN for REDEPLOY because rerun cannot
+    fix a stale-catalogue case (engine bypasses every cycle when there
+    are no in-window fixtures). Default keyboard preserves the original
+    RERUN behaviour for fresh-catalogue cases.
+    """
+    if stale_catalogue:
+        primary = InlineKeyboardButton(text="REDEPLOY", callback_data="action:redeploy")
+    else:
+        primary = InlineKeyboardButton(text="RERUN", callback_data="action:rerun")
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="FEED", callback_data="action:feed"),
-        InlineKeyboardButton(text="RERUN", callback_data="action:rerun"),
+        primary,
         InlineKeyboardButton(text="DISMISS", callback_data="action:dismiss"),
     ]])
 
@@ -126,10 +142,35 @@ class FeedAlerter:
         # --- Card-count low ---
         if count < CARD_COUNT_MIN and not self._already_fired("low_cards"):
             self._mark_fired("low_cards")
-            msg = format_feed_alert_low_cards(count)
-            logger.info("feed_alerter: low card count %d — sending alert", count)
+            # Try to fetch catalogue age so the alert can route to REDEPLOY
+            # when staleness is the inferred cause. Cost-detail call is
+            # cheap; if it fails for any reason we fall back to the
+            # original message shape (no age hint, RERUN button).
+            catalogue_age: Optional[float] = None
             try:
-                await self._send(msg, _feed_keyboard())
+                detail = await self._pulse.cost_detail()
+                raw = detail.get("catalogue_age_seconds")
+                if raw is not None:
+                    catalogue_age = float(raw)
+            except Exception as exc:
+                logger.debug(
+                    "feed_alerter: couldn't fetch catalogue_age (using fallback alert): %s",
+                    exc,
+                )
+            stale = (
+                catalogue_age is not None
+                and catalogue_age >= STALE_CATALOGUE_THRESHOLD
+            )
+            msg = format_feed_alert_low_cards(
+                count, catalogue_age_seconds=catalogue_age,
+                stale_threshold_seconds=STALE_CATALOGUE_THRESHOLD,
+            )
+            logger.info(
+                "feed_alerter: low card count %d (catalogue_age=%s, stale=%s) — sending alert",
+                count, catalogue_age, stale,
+            )
+            try:
+                await self._send(msg, _feed_keyboard(stale_catalogue=stale))
             except Exception as exc:
                 logger.error("feed_alerter: failed to send low-cards alert: %s", exc)
 

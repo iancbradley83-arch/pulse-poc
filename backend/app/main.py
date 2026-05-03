@@ -1298,6 +1298,23 @@ async def admin_cost_json(days: int = 7, detail: _Optional[str] = None):
     body["republish_events_today"] = None
     body["rewrite_cache_hits_today"] = None
 
+    # Catalogue freshness — surfaced for the ops-bot's `feed has 0 cards`
+    # alert so it can pick the right action button (REDEPLOY when stale,
+    # RERUN when fresh). Null until the first successful load.
+    try:
+        if _catalogue_loaded_at is not None:
+            body["catalogue_loaded_at"] = float(_catalogue_loaded_at)
+            body["catalogue_age_seconds"] = max(
+                0.0, time.time() - float(_catalogue_loaded_at)
+            )
+        else:
+            body["catalogue_loaded_at"] = None
+            body["catalogue_age_seconds"] = None
+    except Exception as exc:
+        logger.warning("[cost] /admin/cost.json catalogue_age read failed: %s", exc)
+        body["catalogue_loaded_at"] = None
+        body["catalogue_age_seconds"] = None
+
     return body
 
 
@@ -1423,6 +1440,8 @@ async def _load_rogue_prematch(
 
         catalog.replace_all(markets)
         simulator._games = {g.id: g for g in games}
+        global _catalogue_loaded_at
+        _catalogue_loaded_at = time.time()
 
         # Baseline pre-match cards (1X2 per fixture) — DISABLED by default
         # per principle 3 ("no-news fixtures get dropped"). Pulse is the
@@ -1859,6 +1878,14 @@ def _record_last_cycle_cost(usd: float) -> None:
 # (tier loops each publish quickly; minutes-apart cadence so this isn't
 # a throughput bottleneck).
 _engine_mutex = None  # initialised lazily (anyio/asyncio loop must exist)
+
+
+# Last successful Rogue catalogue swap (epoch seconds). Set in two places —
+# the boot-time `_load_rogue_prematch` path and the periodic
+# `_catalogue_refresh_once` path. Surfaced on `/admin/cost.json` so the
+# ops-bot can detect staleness and pick the right alert-action button
+# (REDEPLOY / refresh-catalogue) when the feed empties out.
+_catalogue_loaded_at: float | None = None
 
 
 async def _run_tier_once(tier: str) -> dict:
@@ -2334,6 +2361,8 @@ async def _catalogue_refresh_once() -> bool:
     # `catalog.replace_all` is similarly internally atomic.
     catalog.replace_all(markets)
     simulator._games = {g.id: g for g in games}
+    global _catalogue_loaded_at
+    _catalogue_loaded_at = time.time()
     logger.info(
         "[catalogue-refresh] swapped — fixtures=%d, markets=%d",
         len(games), len(markets),

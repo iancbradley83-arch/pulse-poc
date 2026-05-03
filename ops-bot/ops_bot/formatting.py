@@ -644,11 +644,50 @@ def format_widget_recovery(down_minutes: int) -> str:
     return f"[ops-bot] Pulse widget recovered — was broken ~{down_minutes}m"
 
 
-def format_feed_alert_low_cards(count: int) -> str:
-    """Format a WARN push alert for low card count."""
+def _format_age(seconds: float) -> str:
+    """Compact human-readable age: '23m', '4h', '1d 7h'."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h}h" if m == 0 else f"{h}h {m}m"
+    d = s // 86400
+    h = (s % 86400) // 3600
+    return f"{d}d" if h == 0 else f"{d}d {h}h"
+
+
+def format_feed_alert_low_cards(
+    count: int,
+    *,
+    catalogue_age_seconds: float | None = None,
+    stale_threshold_seconds: float = 3600.0,
+) -> str:
+    """Format a WARN push alert for low card count.
+
+    When `catalogue_age_seconds` is provided and exceeds `stale_threshold_seconds`,
+    the alert names the inferred root cause (stale catalogue) and points the
+    user at /redeploy as the primary fix. When fresh, recommends /rerun.
+    Falls back to the original message shape when age data is unavailable
+    (older Pulse versions before catalogue_loaded_at was surfaced).
+    """
+    head = f"[ops-bot] WARN — feed has {count} cards (<5)"
+    if catalogue_age_seconds is None:
+        return f"{head}\n  /feed for audit  ·  /rerun to refresh"
+    age_str = _format_age(catalogue_age_seconds)
+    if catalogue_age_seconds >= stale_threshold_seconds:
+        return (
+            f"{head}\n"
+            f"  catalogue last refreshed {age_str} ago — likely stale\n"
+            f"  /redeploy to reload catalogue  ·  /feed for audit"
+        )
     return (
-        f"[ops-bot] WARN — feed has {count} cards (<5)\n"
-        f"  /feed for audit  ·  /rerun to refresh"
+        f"{head}\n"
+        f"  catalogue {age_str} old (fresh)\n"
+        f"  /rerun to refresh  ·  /feed for audit"
     )
 
 
