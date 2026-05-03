@@ -347,6 +347,42 @@ These are decisions, not engineering details:
 
 ---
 
+## Phase 3.5 — Narrative composer (PR #121, dark by default)
+
+The breadth from Phase 3b is necessary but not sufficient. Without a way to read the news *as a story* and pick legs that orbit that story's subject, a broader market pool just produces more random combinations. Phase 3.5 is the bridge: subject + archetype + signal vocabulary + composer, all dark behind `PULSE_NARRATIVE_COMPOSER_ENABLED=false`.
+
+**The model in one breath:** every news item resolves to a `NarrativeThesis` carrying *who/what the story is about* (`subject`), *what kind of story it is* (`archetype` — currently 10 starter shapes), and *what game-state signals it implies* (resolved per subject, e.g. `player.casemiro.discipline_pressure`). Markets in `market_meta.py` (50 entries) declare what signals they emit per direction. The composer scores combinations by signal overlap with the thesis, applies the archetype's `bet_shape_rule` as a hard filter (e.g. `discipline_only` rejects every Goalscorer leg for a `PLAYER_DISCIPLINE_RISK` story), and returns ranked combos.
+
+Worked example: "Casemiro one yellow from suspension; Liverpool will target him" → archetype `PLAYER_DISCIPLINE_RISK` → subject Casemiro → signals include `player.casemiro.discipline_pressure`, `discipline.heavy.first_half`, `physicality.high` → composer returns BBs like `Casemiro To Be Booked + Cards 1H Over 2.5 + Total Match Fouls Over 24.5`. Not a goalscorer leg in sight. Today's INJURY/TEAM_NEWS theme would have produced *Casemiro Anytime Scorer + United to Win + BTTS* — wrong shape entirely.
+
+### Self-learning hooks (built in, dormant for now)
+
+| Hook | Captured today | Consumed by |
+|---|---|---|
+| Per-thesis confidence + alternatives | `narrative_telemetry.save_thesis()` | Future engagement model: *"did high-confidence matches drive clicks?"* |
+| `is_uncertain` flag on low-confidence theses | `[narrative_uncertain]` log line | Manual review → extend `ARCHETYPES` keywords / add new archetypes |
+| `llm_second_opinion_hook(news, rule_match)` | No-op today | Next PR: Haiku call when `confidence < 0.5` to overrule rule-based misses |
+| Per-composition `legs_json + score + signal_overlap` | `narrative_telemetry.save_composition()` | Future: which `(archetype, market_type, leg_count, odds_bucket)` correlates with engagement |
+
+### Files (PR #121)
+
+- `app/engine/narrative_signals.py` — vocabulary (~30 signals + per-team/player/manager templates) + `resolve()` + `conflicts()`
+- `app/engine/narrative_archetypes.py` — 10 starter archetypes (`PLAYER_DISCIPLINE_RISK`, `KEY_ATTACKER_OUT`, `TACTICAL_HIGH_PRESS`, `MANAGER_PRESSURE`, `PLAYER_FORM_STREAK`, `KEY_DEFENDER_OUT`, `RETURNING_PLAYER`, `TACTICAL_LOW_BLOCK`, `DERBY_INTENSITY`, `SET_PIECE_THREAT`) with keyword + hook matchers
+- `app/engine/narrative_thesis.py` — `build_thesis(news)` returning subject + archetype + resolved signals + alternatives + uncertainty flag
+- `app/engine/market_meta.py` — 50-market metadata catalogue with `emits_signals_by_direction` + `archetype_affinities` + `bet_shape_rule` constraints
+- `app/engine/combination_composer.py` — `compose_candidates(thesis, market_pool)` → ranked `Combination` list, scored by signal overlap − conflict_penalty − orphan_legs
+- `app/services/narrative_telemetry.py` — separate `narrative_theses` + `narrative_compositions` SQLite tables, no `CandidateCard` schema changes (sidesteps schema-drift risk)
+- `tests/test_narrative_pipeline.py` — 28 tests including the booking-watch end-to-end
+
+### What this PR is NOT doing
+
+- Not flipping `PULSE_NARRATIVE_COMPOSER_ENABLED` on in production
+- Not wiring the composer into `combo_builder` (that's PR #122 — alongside today's hand-coded themes for A/B comparison)
+- Not calling Haiku (LLM second opinion hook is dormant)
+- Not capturing engagement events (depends on AT live + click attribution)
+
+---
+
 ## Cross-references
 
 - `docs/production-mvp-plan.md` — production MVP context (locked 2026-04-28)
