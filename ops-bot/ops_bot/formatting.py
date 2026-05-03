@@ -119,6 +119,24 @@ def format_status(
 ) -> str:
     lines: List[str] = []
 
+    # Top-of-message banner when something is degraded — surfaces the
+    # operational state at a glance instead of burying it at the bottom.
+    # Without this banner, `Deploy: (unavailable)` reads like missing
+    # data and the user assumes the green `Pulse: ok` line below means
+    # everything's fine. It isn't — Railway being unreachable means
+    # recovery actions (redeploy, refresh-catalogue) won't work either.
+    if pulse_unreachable and railway_unreachable:
+        lines.append("🚨 CRITICAL — Pulse + Railway both unreachable")
+        lines.append("")
+    elif pulse_unreachable:
+        lines.append("🚨 CRITICAL — Pulse unreachable")
+        lines.append("")
+    elif railway_unreachable:
+        lines.append(
+            "⚠️ DEGRADED — Railway ops blind (deploy + recovery actions disabled)"
+        )
+        lines.append("")
+
     # Pulse health line.
     if health is not None:
         ok = health.get("ok", False)
@@ -139,7 +157,9 @@ def format_status(
     else:
         lines.append("Cost: (unavailable)")
 
-    # Deploy line.
+    # Deploy line. When Railway is unreachable, prefix with ⚠️ so the
+    # cause of the missing data is obvious inline (not just at the
+    # bottom of the message).
     if deployment is not None:
         status = deployment.get("status", "UNKNOWN")
         commit = deployment.get("commitHash", "")[:7] or "unknown"
@@ -147,7 +167,8 @@ def format_status(
         age = _age_str(created_at) if created_at else "unknown"
         lines.append(f"Deploy: {status} — {commit} — {age}")
     else:
-        lines.append("Deploy: (unavailable)")
+        prefix = "⚠️ " if railway_unreachable else ""
+        lines.append(f"Deploy: {prefix}(unavailable)")
 
     # Feed line.
     if feed is not None:
@@ -168,7 +189,8 @@ def format_status(
         storylines = _flag("PULSE_TIERED_FRESHNESS_ENABLED", "storylines")
         lines.append(f"Engine: {rerun}  {news}  {storylines}")
     else:
-        lines.append("Engine: (unavailable)")
+        prefix = "⚠️ " if railway_unreachable else ""
+        lines.append(f"Engine: {prefix}(unavailable)")
 
     # Cards-in-feed + $/card KPI line (PR #84 enrichment, optional).
     if cost_detail is not None:
@@ -183,10 +205,14 @@ def format_status(
     lines.append("")
     lines.append(f"last check: {check_age_seconds}s ago")
 
+    # Action-oriented bottom warning when degraded — points the operator
+    # at where to look (env-var scope is the recurring root cause).
     if pulse_unreachable:
-        lines.append("(Pulse unreachable)")
+        lines.append("(Pulse unreachable — check pulse-poc service health)")
     if railway_unreachable:
-        lines.append("(Railway API unreachable)")
+        lines.append(
+            "(Railway API unreachable — check ops-bot RAILWAY_API_TOKEN scope)"
+        )
 
     return "\n".join(lines)
 
