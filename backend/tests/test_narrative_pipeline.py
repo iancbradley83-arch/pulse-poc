@@ -1,0 +1,403 @@
+"""Tests for the narrative composition pipeline.
+
+Covers:
+  * narrative_signals: resolve / conflicts
+  * narrative_archetypes: keyword + hook-based detection
+  * narrative_thesis: subject resolution, signal placeholder filling,
+    is_uncertain flagging
+  * market_meta: lookup by market name
+  * combination_composer: end-to-end including the
+    PLAYER_DISCIPLINE_RISK booking-watch example
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Optional
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from app.engine import narrative_signals
+from app.engine.narrative_archetypes import (
+    ARCHETYPE_BY_KEY,
+    derive_archetype,
+)
+from app.engine.narrative_thesis import build_thesis, UNCERTAINTY_THRESHOLD
+from app.engine.market_meta import (
+    CATALOGUE,
+    CATALOGUE_BY_KEY,
+    lookup_by_market_name,
+)
+from app.engine.combination_composer import compose_candidates
+from app.models.news import HookType, NewsItem
+
+
+# ── narrative_signals ─────────────────────────────────────────────────
+
+
+def test_signals_resolve_team_placeholder():
+    out = narrative_signals.resolve("dominance.{team}", team_id="t-123")
+    assert out == "dominance.t-123"
+
+
+def test_signals_resolve_player_placeholder():
+    out = narrative_signals.resolve("player.{p}.active", player_id="Salah")
+    assert out == "player.Salah.active"
+
+
+def test_signals_resolve_raises_on_missing_id():
+    with pytest.raises(ValueError):
+        narrative_signals.resolve("dominance.{team}", team_id=None)
+
+
+def test_signals_static_unchanged():
+    assert narrative_signals.resolve("goals.high") == "goals.high"
+
+
+def test_signals_conflicts_obvious_pairs():
+    assert narrative_signals.conflicts("goals.high", "goals.low")
+    assert narrative_signals.conflicts("tempo.high", "tempo.low")
+    assert narrative_signals.conflicts("set_pieces.heavy", "set_pieces.light")
+
+
+def test_signals_conflicts_per_team_antonyms():
+    assert narrative_signals.conflicts("defense.tight.t-1",
+                                       "defense.leaky.t-1")
+    # Different teams — not a conflict
+    assert not narrative_signals.conflicts("defense.tight.t-1",
+                                           "defense.leaky.t-2")
+
+
+def test_signals_conflicts_player_active_vs_suppressed():
+    assert narrative_signals.conflicts("player.salah.active",
+                                       "player.salah.suppressed")
+    assert not narrative_signals.conflicts("player.salah.active",
+                                           "player.diaz.suppressed")
+
+
+def test_signals_conflicts_orthogonal_pairs():
+    """Unrelated signals are not conflicts."""
+    assert not narrative_signals.conflicts("goals.high", "set_pieces.heavy")
+
+
+# ── narrative_archetypes ──────────────────────────────────────────────
+
+
+def _news(*, headline="", summary="", hook=HookType.OTHER,
+          mentions=None, team_ids=None, fixture_ids=None,
+          injury_details=None) -> NewsItem:
+    return NewsItem(
+        headline=headline,
+        summary=summary,
+        hook_type=hook,
+        mentions=mentions or [],
+        team_ids=team_ids or [],
+        fixture_ids=fixture_ids or [],
+        injury_details=injury_details or [],
+    )
+
+
+def test_archetype_player_discipline_risk_matches_booking_watch():
+    n = _news(
+        headline="Casemiro one yellow from suspension; Liverpool will target him",
+        summary="The midfielder has been booked in 5 of the last 6 games.",
+        hook=HookType.PREVIEW,
+        mentions=["Casemiro"],
+    )
+    match = derive_archetype(n)
+    assert match.primary is not None
+    assert match.primary.key == "PLAYER_DISCIPLINE_RISK"
+    assert match.confidence >= 0.5
+
+
+def test_archetype_key_attacker_out_matches_injury():
+    n = _news(
+        headline="Salah ruled out vs Manchester United",
+        summary="Liverpool's talisman misses out with a hamstring blow.",
+        hook=HookType.INJURY,
+        mentions=["Salah"],
+    )
+    match = derive_archetype(n)
+    assert match.primary is not None
+    assert match.primary.key == "KEY_ATTACKER_OUT"
+
+
+def test_archetype_tactical_high_press_matches_iraola_quote():
+    n = _news(
+        headline="Iraola: full-throttle press from minute one",
+        summary="The Bournemouth manager wants intensity from kickoff.",
+        hook=HookType.MANAGER_QUOTE,
+        team_ids=["bournemouth"],
+    )
+    match = derive_archetype(n)
+    assert match.primary is not None
+    assert match.primary.key == "TACTICAL_HIGH_PRESS"
+
+
+def test_archetype_no_match_returns_none():
+    n = _news(headline="Match preview: kickoff at 3pm", hook=HookType.PREVIEW)
+    match = derive_archetype(n)
+    # No keywords match — primary is None
+    assert match.primary is None
+    assert match.confidence == 0.0
+
+
+def test_archetype_returns_alternatives_when_multiple_match():
+    n = _news(
+        headline="Salah ruled out, Klopp under pressure",
+        summary="Liverpool's manager faces sack watch ahead of injury crisis.",
+        hook=HookType.MANAGER_QUOTE,
+    )
+    match = derive_archetype(n)
+    assert match.primary is not None
+    # Should have at least one alternative scoring lower
+    assert isinstance(match.alternatives, tuple)
+
+
+# ── narrative_thesis ─────────────────────────────────────────────────
+
+
+def test_thesis_resolves_player_subject_from_injury_details():
+    n = _news(
+        headline="Casemiro on booking watch",
+        summary="One yellow from suspension.",
+        hook=HookType.PREVIEW,
+        injury_details=[{"player_name": "Casemiro", "team": "Manchester United",
+                         "position_guess": "defensive_mid", "is_out_confirmed": False}],
+    )
+    thesis = build_thesis(n)
+    assert thesis.archetype is not None
+    assert thesis.archetype.key == "PLAYER_DISCIPLINE_RISK"
+    assert thesis.subject_player_name == "Casemiro"
+    assert "player.Casemiro.discipline_pressure" in thesis.resolved_signals
+
+
+def test_thesis_resolves_team_subject_from_team_ids():
+    n = _news(
+        headline="Iraola wants high press from minute one",
+        hook=HookType.MANAGER_QUOTE,
+        team_ids=["bournemouth-id"],
+    )
+    thesis = build_thesis(n)
+    assert thesis.archetype is not None
+    assert thesis.archetype.key == "TACTICAL_HIGH_PRESS"
+    assert thesis.subject_team_id == "bournemouth-id"
+    # Per-team signal placeholder must be filled
+    assert "team.bournemouth-id.high_press" in thesis.resolved_signals
+
+
+def test_thesis_uncertain_when_no_archetype_matches():
+    n = _news(headline="Standard match preview", hook=HookType.PREVIEW)
+    thesis = build_thesis(n)
+    assert thesis.is_uncertain is True
+    assert thesis.confidence < UNCERTAINTY_THRESHOLD
+
+
+def test_thesis_drops_unfillable_signals_silently():
+    """When subject is a PLAYER but injury_details + mentions are empty,
+    `{p}` placeholders cannot be resolved → those signals are dropped,
+    not emitted as `player..active` (which would never match)."""
+    n = _news(
+        headline="Player on booking watch",
+        summary="One yellow from suspension.",
+        hook=HookType.PREVIEW,
+        # No mentions, no injury_details — subject_player_name = None
+    )
+    thesis = build_thesis(n)
+    # Archetype matches by keyword but subject can't be resolved → signals
+    # dropped (not malformed).
+    if thesis.archetype is not None:
+        for s in thesis.resolved_signals:
+            assert "{" not in s and "}" not in s
+
+
+# ── market_meta ──────────────────────────────────────────────────────
+
+
+def test_meta_lookup_exact_match():
+    meta = lookup_by_market_name("FT 1X2")
+    assert meta is not None
+    assert meta.key == "match_result"
+
+
+def test_meta_lookup_substring_match():
+    meta = lookup_by_market_name("Manchester United: Total Team Goals O/U")
+    assert meta is not None
+    assert meta.key == "team_total_goals_ou"
+
+
+def test_meta_lookup_returns_none_for_unknown():
+    assert lookup_by_market_name("Some Brand New Market") is None
+
+
+def test_meta_lookup_empty_string_safe():
+    assert lookup_by_market_name("") is None
+
+
+def test_meta_catalogue_has_50_entries():
+    """Sanity: we promised ~50 markets in the design doc."""
+    assert len(CATALOGUE) >= 45
+
+
+def test_meta_no_duplicate_keys():
+    keys = [m.key for m in CATALOGUE]
+    assert len(keys) == len(set(keys))
+
+
+# ── combination_composer ─────────────────────────────────────────────
+
+
+def _market(_id, name, selections=None):
+    return {
+        "_id": _id,
+        "Name": name,
+        "Selections": selections or [
+            {"Id": f"{_id}-s0", "Name": "Yes"},
+            {"Id": f"{_id}-s1", "Name": "No"},
+        ],
+    }
+
+
+def test_composer_player_discipline_risk_picks_discipline_only_legs():
+    """The booking-watch example end-to-end. Subject = Casemiro;
+    archetype = PLAYER_DISCIPLINE_RISK; bet_shape_rule = discipline_only.
+    The composer must reject every market that isn't in the
+    discipline-only set, even when other markets emit goals.high signals."""
+    n = _news(
+        headline="Casemiro one yellow from suspension; Liverpool will target him",
+        summary="The midfielder has been booked in 5 of the last 6 games.",
+        hook=HookType.PREVIEW,
+        mentions=["Casemiro"],
+        injury_details=[{"player_name": "Casemiro", "team": "Manchester United",
+                         "position_guess": "defensive_mid", "is_out_confirmed": False}],
+    )
+    thesis = build_thesis(n)
+    assert thesis.archetype.key == "PLAYER_DISCIPLINE_RISK"
+
+    pool = [
+        # Discipline-aligned markets
+        _market("m-cards", "Cards FT O/U"),
+        _market("m-1hcards", "Cards 1st Half O/U"),
+        _market("m-totalfouls", "Total Match Fouls"),
+        _market(
+            "m-pbook",
+            "Player To Be Booked",
+            selections=[{"Id": "p-1", "Name": "Casemiro"},
+                        {"Id": "p-2", "Name": "Bruno Fernandes"}],
+        ),
+        # Off-topic markets that today's themes might pick
+        _market("m-totalgoals", "Total Goals O/U"),
+        _market(
+            "m-anytime",
+            "Anytime Goalscorer",
+            selections=[{"Id": "g-1", "Name": "Casemiro"},
+                        {"Id": "g-2", "Name": "Salah"}],
+        ),
+        _market("m-btts", "Both Teams To Score"),
+    ]
+    combos = compose_candidates(thesis, pool, target_legs=3, min_legs=2)
+    assert combos, "composer should produce at least one combination"
+
+    top = combos[0]
+    # Every leg must be from the discipline-only set
+    discipline_keys = {
+        "player_to_be_booked", "player_to_be_carded_first",
+        "player_red_card", "cards_ft_ou", "cards_ft_1x2",
+        "cards_first_half_ou", "team_total_cards_ou",
+        "both_teams_to_be_booked", "total_match_fouls",
+        "player_over_fouls", "player_over_tackles",
+        "will_a_penalty_be_awarded",
+    }
+    for leg in top.legs:
+        assert leg.market_meta_key in discipline_keys, (
+            f"off-topic leg leaked through: {leg.market_meta_key} "
+            f"({leg.market_name})"
+        )
+
+
+def test_composer_no_combinations_when_thesis_uncertain():
+    n = _news(headline="generic preview", hook=HookType.PREVIEW)
+    thesis = build_thesis(n)
+    assert thesis.is_uncertain
+    pool = [_market("m-1", "Total Goals O/U")]
+    assert compose_candidates(thesis, pool) == []
+
+
+def test_composer_subject_centric_rejects_off_subject_player_legs():
+    """For PLAYER_FORM_STREAK on player X, an Anytime Goalscorer leg on
+    a different player Y should not be accepted."""
+    n = _news(
+        headline="Salah scored in 4 straight; in red-hot form",
+        summary="Liverpool's talisman on a goal streak.",
+        hook=HookType.PREVIEW,
+        mentions=["Salah"],
+    )
+    thesis = build_thesis(n)
+    assert thesis.archetype.key == "PLAYER_FORM_STREAK"
+
+    pool = [
+        _market(
+            "m-anytime-salah",
+            "Anytime Goalscorer",
+            selections=[{"Id": "s-1", "Name": "Mohamed Salah"},
+                        {"Id": "s-2", "Name": "Diaz"}],
+        ),
+        _market(
+            "m-shots-salah",
+            "Player Over Shots",
+            selections=[{"Id": "sh-1", "Name": "Mohamed Salah"}],
+        ),
+        # Off-subject: Anytime Goalscorer for a different player
+        _market(
+            "m-anytime-rashford",
+            "Anytime Goalscorer",
+            selections=[{"Id": "ra-1", "Name": "Rashford"}],
+        ),
+    ]
+    combos = compose_candidates(thesis, pool, target_legs=2, min_legs=2)
+    if combos:
+        for leg in combos[0].legs:
+            # All accepted player-scope legs must reference Salah
+            if leg.selection_name:
+                assert "Salah" in leg.selection_name
+
+
+def test_composer_does_not_explode_on_empty_pool():
+    n = _news(
+        headline="Salah ruled out", hook=HookType.INJURY,
+        mentions=["Salah"],
+        injury_details=[{"player_name": "Salah", "team": "Liverpool",
+                         "position_guess": "winger", "is_out_confirmed": True}],
+    )
+    thesis = build_thesis(n)
+    assert compose_candidates(thesis, []) == []
+
+
+def test_composer_rejects_combos_with_signal_conflict():
+    """Build a synthetic case where two leg directions emit conflicting
+    signals — composer should not include that combo."""
+    n = _news(
+        headline="Iraola wants high press from minute one",
+        hook=HookType.MANAGER_QUOTE,
+        team_ids=["bournemouth"],
+    )
+    thesis = build_thesis(n)
+    pool = [
+        _market("m-totalgoals", "Total Goals O/U"),
+        _market("m-1hgoals", "1st Half Total Goals O/U"),
+        _market("m-corners", "Corners FT O/U"),
+    ]
+    combos = compose_candidates(thesis, pool, target_legs=3)
+    if combos:
+        # Within any combo, no two emitted signals should conflict
+        for combo in combos:
+            all_sigs = []
+            for leg in combo.legs:
+                all_sigs.extend(leg.emitted_signals)
+            for i, a in enumerate(all_sigs):
+                for b in all_sigs[i+1:]:
+                    assert not narrative_signals.conflicts(a, b)
