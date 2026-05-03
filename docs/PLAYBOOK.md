@@ -77,6 +77,7 @@ These DO change state. Every one shows a 30-second confirm prompt before executi
 - `/resume` — set both back to `true`
 - `/rerun` — POST `/admin/rerun` to trigger a candidate engine cycle (no redeploy)
 - `/redeploy` — trigger Railway `deploymentRedeploy` on the latest deployment (forces fresh boot, ~4 min cold start, reloads catalogue)
+- `/refresh_catalogue` — POST `/admin/catalogue-refresh`. Forces a fresh Rogue catalogue load **without** a redeploy: no rebuild, no cold start, no LLM cost. Lighter than `/redeploy` for stale-catalogue cases. Synchronous (a few seconds).
 - `/flag <NAME> <true|false>` — set any other `PULSE_*` env var; useful for kill-switching specific features without a redeploy
 - `/snooze <kind> <duration>` — see above
 
@@ -215,7 +216,7 @@ Common causes & phone fix:
 |---|---|---|
 | Engine paused | `/env` shows `PULSE_RERUN_ENABLED=false` | `/resume`. (Currently broken — see ⚠️ below.) |
 | News cache stale, fresh fixtures available | `/breakdown` shows recent cycles produced 0 candidates but eligible > 0 | `/rerun`, recheck `/feed` after 60–90s |
-| **Stale catalogue** (deploy >24h old, all kickoffs in past) | `/breakdown` shows `eligible=0` every cycle; `/status` shows old deploy | `/redeploy` — fresh boot reloads today's catalogue. Periodic refresh runs every 4h since 2026-05-03 (PR #113), so this is rarer now. |
+| **Stale catalogue** (deploy >24h old, all kickoffs in past) | `/breakdown` shows `eligible=0` every cycle; `/status` shows old deploy; bot's empty-feed alert may already say `catalogue last refreshed Xh ago — likely stale` | **`/refresh_catalogue`** (preferred — no rebuild, no cold start) or `/redeploy` (fresh boot). Periodic refresh runs every 4h since 2026-05-03 (PR #113), so this is rarer. |
 | Catalogue cap reached & most post-kickoff | `/feed` empty but `/breakdown` shows engine ran | Wait for next catalogue refresh (≤4h). No phone fix. |
 | Cost tripwire fired | `/breakdown` shows daily ≥ $3 | `/snooze cost 6h` won't help — laptop work. |
 

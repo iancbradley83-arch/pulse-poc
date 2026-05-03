@@ -238,3 +238,43 @@ class PulseClient:
             raise
         except Exception as exc:
             raise PulseError(f"request failed: {exc}") from exc
+
+    async def post_admin_catalogue_refresh(self) -> Dict[str, Any]:
+        """
+        POST /admin/catalogue-refresh — force a fresh Rogue catalogue load.
+
+        Synchronous on Pulse's side (Rogue fetch typically completes in
+        a few seconds, well under the 60s Railway edge cap). Returns
+        timing + counts on success.
+
+        Expected success shape:
+          {"ok": true, "fixtures": int, "elapsed_seconds": float,
+           "catalogue_loaded_at": float}
+        Returns 503 on Rogue failure (kept prior snapshot).
+
+        Raises PulseError on network failure or non-2xx status.
+        """
+        url = f"{self._base_url}/admin/catalogue-refresh"
+        try:
+            kwargs: Dict[str, Any] = {}
+            if self._admin_auth:
+                kwargs["auth"] = self._admin_auth
+            resp = await self._client.post(url, **kwargs)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+                if not isinstance(data, dict):
+                    data = {"ok": True}
+            except Exception:
+                data = {"ok": True}
+            return data
+        except httpx.TimeoutException as exc:
+            raise PulseError("unreachable") from exc
+        except httpx.HTTPStatusError as exc:
+            # Surface 503 (Rogue empty / kept prior) distinctly so handler
+            # can render a useful message.
+            raise PulseError(f"http {exc.response.status_code}") from exc
+        except PulseError:
+            raise
+        except Exception as exc:
+            raise PulseError(f"request failed: {exc}") from exc
