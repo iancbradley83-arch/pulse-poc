@@ -894,6 +894,10 @@ async def generate_prematch_cards():
             for _tier in _TIER_ORDER:
                 _tier_tasks.append(_asyncio.create_task(_tier_loop(_tier)))
             _tier_tasks.append(_asyncio.create_task(_card_ttl_sweep_loop()))
+            # 2026-05-03 fix: periodic catalogue refresh — keeps the
+            # Rogue snapshot in sync with today's fixtures so deploys
+            # older than ~24h don't end up with every kickoff in the past.
+            _tier_tasks.append(_asyncio.create_task(_catalogue_refresh_loop()))
             # PR #53: release-buffer scheduler — enforces hook-variety
             # across adjacent WS `card_added` broadcasts. Runs even when
             # the buffer is disabled (noop); cheap timer.
@@ -901,7 +905,7 @@ async def generate_prematch_cards():
             _release_task = _asyncio.create_task(_release_loop())
             _tier_tasks.append(_release_task)
             logger.info(
-                "[PULSE] Tiered freshness active — %d tier loops + TTL sweep + release buffer",
+                "[PULSE] Tiered freshness active — %d tier loops + TTL sweep + catalogue refresh + release buffer",
                 len(_TIER_ORDER),
             )
         else:
@@ -2266,6 +2270,107 @@ async def _card_ttl_sweep_loop() -> None:
             logger.exception(
                 "[PULSE] published_cards TTL sweep errored: %s", exc,
             )
+
+
+def _read_catalogue_refresh_config() -> tuple[bool, int, str]:
+    """Read env-driven refresh config. Returns (enabled, interval_s, reason).
+
+    Reads at the moment the loop starts (boot) — Railway env flips need a
+    redeploy to take effect. Floored at 15 min so a typo can't have us
+    pounding Rogue. `enabled=False` short-circuits with the reason in the
+    log line.
+    """
+    if os.getenv("PULSE_CATALOGUE_REFRESH_ENABLED", "true").lower() != "true":
+        return (False, 0, "PULSE_CATALOGUE_REFRESH_ENABLED=false")
+    if not ROGUE_CONFIG_JWT:
+        return (False, 0, "no ROGUE_CONFIG_JWT — mock mode")
+    try:
+        interval = int(os.getenv("PULSE_CATALOGUE_REFRESH_SECONDS", "14400"))
+    except ValueError:
+        interval = 14400
+    interval = max(900, interval)
+    return (True, interval, "")
+
+
+async def _catalogue_refresh_once() -> bool:
+    """Single catalogue refresh pass. Returns True iff a swap happened.
+
+    Catalogue-only — no LLM. Fetches `fetch_soccer_snapshot` from Rogue,
+    atomically swaps `simulator._games` + market catalog. Importance
+    scores get re-stamped inside `fetch_soccer_snapshot` so the gradient
+    router sees fresh ranks. Errors and empty responses keep the prior
+    snapshot in place.
+    """
+    client = RogueClient(
+        base_url=ROGUE_BASE_URL,
+        config_jwt=ROGUE_CONFIG_JWT,
+        per_second=ROGUE_RATE_LIMIT_PER_SECOND,
+    )
+    try:
+        try:
+            games, markets, _ = await fetch_soccer_snapshot(
+                client,
+                sport_id=ROGUE_SOCCER_SPORT_ID,
+                days_ahead=ROGUE_CATALOGUE_DAYS_AHEAD,
+                max_events=ROGUE_CATALOGUE_MAX_EVENTS,
+            )
+        except Exception as exc:
+            logger.exception("[catalogue-refresh] fetch failed: %s", exc)
+            return False
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+    if not games:
+        logger.warning(
+            "[catalogue-refresh] Rogue returned no usable fixtures — keeping prior snapshot"
+        )
+        return False
+    # Atomic-ish swap: catalog + simulator._games together. Tier
+    # loops read both; if they diverge mid-cycle the engine gets
+    # markets for fixtures that aren't in the games dict (or vice
+    # versa). Python's GIL gives atomicity for the dict assignment;
+    # `catalog.replace_all` is similarly internally atomic.
+    catalog.replace_all(markets)
+    simulator._games = {g.id: g for g in games}
+    logger.info(
+        "[catalogue-refresh] swapped — fixtures=%d, markets=%d",
+        len(games), len(markets),
+    )
+    return True
+
+
+async def _catalogue_refresh_loop() -> None:
+    """Periodically refresh the Rogue soccer catalogue.
+
+    Without this, deployments older than ~24h see every kickoff slip into
+    the past, the HOT-tier classifier reports `total=N -> eligible=0`,
+    every tier loop bypasses the engine, and the feed stays empty until
+    the next redeploy. Hit on 2026-05-02 — feed at 0 cards for a full day
+    while the engine ran zero-cost cycles every hour.
+
+    The refresh is **catalogue-only** — no LLM, no Anthropic spend.
+
+    Tunables (env, read once at boot):
+      PULSE_CATALOGUE_REFRESH_ENABLED  — kill switch (default true)
+      PULSE_CATALOGUE_REFRESH_SECONDS  — interval (default 14400 = 4h)
+    """
+    import asyncio as _asyncio
+    enabled, interval, reason = _read_catalogue_refresh_config()
+    if not enabled:
+        logger.info("[PULSE] Catalogue refresh disabled (%s)", reason)
+        return
+    logger.info("[PULSE] Catalogue refresh active — every %ds", interval)
+    while True:
+        try:
+            await _asyncio.sleep(interval)
+        except _asyncio.CancelledError:
+            return
+        try:
+            await _catalogue_refresh_once()
+        except Exception as exc:
+            logger.exception("[catalogue-refresh] loop iteration errored: %s", exc)
 
 
 def _label_contains_excluded_player(label: str, excluded: set) -> bool:
