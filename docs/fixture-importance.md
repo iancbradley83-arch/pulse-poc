@@ -228,6 +228,72 @@ This resolves the prior open question on `MarketCatalog.ALLOW`: it stays as the 
 
 **Files affected at 3b/3c:** `backend/app/engine/candidate_builder.py`, `backend/app/engine/combo_builder.py`, `backend/app/engine/cross_event_builder.py`.
 
+#### Appendix — Phase 3b cap-by-gradient design (PR #119)
+
+Phase 2b's `gradient_factor()` already scales `max_searches`,
+`per_fixture_cap`, and `max_cost_usd` linearly by `importance_score`.
+PR #119 adds a fourth gradient knob — **per-group market cap** — sized
+the same way:
+
+| Score | Per-group market cap | Notes |
+|---|---|---|
+| 1.0 (top) | 10 | Top fixture (Man U vs LIV scale) — saturates the BB-eligible pool |
+| 0.5 (mid) | 6  | Linear interpolation between floor / ceiling |
+| 0.0 (tail) | 2 | Tail fixture — keeps cost down, ALLOW floor still surfaces |
+
+`MarketCatalog.ALLOW`-equivalent floor markets (1X2, OU 2.5, BTTS, AH,
+DNB, double-chance) survive at every score — they are the anchor
+markets every card needs. Pool builder is
+`app/engine/market_pool_builder.py::build_pool`.
+
+Two groups skipped by default: `All Markets` (every market belongs;
+including would bypass per-group caps) and `Special` (operator marks
+`MarketOrder=999999` — unranked, sampling would be random).
+
+#### Appendix — BB diversity targets (PR #119)
+
+Once the pool is broader, we want BBs to actually USE the new variety
+— not just pick the same 2–3 leg combos forever. Two diversification
+axes, both observed first, then routed on:
+
+**Leg-count target distribution per importance:**
+
+| Score | 1-leg | 2-leg | 3-leg | 4-leg | 5-leg | 6-leg |
+|---|---|---|---|---|---|---|
+| 1.0 (top)  | 20% | 20% | 25% | 20% | 10% | 5% |
+| 0.0 (tail) | 50% | 30% | 20% | 0%  | 0%  | 0% |
+
+**Odds-bucket target distribution per importance:**
+
+| Score | short [1.00–1.50) | mid [1.50–2.50) | plus [2.50–5.00) | long [5.00–12.00) | lottery [12.00+) |
+|---|---|---|---|---|---|
+| 1.0 (top)  | 15% | 35% | 30% | 15% | 5% |
+| 0.0 (tail) | 30% | 50% | 15% | 5%  | 0% |
+
+These are starting points, not committed targets. Phase 3b PR #119
+ships `composition_report()` in `app/engine/bb_diversity.py` plus a
+cycle-end `[pool_composition]` log line so we can compare actual vs.
+target across 1–2 cycles before tuning. Routing the engine to *hit*
+the targets lands in PR #120 (which themes / legs to favour when
+actual distribution is below target).
+
+#### Appendix — Composition observability log (PR #119, always on)
+
+End of every CandidateEngine cycle now emits:
+
+```
+[pool_composition] total=47  bet_type={single=18, bet_builder=21, combo=8}
+                   legs={1=18, 2=12, 3=11, 4=4, 5=2, 6=0}
+                   odds_bucket={short=4, mid=22, plus=15, long=5, lottery=1}
+                   odds_range=[1.32, 14.50]
+```
+
+No env knob — pure observability, wrapped in try/except so it never
+breaks the cycle. Phase 3b's calibration question is answered by
+reading this line across a few cycles, then deciding whether to flip
+the route layer (`PULSE_DEEP_MARKET_EXPANSION_ENABLED=true`) and the
+diversity targeter (PR #120).
+
 ---
 
 ## Market-depth expander (own workstream)
