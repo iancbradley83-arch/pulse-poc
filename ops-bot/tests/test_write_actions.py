@@ -48,15 +48,39 @@ async def test_pause_passes_correct_project_service_env():
 
 
 @pytest.mark.asyncio
-async def test_pause_partial_failure_returns_false():
+async def test_pause_partial_failure_returns_false(monkeypatch):
+    """First var succeeds. Second var fails on initial call AND on retry —
+    only then does it count as a real failure to the user."""
+    monkeypatch.setattr("ops_bot.write_actions.asyncio.sleep", AsyncMock())
     rc = MagicMock()
-    # First var succeeds, second fails.
-    rc.set_variable = AsyncMock(side_effect=[None, RailwayError("boom")])
+    # var 1: ok. var 2: initial call fails, retry also fails.
+    rc.set_variable = AsyncMock(
+        side_effect=[None, RailwayError("boom"), RailwayError("boom-retry")]
+    )
 
     success, summary = await wa.pause(rc)
 
     assert success is False
     assert "partial" in summary
+    # Verify retry was attempted (3 calls total: ok + fail + fail-retry)
+    assert rc.set_variable.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_pause_recovers_on_transient_railway_error(monkeypatch):
+    """Single transient failure followed by success should report success
+    (this is the 2026-05-01 /resume scenario — Railway hiccup, retry works)."""
+    monkeypatch.setattr("ops_bot.write_actions.asyncio.sleep", AsyncMock())
+    rc = MagicMock()
+    # var 1: transient fail then retry-success. var 2: clean success.
+    rc.set_variable = AsyncMock(
+        side_effect=[RailwayError("transient"), None, None]
+    )
+
+    success, summary = await wa.pause(rc)
+
+    assert success is True
+    assert rc.set_variable.await_count == 3  # 1 fail + 1 retry-ok + 1 ok
 
 
 # ---------------------------------------------------------------------------
