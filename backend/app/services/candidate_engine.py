@@ -384,4 +384,21 @@ class CandidateEngine:
             "CandidateEngine run: fixtures=%d news=%d candidates=%d published=%d",
             counts["fixtures"], counts["news"], counts["candidates"], counts["published"],
         )
+
+        # Phase 3b: pool composition observability — what did we ACTUALLY
+        # generate this cycle (singles vs BB vs combo, leg-count spread,
+        # odds buckets)? Always on; pure summarisation, no behaviour
+        # change. Routing on this lands in PR #120.
+        try:
+            from app.engine.bb_diversity import (
+                composition_report,
+                format_composition_log_line,
+            )
+            report = composition_report(final)
+            logger.info(
+                "[pool_composition] %s", format_composition_log_line(report),
+            )
+        except Exception:  # never let observability break the cycle
+            logger.exception("[pool_composition] reporter failed (non-fatal)")
+
         return counts
