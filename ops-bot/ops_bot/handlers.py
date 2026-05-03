@@ -613,6 +613,9 @@ async def _execute_action(action_id: str, args, chat_id: int, reply_fn) -> None:
     elif action_id == "rerun":
         success, summary = await _actions.rerun(_pulse_client)
 
+    elif action_id == "refresh_catalogue":
+        success, summary = await _actions.refresh_catalogue(_pulse_client)
+
     elif action_id == "redeploy":
         if _railway_client is None:
             await reply_fn("(Railway API unavailable — cannot redeploy)")
@@ -674,6 +677,28 @@ async def cmd_rerun(message: Message) -> None:
         message,
         action_id="rerun",
         detail="POST /admin/rerun — triggers candidate engine cycle",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — /refresh_catalogue
+# ---------------------------------------------------------------------------
+
+@router.message(Command("refresh_catalogue"))
+async def cmd_refresh_catalogue(message: Message) -> None:
+    """/refresh_catalogue — POST /admin/catalogue-refresh.
+
+    Forces a fresh Rogue catalogue load. Lighter than /redeploy for
+    stale-catalogue cases (no rebuild, no cold start). Catalogue-only —
+    no LLM, no Anthropic spend.
+    """
+    await _send_confirm_prompt(
+        message,
+        action_id="refresh_catalogue",
+        detail=(
+            "POST /admin/catalogue-refresh — forces a fresh Rogue catalogue "
+            "load (no rebuild, no LLM cost). Lighter than /redeploy."
+        ),
     )
 
 

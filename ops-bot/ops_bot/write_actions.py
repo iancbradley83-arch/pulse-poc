@@ -122,6 +122,37 @@ async def rerun(pulse_client: PulseClient) -> ActionResult:
         return False, f"Pulse unreachable: {exc}"
 
 
+async def refresh_catalogue(pulse_client: PulseClient) -> ActionResult:
+    """
+    POST /admin/catalogue-refresh on Pulse. Forces a fresh Rogue catalogue
+    load — lighter than /redeploy for stale-catalogue cases (no rebuild,
+    no cold start, no Anthropic spend). Synchronous on Pulse side
+    (Rogue fetch typically completes in a few seconds).
+    """
+    try:
+        result = await pulse_client.post_admin_catalogue_refresh()
+        ok = result.get("ok", False)
+        if ok:
+            fixtures = result.get("fixtures", "?")
+            elapsed = result.get("elapsed_seconds", "?")
+            return (
+                True,
+                f"catalogue refreshed — {fixtures} fixtures loaded in {elapsed}s",
+            )
+        return False, f"Pulse returned ok=false: {result}"
+    except PulseError as exc:
+        logger.error("refresh_catalogue: failed: %s", exc)
+        # Surface the 503 (Rogue empty) case explicitly — the user should
+        # know the prior snapshot is still in place rather than guessing.
+        msg = str(exc)
+        if "503" in msg:
+            return False, (
+                "catalogue-refresh: Rogue returned no usable fixtures — "
+                "kept prior snapshot. Try again later or check Rogue status."
+            )
+        return False, f"Pulse unreachable: {exc}"
+
+
 async def flag(
     railway_client: RailwayClient,
     name: str,

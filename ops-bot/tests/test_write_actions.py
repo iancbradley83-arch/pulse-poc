@@ -138,6 +138,50 @@ async def test_rerun_ok_false_returns_false():
 
 
 # ---------------------------------------------------------------------------
+# refresh_catalogue
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_refresh_catalogue_success_includes_count_and_timing():
+    pc = MagicMock()
+    pc.post_admin_catalogue_refresh = AsyncMock(return_value={
+        "ok": True, "fixtures": 12, "elapsed_seconds": 2.41,
+        "catalogue_loaded_at": 1777641000.0,
+    })
+
+    success, summary = await wa.refresh_catalogue(pc)
+
+    pc.post_admin_catalogue_refresh.assert_awaited_once()
+    assert success is True
+    assert "12" in summary
+    assert "2.41" in summary
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalogue_503_renders_kept_prior_message():
+    """Pulse 503 means Rogue returned no usable fixtures and the prior
+    snapshot is still in place; surface that distinctly to the user."""
+    pc = MagicMock()
+    pc.post_admin_catalogue_refresh = AsyncMock(side_effect=PulseError("http 503"))
+
+    success, summary = await wa.refresh_catalogue(pc)
+
+    assert success is False
+    assert "kept prior snapshot" in summary.lower()
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalogue_other_pulse_error_returns_unreachable():
+    pc = MagicMock()
+    pc.post_admin_catalogue_refresh = AsyncMock(side_effect=PulseError("unreachable"))
+
+    success, summary = await wa.refresh_catalogue(pc)
+
+    assert success is False
+    assert "unreachable" in summary.lower()
+
+
+# ---------------------------------------------------------------------------
 # flag
 # ---------------------------------------------------------------------------
 

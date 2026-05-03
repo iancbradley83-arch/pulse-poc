@@ -1065,6 +1065,53 @@ async def _do_ondemand_rerun():
         _ondemand_rerun_inflight = False
 
 
+@app.post("/admin/catalogue-refresh", dependencies=[Depends(require_admin)])
+async def admin_catalogue_refresh():
+    """Force an immediate catalogue refresh.
+
+    Runs the same `_catalogue_refresh_once()` helper that the periodic
+    loop uses (PR #113), but on demand. Catalogue-only — no LLM, no
+    Anthropic spend. Useful as a phone-only fix path for stale-catalogue
+    cases (the 2026-05-03 incident pattern) — lighter than `/redeploy`
+    because there's no rebuild + cold start.
+
+    Returns 200 with timing + counts on success, 503 on Rogue failure
+    (prior catalogue stays in place), 400 in mock mode.
+
+    No external auth (POC convention). Cost: zero (Rogue catalogue
+    queries are free).
+    """
+    if PULSE_DATA_SOURCE != "rogue":
+        raise HTTPException(
+            400,
+            "catalogue-refresh only valid when PULSE_DATA_SOURCE=rogue",
+        )
+    if not ROGUE_CONFIG_JWT:
+        raise HTTPException(
+            400,
+            "catalogue-refresh disabled: ROGUE_CONFIG_JWT not set (mock mode)",
+        )
+    t0 = time.time()
+    try:
+        swapped = await _catalogue_refresh_once()
+    except Exception as exc:
+        logger.exception("[admin/catalogue-refresh] errored: %s", exc)
+        raise HTTPException(500, f"catalogue-refresh errored: {exc}")
+    elapsed = time.time() - t0
+    if not swapped:
+        raise HTTPException(
+            503,
+            "catalogue-refresh: Rogue returned no usable fixtures — "
+            "kept prior snapshot. Try again or check Rogue API status.",
+        )
+    return {
+        "ok": True,
+        "fixtures": len(simulator._games or {}),
+        "elapsed_seconds": round(elapsed, 3),
+        "catalogue_loaded_at": _catalogue_loaded_at,
+    }
+
+
 @app.post("/admin/rerun", dependencies=[Depends(require_admin)])
 async def admin_rerun():
     """On-demand candidate-engine rerun for demos. Fires-and-forgets so
