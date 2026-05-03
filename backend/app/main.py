@@ -480,6 +480,75 @@ class SecurityHeadersMiddleware:
 app.add_middleware(SecurityHeadersMiddleware)
 
 
+class MaintenanceMiddleware:
+    """Serve a friendly maintenance page when MAINTENANCE_MODE=true.
+
+    Lets us kill the API while still showing visitors a styled page
+    instead of a 502 or blank screen. Exempted paths (`/health`,
+    `/static/`, `/admin`) stay live so monitors and ops keep working;
+    the public routes (`/`, `/api/feed`, etc.) return a 503 with a
+    `Retry-After: 300` and the maintenance HTML.
+
+    Pure ASGI for the same reason as `SecurityHeadersMiddleware` —
+    BaseHTTPMiddleware adds a ~1s latency floor under SSE load.
+
+    Mirror of polysportsbook PR #5; adapted for Pulse's static-dir
+    layout (`backend/app/static/maintenance.html`) and admin-routes
+    exemption.
+    """
+
+    _EXEMPT_PREFIXES: tuple[bytes, ...] = (
+        b"/health",
+        b"/static/",
+        b"/admin",     # ops paths must stay reachable during maintenance
+    )
+
+    def __init__(self, app):
+        self.app = app
+        # Read once at startup — Railway env flips need a redeploy to
+        # take effect, same as the other middleware in this file.
+        self._enabled = os.environ.get("MAINTENANCE_MODE", "false").lower() == "true"
+        # Path to the page; resolved once.
+        self._page_path = Path(__file__).parent / "static" / "maintenance.html"
+        if self._enabled:
+            logger.info(
+                "[PULSE] MAINTENANCE_MODE=true — public routes will 503"
+            )
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not self._enabled:
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "").encode("latin-1")
+        if any(path == p or path.startswith(p) for p in self._EXEMPT_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+        # Build the 503 response.
+        try:
+            body = self._page_path.read_bytes()
+            content_type = b"text/html; charset=utf-8"
+        except OSError:
+            body = b"<h1>Under maintenance</h1><p>Back shortly.</p>"
+            content_type = b"text/html; charset=utf-8"
+        await send({
+            "type": "http.response.start",
+            "status": 503,
+            "headers": [
+                (b"content-type", content_type),
+                (b"cache-control", b"no-cache, no-store, must-revalidate"),
+                (b"retry-after", b"300"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": body,
+        })
+
+
+app.add_middleware(MaintenanceMiddleware)
+
+
 class AnonCookieMiddleware:
     """Ensure every HTTP response carries a stable `pulse_anon_id` cookie.
 
