@@ -433,9 +433,152 @@ class ComboBuilder:
         self,
         catalog: MarketCatalog,
         rogue_client: Optional[RogueClient],
+        *,
+        event_payload_by_game_id: Optional[dict[str, dict[str, Any]]] = None,
+        narrative_telemetry: Optional[Any] = None,
     ):
         self._catalog = catalog
         self._rogue = rogue_client
+        # Per-fixture raw event payload (Rogue includeMarkets="all"
+        # response) keyed by game.id. When supplied, `build_narrative()`
+        # uses it as the market pool for the composer; without it the
+        # composer falls back to the catalog's normalized markets which
+        # don't carry per-selection IsBetBuilderAvailable.
+        self._event_payload_by_game_id = event_payload_by_game_id or {}
+        self._narrative_telemetry = narrative_telemetry
+
+    async def build_narrative(
+        self,
+        news: NewsItem,
+        game: Game,
+        *,
+        publish: bool = False,
+    ) -> list[CandidateCard]:
+        """Phase 3.5 narrative composer path — runs alongside `build()`.
+
+        When `PULSE_NARRATIVE_COMPOSER_ENABLED=true` and the news matches
+        an archetype, the composer builds a thesis from the news, runs
+        `compose_candidates()` against the per-fixture market pool, and
+        produces:
+          * 1 BB-shape CandidateCard from the top-scoring BB-eligible
+            combination, OR no BB if the archetype produced none
+          * Up to 2 single-shape CandidateCards for high-affinity
+            subject-player legs that aren't BB-eligible
+
+        Telemetry is captured to `narrative_telemetry` regardless of
+        `publish`. When `publish=False` (default — shadow mode) the
+        method returns an empty list and the caller publishes nothing
+        from the composer; the captured telemetry still flows.
+
+        Returns the list of CandidateCards (empty if nothing matches,
+        nothing publishable, or `publish=False`).
+        """
+        # Lazy imports to keep the optional path off the import graph
+        # for callers that never enable the composer.
+        from app.engine.combination_composer import (
+            BET_SHAPE_BET_BUILDER,
+            BET_SHAPE_SINGLE,
+            compose_candidates,
+        )
+        from app.engine.narrative_thesis import build_thesis
+
+        thesis = build_thesis(news)
+        if thesis.is_uncertain or thesis.archetype is None:
+            logger.info(
+                "[narrative_uncertain] news=%s confidence=%.2f "
+                "matched_keywords=%s — no archetype, no composer output",
+                news.id, thesis.confidence,
+                list(thesis.matched_keywords),
+            )
+            return []
+
+        # Telemetry — capture every thesis decision, even before any
+        # combo decision. Thesis IDs link compositions back.
+        thesis_id: Optional[int] = None
+        if self._narrative_telemetry is not None:
+            thesis_id = await self._narrative_telemetry.save_thesis(thesis)
+
+        # Pull the per-fixture event payload (composer's market pool).
+        # Without it the composer can't reason over BB-eligibility — log
+        # and return so it's visible.
+        event_payload = self._event_payload_by_game_id.get(game.id)
+        if not event_payload:
+            logger.info(
+                "[narrative_composer] news=%s game=%s — no event_payload "
+                "for fixture; composer would need raw market data with "
+                "IsBetBuilderAvailable. Skipping.",
+                news.id, game.id,
+            )
+            return []
+
+        market_pool = event_payload.get("Markets") or []
+        # Resolve home / away ids for signal placeholder filling.
+        participants = event_payload.get("Participants") or []
+        home_id = (participants[0] or {}).get("_id") if participants else None
+        away_id = (participants[1] or {}).get("_id") if len(participants) > 1 else None
+
+        combos = compose_candidates(
+            thesis, market_pool,
+            home_team_id=home_id, away_team_id=away_id,
+            target_legs=4, min_legs=2,
+            require_bb_eligibility=True,
+            emit_singles_for_subject_misses=True,
+        )
+
+        # Telemetry: persist every composition (BB + singles), regardless
+        # of publish flag, so we can compare shadow runs to live runs.
+        if combos and self._narrative_telemetry is not None and thesis_id is not None:
+            for combo in combos:
+                await self._narrative_telemetry.save_composition(
+                    thesis_id=thesis_id,
+                    candidate_card_id=None,  # set when publishing path lands
+                    combination=combo,
+                )
+
+        # Log composition summary
+        bb_count = sum(1 for c in combos if c.bet_shape == BET_SHAPE_BET_BUILDER)
+        single_count = sum(1 for c in combos if c.bet_shape == BET_SHAPE_SINGLE)
+        logger.info(
+            "[narrative_composer] news=%s game=%s archetype=%s "
+            "subject=%s combos=%d (bb=%d singles=%d) publish=%s",
+            news.id, game.id, thesis.archetype.key,
+            thesis.subject_player_name or thesis.subject_team_id or "match",
+            len(combos), bb_count, single_count, publish,
+        )
+
+        if not publish:
+            return []
+
+        # PUBLISH path — convert Combinations to CandidateCards.
+        # Today's shape: emit one CandidateCard per Combination, tagged
+        # with bet_type=BET_BUILDER for bb_shape, BET_TYPE_SINGLE for
+        # singles. selection_ids drive deep-link minting downstream.
+        cards: list[CandidateCard] = []
+        for combo in combos:
+            sel_ids = [
+                l.selection_id for l in combo.legs
+                if l.selection_id
+            ]
+            if not sel_ids:
+                # Without selection_ids we can't deep-link; skip.
+                continue
+            bet_type = (
+                BetType.BET_BUILDER
+                if combo.bet_shape == BET_SHAPE_BET_BUILDER and len(combo.legs) > 1
+                else BetType.SINGLE
+            )
+            card = CandidateCard(
+                news_item_id=news.id,
+                hook_type=news.hook_type,
+                bet_type=bet_type,
+                game_id=game.id,
+                selection_ids=sel_ids,
+                market_ids=[l.market_id for l in combo.legs],
+                status=CandidateStatus.DRAFT,
+                reason=combo.rationale,
+            )
+            cards.append(card)
+        return cards
 
     async def build(self, news: NewsItem, game: Game) -> Optional[CandidateCard]:
         """Build a Bet Builder candidate from a news item + its resolved fixture."""

@@ -20,7 +20,26 @@ import logging
 from typing import Any, Optional, Protocol
 
 from app.engine.candidate_builder import CandidateBuilder
+import os
+
 from app.engine.combo_builder import ComboBuilder
+
+
+def _narrative_composer_enabled() -> bool:
+    """Read kill switch env var. Default off so production behaviour
+    is unchanged until explicitly flipped on."""
+    return os.getenv("PULSE_NARRATIVE_COMPOSER_ENABLED", "false").lower() in (
+        "1", "true", "yes",
+    )
+
+
+def _narrative_composer_publish() -> bool:
+    """When ENABLED is on, this controls whether composer cards flow
+    into the publishing pool (`true`) or stay shadow-only (`false`,
+    default — capture telemetry, don't publish)."""
+    return os.getenv("PULSE_NARRATIVE_COMPOSER_PUBLISH", "false").lower() in (
+        "1", "true", "yes",
+    )
 from app.engine.news_entity_resolver import NewsEntityResolver
 from app.engine.news_scorer import NewsScorer, PolicyLayer
 from app.models.news import CandidateCard, NewsItem
@@ -343,6 +362,29 @@ class CandidateEngine:
                         bb = await self._combo_builder.build(item, fixture)
                         if bb is not None:
                             drafts.append(bb)
+
+                        # Phase 3.5 narrative composer (PR #124) — runs
+                        # alongside themes when enabled. SHADOW=true
+                        # (default) only logs + telemetry-writes; does
+                        # not contribute cards to publishing. SHADOW=false
+                        # publishes alongside themed cards for A/B.
+                        if (
+                            self._combo_builder is not None
+                            and _narrative_composer_enabled()
+                        ):
+                            publish_mode = _narrative_composer_publish()
+                            try:
+                                narrative_cards = (
+                                    await self._combo_builder.build_narrative(
+                                        item, fixture, publish=publish_mode,
+                                    )
+                                )
+                                if publish_mode and narrative_cards:
+                                    drafts.extend(narrative_cards)
+                            except Exception:
+                                logger.exception(
+                                    "[narrative_composer] build_narrative failed (non-fatal)"
+                                )
 
             # Score this fixture's drafts now (needs in-memory news items).
             for c in drafts:

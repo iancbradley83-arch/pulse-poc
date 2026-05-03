@@ -32,7 +32,11 @@ from app.engine.market_meta import (
     CATALOGUE_BY_KEY,
     lookup_by_market_name,
 )
-from app.engine.combination_composer import compose_candidates
+from app.engine.combination_composer import (
+    compose_candidates,
+    pick_line_for_match_market,
+    pick_line_for_player_selections,
+)
 from app.models.news import HookType, NewsItem
 
 
@@ -553,3 +557,75 @@ def test_composer_rejects_combos_with_signal_conflict():
             for i, a in enumerate(all_sigs):
                 for b in all_sigs[i+1:]:
                     assert not narrative_signals.conflicts(a, b)
+
+
+
+# ── line picker ──────────────────────────────────────────────────────
+
+
+def _player_sel(name, decimal_odds, bb=False):
+    safe_id = name.replace(" ", "_")
+    return {
+        "Id": f"sel-{safe_id}",
+        "Name": name,
+        "DisplayOdds": {"Decimal": str(decimal_odds)},
+        "IsBetBuilderAvailable": bb,
+    }
+
+
+def test_pick_line_for_player_selections_real_casemiro_fouls():
+    """The MUN vs LIV live data: 5 lines for Casemiro Over Fouls.
+    Default band (1.7, 4.0) → pick the selection closest to the band
+    midpoint (2.85). Over 2.5 @ 3.49 wins — a card-worthy line that's
+    narratively stronger than Over 0.5 (a lock) or Over 4.5 (lottery).
+    """
+    sels = [
+        _player_sel("Casemiro Over 0.5", 1.18),
+        _player_sel("Casemiro Over 1.5", 1.84),
+        _player_sel("Casemiro Over 2.5", 3.49),
+        _player_sel("Casemiro Over 3.5", 8.00),
+        _player_sel("Casemiro Over 4.5", 19.00),
+    ]
+    pick = pick_line_for_player_selections(sels, "Casemiro", direction="over")
+    assert pick is not None
+    # Over 2.5 @ 3.49 is the closest to band midpoint 2.85 (in-band
+    # bonus halves distance); rejects 0.5 (too short) + 4.5 (lottery).
+    assert "Over 2.5" in pick["Name"]
+
+
+def test_pick_line_filters_to_target_player():
+    sels = [
+        _player_sel("Bruno Fernandes Over 1.5", 1.85),
+        _player_sel("Casemiro Over 1.5", 2.20),
+    ]
+    pick = pick_line_for_player_selections(sels, "Casemiro", direction="over")
+    assert "Casemiro" in pick["Name"]
+
+
+def test_pick_line_returns_none_when_no_match():
+    sels = [_player_sel("Bruno Fernandes Over 1.5", 1.85)]
+    pick = pick_line_for_player_selections(sels, "Casemiro", direction="over")
+    assert pick is None
+
+
+def test_pick_line_for_match_market_picks_balanced_book_line():
+    sels = [
+        {"Id": "s1", "Name": "Over",
+         "DisplayOdds": {"Decimal": "1.85"}},
+        {"Id": "s2", "Name": "Under",
+         "DisplayOdds": {"Decimal": "1.95"}},
+    ]
+    pick = pick_line_for_match_market(sels, direction="over")
+    assert pick["Id"] == "s1"
+
+
+def test_pick_line_band_clamps_extremes():
+    """A 1.05 selection (heavy favourite) and a 12.0 selection
+    (longshot) — picker prefers the in-band one if any."""
+    sels = [
+        _player_sel("Casemiro Over 0.5", 1.05),
+        _player_sel("Casemiro Over 2.5", 3.50),
+    ]
+    pick = pick_line_for_player_selections(sels, "Casemiro", direction="over")
+    assert "Over 2.5" in pick["Name"]
+
