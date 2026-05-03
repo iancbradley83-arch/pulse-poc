@@ -377,9 +377,26 @@ Worked example: "Casemiro one yellow from suspension; Liverpool will target him"
 ### What this PR is NOT doing
 
 - Not flipping `PULSE_NARRATIVE_COMPOSER_ENABLED` on in production
-- Not wiring the composer into `combo_builder` (that's PR #122 — alongside today's hand-coded themes for A/B comparison)
+- Not wiring the composer into `combo_builder` (that's a later PR — alongside today's hand-coded themes for A/B comparison)
 - Not calling Haiku (LLM second opinion hook is dormant)
 - Not capturing engagement events (depends on AT live + click attribution)
+
+### Appendix — BB-eligibility filter + singles split (PR #122)
+
+Live MUN vs LIV data exposed a real production constraint: **only 1 of 4 legs in the composer's narratively-best combo was BB-eligible per Rogue's `IsBetBuilderAvailable` flag.** That combo can't ship as a single Bet Builder card — Rogue's `/v1/sportsdata/betbuilder/match` would reject it.
+
+Composer fix:
+
+- `compose_candidates(..., require_bb_eligibility=True)` (default `True`) — multi-leg combos are filtered to BB-eligible legs only; what we propose is what Rogue can actually price.
+- BB-eligibility is read **per-selection at compose time** from the live `IsBetBuilderAvailable` flag — not from static metadata. As Rogue extends BB-eligibility per market type over time, the composer inherits the new surface automatically.
+- `compose_candidates(..., emit_singles_for_subject_misses=True)` (default `True`) — when a high-affinity subject-player leg ISN'T BB-eligible (Casemiro To Be Booked @ 2.73, Casemiro Over 3.5 Fouls @ 8.00), emit it as a `bet_shape="single"` Combination so the narrative still surfaces — split into its own card downstream rather than silently dropped. Capped at 2 singles per news item to keep the feed clean.
+- `narrative_compositions.bet_shape` column captures `bet_builder` vs `single` so the learning loop can later measure which shape drives engagement per archetype.
+
+Casemiro story under the new pipeline:
+
+- **1 Bet Builder card** — Cards FT Over 4.5 + Cards 1H Over + Total Match Fouls Over + United Total Cards Over (every leg BB-eligible per the live data)
+- **2 single cards** — Casemiro To Be Booked, Casemiro Over 3.5 Fouls (the player-specific narrative shots, priced as singles)
+- Card narrative on each ties back to the same thesis ("Casemiro on the brink, Liverpool will target him")
 
 ---
 

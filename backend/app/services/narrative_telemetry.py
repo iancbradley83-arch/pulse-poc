@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS narrative_compositions (
     thesis_id                   INTEGER NOT NULL,
     candidate_card_id           TEXT,
     captured_at                 REAL NOT NULL,
-    legs_json                   TEXT NOT NULL,   -- list of {market_meta_key, direction, market_id, selection_id, selection_name}
+    bet_shape                   TEXT NOT NULL DEFAULT 'bet_builder',  -- 'bet_builder' | 'single'
+    legs_json                   TEXT NOT NULL,
     signal_overlap_count        INTEGER NOT NULL,
     archetype_affinity_total    REAL NOT NULL,
     conflict_penalty            INTEGER NOT NULL,
@@ -83,6 +84,9 @@ CREATE TABLE IF NOT EXISTS narrative_compositions (
     score                       REAL NOT NULL,
     FOREIGN KEY (thesis_id) REFERENCES narrative_theses(id)
 );
+
+CREATE INDEX IF NOT EXISTS narrative_compositions_bet_shape_idx
+    ON narrative_compositions (bet_shape);
 
 CREATE INDEX IF NOT EXISTS narrative_compositions_thesis_id_idx
     ON narrative_compositions (thesis_id);
@@ -156,6 +160,7 @@ class NarrativeTelemetry:
                     "selection_id": l.selection_id,
                     "selection_name": l.selection_name,
                     "emitted_signals": list(l.emitted_signals),
+                    "is_bb_eligible": getattr(l, "is_bb_eligible", True),
                 }
                 for l in combination.legs
             ]
@@ -163,12 +168,13 @@ class NarrativeTelemetry:
                 await db.execute(
                     """INSERT INTO narrative_compositions (
                         thesis_id, candidate_card_id, captured_at,
-                        legs_json, signal_overlap_count,
+                        bet_shape, legs_json, signal_overlap_count,
                         archetype_affinity_total, conflict_penalty,
                         orphan_legs, score
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         thesis_id, candidate_card_id, time.time(),
+                        getattr(combination, "bet_shape", "bet_builder"),
                         json.dumps(legs_payload),
                         int(combination.signal_overlap_count),
                         float(combination.archetype_affinity_total),

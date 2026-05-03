@@ -63,9 +63,19 @@ from app.engine.narrative_thesis import NarrativeThesis
 # ── Data classes ──────────────────────────────────────────────────────
 
 
+BET_SHAPE_SINGLE = "single"
+BET_SHAPE_BET_BUILDER = "bet_builder"
+
+
 @dataclass(frozen=True)
 class Leg:
-    """One candidate leg in a combination."""
+    """One candidate leg in a combination.
+
+    `is_bb_eligible` is set from the live Rogue `IsBetBuilderAvailable`
+    flag at compose time — it's RUNTIME data per fixture per market,
+    not a static metadata fact, because Rogue extends BB-eligibility
+    over time per market type.
+    """
     market_id: str           # Rogue market _id
     market_name: str
     market_meta_key: str     # MarketMeta.key — None-safe via empty string
@@ -74,11 +84,24 @@ class Leg:
     selection_name: Optional[str] = None
     emitted_signals: tuple[str, ...] = ()
     archetype_affinity_weight: float = 0.0
+    is_bb_eligible: bool = True
 
 
 @dataclass(frozen=True)
 class Combination:
-    """A ranked combination of legs proposed by the composer."""
+    """A ranked combination of legs proposed by the composer.
+
+    `bet_shape`:
+      * `BET_SHAPE_BET_BUILDER` — multi-leg combo, every leg's
+        selection is BB-eligible per Rogue's live
+        `IsBetBuilderAvailable` flag → can be priced via
+        `/v1/sportsdata/betbuilder/match` for correlated odds.
+      * `BET_SHAPE_SINGLE` — single-leg "subject hero" card. Used when
+        the composer can't fit a high-affinity subject leg into a BB
+        (the leg isn't BB-eligible) but the leg has strong narrative
+        value on its own. Priced as a single via the underlying
+        market selection.
+    """
     legs: tuple[Leg, ...]
     score: float
     signal_overlap_count: int
@@ -86,6 +109,7 @@ class Combination:
     conflict_penalty: int
     orphan_legs: int
     rationale: str   # human-readable why-this-combo
+    bet_shape: str = BET_SHAPE_BET_BUILDER
 
 
 # ── Direction → emitted-signal resolution ─────────────────────────────
@@ -236,6 +260,24 @@ def _orphan_count(legs: list[Leg]) -> int:
 # ── Candidate-leg construction from a market pool ─────────────────────
 
 
+def _market_has_bb_eligible_in_direction(
+    market: dict[str, Any],
+    direction: str,
+) -> bool:
+    """For non-player markets: does the market have at least one
+    BB-eligible selection that corresponds to `direction`?
+
+    Conservative: when we can't tell which selection corresponds to
+    which direction (e.g. correct score), require ANY selection to be
+    BB-eligible. The composer's bet-shape filter is the safety net.
+    """
+    sels = market.get("Selections") or []
+    for sel in sels:
+        if sel.get("IsBetBuilderAvailable"):
+            return True
+    return False
+
+
 def _candidate_legs_for_market(
     market: dict[str, Any],
     meta: MarketMeta,
@@ -245,30 +287,42 @@ def _candidate_legs_for_market(
     away_team_id: Optional[str] = None,
 ) -> list[Leg]:
     """Build the candidate legs (one per relevant direction) for a single
-    Rogue market under this thesis."""
+    Rogue market under this thesis.
+
+    Each leg carries `is_bb_eligible` derived from the live Rogue
+    `IsBetBuilderAvailable` flag — composer's bet-shape filter uses
+    this to keep BB combos shippable.
+    """
     out: list[Leg] = []
     affinity = meta.archetype_affinities.get(
         thesis.archetype.key if thesis.archetype else "", (None, 0.0),
     )
     aff_dir, aff_weight = affinity
 
-    # For player markets, the SUBJECT must be the player (subject_centric)
-    # OR for opp-archetypes, the player must NOT be the subject (no
-    # composer support yet — we just pull the first BB-eligible
-    # selection that matches the subject_player_name).
+    # For player markets, find the SUBJECT player's selection and read
+    # its individual BB-eligibility (player markets vary per-selection
+    # — Player To Be Booked is 0/51 BB-eligible; Player Over Shots is
+    # 190/190).
     selections = market.get("Selections") or []
     sel_id: Optional[str] = None
     sel_name: Optional[str] = None
+    sel_is_bb_eligible: bool = False
     if meta.entity_scope == ENTITY_PLAYER and thesis.subject_player_name:
-        # Try to find the subject player among selections
         for sel in selections:
             sname = (sel.get("Name") or sel.get("BetslipLine") or "").strip()
             if thesis.subject_player_name.lower() in sname.lower():
                 sel_id = sel.get("Id") or sel.get("_id")
                 sel_name = sname
+                sel_is_bb_eligible = bool(sel.get("IsBetBuilderAvailable"))
                 break
         if sel_id is None:
             return []  # subject player not present — drop this market
+    else:
+        # Non-player markets: BB-eligibility is per-direction in
+        # principle, per-selection in practice. Conservative check.
+        sel_is_bb_eligible = _market_has_bb_eligible_in_direction(
+            market, direction="any",
+        )
 
     for direction in meta.emits_signals_by_direction.keys():
         sigs = _resolve_signals(
@@ -290,6 +344,7 @@ def _candidate_legs_for_market(
             selection_name=sel_name,
             emitted_signals=sigs,
             archetype_affinity_weight=(aff_weight if aff_dir else 0.0),
+            is_bb_eligible=sel_is_bb_eligible,
         ))
     return out
 
@@ -306,24 +361,28 @@ def compose_candidates(
     target_legs: int = 3,
     min_legs: int = 2,
     max_combinations: int = 5,
+    require_bb_eligibility: bool = True,
+    emit_singles_for_subject_misses: bool = True,
 ) -> list[Combination]:
     """Score and rank candidate combinations.
 
-    Returns up to `max_combinations`. Each combination has between
-    `min_legs` and `target_legs` legs. The composer also yields
-    single-leg "subject hero" combinations when the archetype is
-    subject-centric (these become singles cards downstream).
+    `require_bb_eligibility` (default `True`):
+        For multi-leg combos, only legs whose underlying selection has
+        Rogue's `IsBetBuilderAvailable=True` flag are eligible. Combos
+        containing any non-BB-eligible leg are dropped (they couldn't
+        be priced via `/v1/sportsdata/betbuilder/match`). Set `False`
+        to compose without this constraint (e.g. for system bets or
+        observability runs).
 
-    Today's heuristic walk:
-      1. Build all candidate legs from the market pool that pass
-         per-leg metadata + thesis filters.
-      2. Score each leg by signals + affinity in isolation; keep top-N
-         per market_meta key.
-      3. Greedy-extend combos by adding the leg with the largest
-         marginal signal overlap, until target_legs reached or no
-         improving leg remains.
-      4. Apply bet-shape rule + conflict count + orphan count.
-      5. Return top-K by score.
+    `emit_singles_for_subject_misses` (default `True`):
+        When the thesis is subject-centric (player) and a high-affinity
+        subject-player leg ISN'T BB-eligible, emit it as a `single`
+        Combination so the narrative still surfaces — just split into
+        its own card downstream rather than getting silently dropped.
+
+    Returns combinations of `bet_shape = bet_builder` (multi-leg, all
+    BB-eligible) and `bet_shape = single` (1-leg, non-BB-eligible
+    subject hero). Caller consumes both.
     """
     if thesis.archetype is None or thesis.is_uncertain or not market_pool:
         return []
@@ -353,7 +412,45 @@ def compose_candidates(
         overlap = len(set(leg.emitted_signals) & thesis_sigs)
         return overlap * 1.0 + leg.archetype_affinity_weight * 1.5
 
-    scored = sorted(all_candidates, key=lambda l: -leg_solo_score(l))
+    # ── 2a. Carve off non-BB-eligible high-affinity subject legs to be
+    # singles candidates BEFORE BB-shape filtering. ──
+    singles_combos: list[Combination] = []
+    if (require_bb_eligibility and emit_singles_for_subject_misses
+            and thesis.subject_type == SUBJECT_PLAYER
+            and thesis.subject_player_name):
+        # Pick the best 2 non-BB-eligible subject legs (cap to avoid
+        # spamming the feed with one news item).
+        subject_singles_pool = [
+            l for l in all_candidates
+            if not l.is_bb_eligible
+            and l.selection_name
+            and thesis.subject_player_name.lower() in l.selection_name.lower()
+            and l.archetype_affinity_weight >= 0.7
+        ]
+        subject_singles_pool.sort(key=lambda l: -leg_solo_score(l))
+        for l in subject_singles_pool[:2]:
+            singles_combos.append(Combination(
+                legs=(l,),
+                score=round(leg_solo_score(l), 2),
+                signal_overlap_count=len(set(l.emitted_signals) & thesis_sigs),
+                archetype_affinity_total=round(l.archetype_affinity_weight, 2),
+                conflict_penalty=0,
+                orphan_legs=0,
+                rationale=(
+                    f"single — archetype={thesis.archetype.key} "
+                    f"subject={thesis.subject_player_name} "
+                    f"market={l.market_meta_key} "
+                    f"(non-BB-eligible — surfaced as single card)"
+                ),
+                bet_shape=BET_SHAPE_SINGLE,
+            ))
+
+    # ── 2b. For BB combos, restrict to BB-eligible legs only. ──
+    if require_bb_eligibility:
+        bb_pool = [l for l in all_candidates if l.is_bb_eligible]
+    else:
+        bb_pool = list(all_candidates)
+    scored = sorted(bb_pool, key=lambda l: -leg_solo_score(l))
 
     # 3. Greedy: build combos seeded from each top leg
     combos: list[Combination] = []
@@ -415,10 +512,11 @@ def compose_candidates(
         )
 
         rationale = (
-            f"archetype={thesis.archetype.key} "
+            f"bet_builder — archetype={thesis.archetype.key} "
             f"signals_matched={signal_overlap}/{len(thesis_sigs)} "
             f"affinity={affinity_total:.2f} "
-            f"conflicts={conflicts} orphans={orphans}"
+            f"conflicts={conflicts} orphans={orphans} "
+            f"bb_eligible={'all' if require_bb_eligibility else 'mixed'}"
         )
         combos.append(Combination(
             legs=tuple(combo),
@@ -428,7 +526,9 @@ def compose_candidates(
             conflict_penalty=conflicts,
             orphan_legs=orphans,
             rationale=rationale,
+            bet_shape=BET_SHAPE_BET_BUILDER,
         ))
 
     combos.sort(key=lambda c: -c.score)
-    return combos[:max_combinations]
+    # Cap BB combos at max_combinations; singles ride alongside (capped at 2 above).
+    return combos[:max_combinations] + singles_combos
