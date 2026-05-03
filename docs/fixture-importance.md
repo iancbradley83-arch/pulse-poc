@@ -398,6 +398,21 @@ Casemiro story under the new pipeline:
 - **2 single cards** — Casemiro To Be Booked, Casemiro Over 3.5 Fouls (the player-specific narrative shots, priced as singles)
 - Card narrative on each ties back to the same thesis ("Casemiro on the brink, Liverpool will target him")
 
+### Appendix — Composer wired into the engine + line picker (PR #124)
+
+Three changes that move the composer from "pure functions sitting in a module" to "running on every cycle when the kill switch is flipped, with line picking and full plumbing":
+
+**(1) Composer wired into `combo_builder.build_narrative()`** — runs alongside the existing `build()` (themed) path inside the `CandidateEngine.run_once` per-news-item loop. Two env vars stage the rollout:
+
+  * `PULSE_NARRATIVE_COMPOSER_ENABLED` (default `false`) — master switch. When `false`, no composer code runs and production behaviour is identical to today.
+  * `PULSE_NARRATIVE_COMPOSER_PUBLISH` (default `false`) — when ENABLED is `true` and PUBLISH is `false`, the composer runs in **shadow mode**: emits `[narrative_composer]` log lines, persists thesis + compositions to `narrative_telemetry`, but **does not** add cards to the publishing pool. When PUBLISH flips `true`, composer cards flow alongside themed cards for A/B comparison.
+
+**(2) Per-fixture event payload plumbed end-to-end** — `catalogue_loader.fetch_soccer_snapshot` already returns the raw `includeMarkets="all"` payload as `raw_detailed`. Both `_load_rogue_prematch()` and `_catalogue_refresh_once()` now stash it in `_event_payload_by_game_id` (a per-fixture dict keyed by Rogue event id). `ComboBuilder` reads it at construction time so `build_narrative()` has access to live `IsBetBuilderAvailable` flags + per-selection lines.
+
+**(3) Line-value picker** — `combination_composer.pick_line_for_player_selections()` and `pick_line_for_match_market()`. Real example: Casemiro Over Fouls market has 5 lines (0.5 @ 1.18, 1.5 @ 1.84, 2.5 @ 3.49, 3.5 @ 8.00, 4.5 @ 19.00). Default band `(1.7, 4.0)` picks Over 2.5 @ 3.49 — narratively right, neither too short nor lottery. The composer now picks the line, not just the direction.
+
+**Telemetry lazy-init.** `narrative_telemetry.NarrativeTelemetry` self-initialises its tables on first save call, so `_get_narrative_telemetry()` in `main.py` doesn't need to await an explicit `init()` at startup — keeps the composer fully off-path until the kill switch flips.
+
 ---
 
 ## Cross-references

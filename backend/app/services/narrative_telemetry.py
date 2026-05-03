@@ -101,11 +101,23 @@ class NarrativeTelemetry:
 
     def __init__(self, db_path: str):
         self._db_path = db_path
+        self._initialised = False
 
     async def init(self) -> None:
         async with aiosqlite.connect(self._db_path) as db:
             await db.executescript(_SCHEMA)
             await db.commit()
+        self._initialised = True
+
+    async def _ensure_init(self) -> None:
+        """Lazy-init guard so callers never need to call `init()`
+        explicitly. Idempotent because schema uses CREATE IF NOT EXISTS."""
+        if self._initialised:
+            return
+        try:
+            await self.init()
+        except Exception:
+            logger.exception("[narrative_telemetry] lazy init failed (non-fatal)")
 
     async def save_thesis(self, thesis: Any) -> Optional[int]:
         """Persist a NarrativeThesis. Returns the inserted id (or None on
@@ -115,6 +127,7 @@ class NarrativeTelemetry:
         Any to avoid an import cycle.
         """
         try:
+            await self._ensure_init()
             arch_key = thesis.archetype.key if thesis.archetype else None
             async with aiosqlite.connect(self._db_path) as db:
                 cursor = await db.execute(
@@ -151,6 +164,7 @@ class NarrativeTelemetry:
                                 combination: Any) -> None:
         """Persist a Combination produced by the composer."""
         try:
+            await self._ensure_init()
             legs_payload = [
                 {
                     "market_meta_key": l.market_meta_key,

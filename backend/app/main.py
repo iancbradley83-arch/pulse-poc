@@ -1580,7 +1580,7 @@ async def _load_rogue_prematch(
         per_second=ROGUE_RATE_LIMIT_PER_SECOND,
     )
     try:
-        games, markets, _ = await fetch_soccer_snapshot(
+        games, markets, raw_detailed = await fetch_soccer_snapshot(
             client,
             sport_id=ROGUE_SOCCER_SPORT_ID,
             days_ahead=ROGUE_CATALOGUE_DAYS_AHEAD,
@@ -1594,8 +1594,17 @@ async def _load_rogue_prematch(
 
         catalog.replace_all(markets)
         simulator._games = {g.id: g for g in games}
-        global _catalogue_loaded_at
+        global _catalogue_loaded_at, _event_payload_by_game_id
         _catalogue_loaded_at = time.time()
+        # Phase 3.5 wiring: stash per-fixture raw event payload so the
+        # narrative composer (when enabled) can read per-selection
+        # IsBetBuilderAvailable + InMarketGroups + MarketGroupOrder.
+        # Used by ComboBuilder.build_narrative().
+        _event_payload_by_game_id = {
+            str(r.get("_id") or r.get("Id")): r
+            for r in (raw_detailed or [])
+            if r.get("_id") or r.get("Id")
+        }
 
         # Baseline pre-match cards (1X2 per fixture) — DISABLED by default
         # per principle 3 ("no-news fixtures get dropped"). Pulse is the
@@ -2040,6 +2049,41 @@ _engine_mutex = None  # initialised lazily (anyio/asyncio loop must exist)
 # ops-bot can detect staleness and pick the right alert-action button
 # (REDEPLOY / refresh-catalogue) when the feed empties out.
 _catalogue_loaded_at: float | None = None
+
+# Phase 3.5 narrative composer plumbing — per-fixture raw Rogue event
+# payload (includeMarkets="all"). Populated by `_load_rogue_prematch()`
+# and `_catalogue_refresh_once()`; read by ComboBuilder.build_narrative()
+# when PULSE_NARRATIVE_COMPOSER_ENABLED=true. Empty when in mock mode.
+_event_payload_by_game_id: dict[str, dict] = {}
+
+# Lazy singleton for narrative telemetry — only instantiated when the
+# composer kill switch is on, but the table init itself is idempotent.
+_narrative_telemetry_singleton: object | None = None
+
+
+def _get_narrative_telemetry():
+    """Return a NarrativeTelemetry instance (lazy, singleton).
+
+    Returns None when narrative composer is fully disabled OR when the
+    candidate-store DB path isn't available — keeps the cycle safe in
+    mock / cold-start states.
+    """
+    global _narrative_telemetry_singleton
+    if os.getenv("PULSE_NARRATIVE_COMPOSER_ENABLED", "false").lower() not in (
+        "1", "true", "yes",
+    ):
+        return None
+    if _narrative_telemetry_singleton is not None:
+        return _narrative_telemetry_singleton
+    try:
+        from app.services.narrative_telemetry import NarrativeTelemetry
+        from app.config import PULSE_CANDIDATE_DB_PATH
+        _narrative_telemetry_singleton = NarrativeTelemetry(PULSE_CANDIDATE_DB_PATH)
+        # init() is async; we'll lazily init on first save call.
+    except Exception:
+        logger.exception("[narrative_composer] telemetry init failed (non-fatal)")
+        _narrative_telemetry_singleton = None
+    return _narrative_telemetry_singleton
 
 
 async def _run_tier_once(tier: str) -> dict:
@@ -2489,7 +2533,7 @@ async def _catalogue_refresh_once() -> bool:
     )
     try:
         try:
-            games, markets, _ = await fetch_soccer_snapshot(
+            games, markets, raw_detailed = await fetch_soccer_snapshot(
                 client,
                 sport_id=ROGUE_SOCCER_SPORT_ID,
                 days_ahead=ROGUE_CATALOGUE_DAYS_AHEAD,
@@ -2508,15 +2552,18 @@ async def _catalogue_refresh_once() -> bool:
             "[catalogue-refresh] Rogue returned no usable fixtures — keeping prior snapshot"
         )
         return False
-    # Atomic-ish swap: catalog + simulator._games together. Tier
-    # loops read both; if they diverge mid-cycle the engine gets
-    # markets for fixtures that aren't in the games dict (or vice
-    # versa). Python's GIL gives atomicity for the dict assignment;
-    # `catalog.replace_all` is similarly internally atomic.
+    # Atomic-ish swap: catalog + simulator._games + event payload map
+    # together. Tier loops read all three; mid-cycle divergence would
+    # leave the composer reading stale BB-eligibility flags.
     catalog.replace_all(markets)
     simulator._games = {g.id: g for g in games}
-    global _catalogue_loaded_at
+    global _catalogue_loaded_at, _event_payload_by_game_id
     _catalogue_loaded_at = time.time()
+    _event_payload_by_game_id = {
+        str(r.get("_id") or r.get("Id")): r
+        for r in (raw_detailed or [])
+        if r.get("_id") or r.get("Id")
+    }
     logger.info(
         "[catalogue-refresh] swapped — fixtures=%d, markets=%d",
         len(games), len(markets),
@@ -2694,7 +2741,14 @@ async def _run_candidate_engine(
     # Bet Builder generator — only active when we have a Rogue client.
     # The same client provides real correlated BB pricing via the Betting
     # API (calculate_bets). Mock mode (no Rogue client) skips BBs entirely.
-    combo_builder = ComboBuilder(catalog, rogue_client) if rogue_client is not None else None
+    combo_builder = (
+        ComboBuilder(
+            catalog, rogue_client,
+            event_payload_by_game_id=_event_payload_by_game_id,
+            narrative_telemetry=_get_narrative_telemetry(),
+        )
+        if rogue_client is not None else None
+    )
 
     # Phase 2b: gradient routing config — read once per engine run so a
     # Railway env flip takes effect on the next cycle without redeploy.

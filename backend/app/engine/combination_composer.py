@@ -278,6 +278,127 @@ def _market_has_bb_eligible_in_direction(
     return False
 
 
+def _decimal_odds(sel: dict[str, Any]) -> Optional[float]:
+    """Pull decimal odds from a Rogue selection, defensively.
+
+    Rogue's DisplayOdds is a dict like ``{"Decimal": "1.85", ...}``;
+    Price may also exist as a numeric. Returns None when the price
+    isn't readable.
+    """
+    do = sel.get("DisplayOdds")
+    if isinstance(do, dict):
+        v = do.get("Decimal")
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    p = sel.get("Price")
+    try:
+        return float(p) if p is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def pick_line_for_player_selections(
+    selections: list[dict[str, Any]],
+    target_player_name: str,
+    *,
+    direction: str = "over",
+    target_odds_band: tuple[float, float] = (1.7, 4.0),
+) -> Optional[dict[str, Any]]:
+    """Pick the best line for a player when a market lists multiple lines.
+
+    Real example (MUN vs LIV): "Player Over Fouls" has 5 lines for
+    Casemiro: Over 0.5 @ 1.18, Over 1.5 @ 1.84, Over 2.5 @ 3.49,
+    Over 3.5 @ 8.00, Over 4.5 @ 19.00. The narratively-right pick
+    is Over 1.5 (story = "he'll commit fouls", reads strong without
+    being lottery-shaped). The composer needs to pick ONE.
+
+    Heuristic v1: pick the selection whose decimal odds are closest
+    to the middle of the `target_odds_band`. The default band
+    `(1.7, 4.0)` corresponds to "narratively interesting without
+    being a lock or a lottery." Tightens to `(1.5, 2.5)` when
+    direction is "under" or for low-affinity legs (caller decides).
+
+    Returns the selected selection dict, or `None` when no selection
+    matches the target player.
+    """
+    if not selections or not target_player_name:
+        return None
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    target_lc = target_player_name.lower()
+    band_lo, band_hi = target_odds_band
+    band_mid = (band_lo + band_hi) / 2.0
+    for sel in selections:
+        sname = (sel.get("Name") or sel.get("BetslipLine") or "").strip()
+        if target_lc not in sname.lower():
+            continue
+        # If filtering by direction (e.g. "over"), match in the name
+        if direction and direction.lower() not in sname.lower():
+            # Some markets don't encode direction in selection name
+            # (e.g. Anytime Goalscorer is yes-only). Skip the filter
+            # then — no penalty.
+            if direction == "yes":
+                pass
+            else:
+                # Skip selections that don't match the requested direction
+                # for OU-style markets where direction IS in the name.
+                if "over" in sname.lower() or "under" in sname.lower():
+                    continue
+        odds = _decimal_odds(sel)
+        if odds is None or odds <= 1.0:
+            # Skip unprice-able / break-even
+            continue
+        # Distance from band midpoint, with bonus when inside the band.
+        dist = abs(odds - band_mid)
+        if band_lo <= odds <= band_hi:
+            dist *= 0.5  # prefer in-band
+        candidates.append((dist, sel))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0][1]
+
+
+def pick_line_for_match_market(
+    selections: list[dict[str, Any]],
+    *,
+    direction: str = "over",
+    target_odds_band: tuple[float, float] = (1.6, 2.5),
+) -> Optional[dict[str, Any]]:
+    """Pick the main line for a match-level OU/AH market when multiple
+    lines exist (e.g. Cards FT O/U with one line at 4.5; FT O/U with
+    lines at 0.5/1.5/2.5/3.5/4.5).
+
+    Tighter band than player props because match-level lines should
+    feel like the "book line" — close to even-money. Returns the
+    selection in the requested direction whose odds are closest to
+    the band midpoint.
+    """
+    if not selections:
+        return None
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    band_lo, band_hi = target_odds_band
+    band_mid = (band_lo + band_hi) / 2.0
+    direction_lc = (direction or "").lower()
+    for sel in selections:
+        sname = (sel.get("Name") or "").strip().lower()
+        if direction_lc and direction_lc not in sname:
+            # Direction-encoded selection (Over/Under/Home/Away)
+            continue
+        odds = _decimal_odds(sel)
+        if odds is None or odds <= 1.0:
+            continue
+        dist = abs(odds - band_mid)
+        if band_lo <= odds <= band_hi:
+            dist *= 0.5
+        candidates.append((dist, sel))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0][1]
+
+
 def _candidate_legs_for_market(
     market: dict[str, Any],
     meta: MarketMeta,
@@ -308,13 +429,28 @@ def _candidate_legs_for_market(
     sel_name: Optional[str] = None
     sel_is_bb_eligible: bool = False
     if meta.entity_scope == ENTITY_PLAYER and thesis.subject_player_name:
-        for sel in selections:
-            sname = (sel.get("Name") or sel.get("BetslipLine") or "").strip()
-            if thesis.subject_player_name.lower() in sname.lower():
-                sel_id = sel.get("Id") or sel.get("_id")
-                sel_name = sname
-                sel_is_bb_eligible = bool(sel.get("IsBetBuilderAvailable"))
-                break
+        # Player markets often list one selection per (player, line)
+        # pair — e.g. Casemiro Over 0.5/1.5/2.5/3.5/4.5 fouls. Use the
+        # line picker to choose narratively-right line.
+        is_ou_player = (meta.claim_shape == "over_under")
+        if is_ou_player:
+            sel = pick_line_for_player_selections(
+                selections, thesis.subject_player_name,
+                direction="over",
+            )
+        else:
+            # Yes/no player markets (Anytime Goalscorer, To Be Booked)
+            # have one selection per player.
+            sel = None
+            for s in selections:
+                sname = (s.get("Name") or s.get("BetslipLine") or "").strip()
+                if thesis.subject_player_name.lower() in sname.lower():
+                    sel = s
+                    break
+        if sel is not None:
+            sel_id = sel.get("Id") or sel.get("_id")
+            sel_name = (sel.get("Name") or sel.get("BetslipLine") or "").strip()
+            sel_is_bb_eligible = bool(sel.get("IsBetBuilderAvailable"))
         if sel_id is None:
             return []  # subject player not present — drop this market
     else:
