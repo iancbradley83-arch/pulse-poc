@@ -128,27 +128,37 @@ Symptom:
 - `[ops-bot] WARN — feed has N cards (<5)` or `> 80% same hook_type` with `[FEED] [RERUN] [DISMISS]`.
 
 What it means:
-- Either content drained out (kickoffs passed, no fresh fixtures scouted) or the engine is stuck on one hook type (lack of variety).
+- Either content drained out (kickoffs passed, no fresh fixtures scouted), the engine is stuck on one hook type, OR the catalogue is stale (long-running deploy, all kickoffs in the past — see incident `incidents/2026-05-03-empty-feed-stale-catalogue.md`).
 
-First move:
+First move (90 seconds):
 1. Tap `[FEED]` — see the hook + league mix + missing-prices counts.
 2. `/breakdown` — confirm engine cycles ran today and produced candidates.
 3. `/env PULSE_RERUN_ENABLED` — make sure engine isn't paused.
+4. `/status` — note `Deploy:` age. **If the deploy is older than ~24h, suspect a stale catalogue first.**
 
-Common causes:
-- **Engine paused** — `/resume`.
-- **News cache stale, no new fixtures** — `/rerun` to force a cycle.
-- **Catalogue cap reached** (`ROGUE_CATALOGUE_MAX_EVENTS=10`) and most are post-kickoff — wait for catalogue refresh. No phone fix.
+Common causes & phone fix:
 
-Phone fix:
-- `/resume` if paused. `/rerun` then check `/feed` 60-90 seconds later. `/snooze feed 1h` if you're choosing to live with it briefly.
+| Cause | Signal | Phone fix |
+|---|---|---|
+| Engine paused | `/env` shows `PULSE_RERUN_ENABLED=false` | `/resume`. (Currently broken — see ⚠️ below.) |
+| News cache stale, fresh fixtures available | `/breakdown` shows recent cycles produced 0 candidates but eligible > 0 | `/rerun`, recheck `/feed` after 60–90s |
+| **Stale catalogue** (deploy >24h old, all kickoffs in past) | `/breakdown` shows `eligible=0` every cycle; `/status` shows old deploy | `/redeploy` — fresh boot reloads today's catalogue. Periodic refresh runs every 4h since 2026-05-03 (PR #113), so this is rarer now. |
+| Catalogue cap reached & most post-kickoff | `/feed` empty but `/breakdown` shows engine ran | Wait for next catalogue refresh (≤4h). No phone fix. |
+| Cost tripwire fired | `/breakdown` shows daily ≥ $3 | `/snooze cost 6h` won't help — laptop work. |
+
+Why `/rerun` might not unstick this:
+- `/rerun` triggers tier-loop fan-out, but each tier still filters fixtures by kickoff window. If the catalogue is stale (every fixture in the past), the tiers all see `eligible=0` and the engine bypasses every cycle. The bot will report `rerun: done — engine will run on next cycle`, but the next cycle does nothing. **Always verify with `/feed` 60-90s after `/rerun`** — silence-then-success pattern means real recovery; silence-then-still-empty means staleness or another root cause.
 
 Escalate to laptop if:
-- Repeated `/rerun` produces 0 candidates over 2 cycles (engine bug or quality gate stuck).
+- After `/redeploy`, `[catalogue-refresh] swapped — fixtures=0` repeats across two cycles (Rogue-side issue, our /v1/multilanguage/events query, or a regional outage).
+- Repeated `/rerun` produces 0 candidates over 2 cycles WITH eligible > 0 (engine bug or quality gate stuck).
 - Hook diversity stays collapsed across days (storyline mix needs tuning).
 
 Learning step:
-- Note in an incident: which conditions triggered the alert (counts, league mix); whether `/rerun` recovered.
+- Open an incident: `/incident start "feed empty YYYY-MM-DD"`.
+- Capture: deploy age at trigger, eligible count from cycle log, whether `/rerun` or `/redeploy` recovered. Close after.
+
+> ⚠️ **Bot variableUpsert bug (open, not a token issue).** `/resume`, `/pause`, `/flag` send Railway's `variableUpsert` mutation with `environmentId: "production"` (the name) instead of the environment UUID. Railway returns generic `Not Authorized`, which looks like a token-permission failure but isn't — the rotated 30 Apr token has full read+write, verified by directly upserting `PULSE_RERUN_ENABLED=true` post-incident. **Do not regenerate the token; it will not help.** Fix is a few lines in `ops-bot/` to look up the env UUID once and pass it through. Until then, those phone commands are degraded. See incident `2026-05-03-empty-feed-stale-catalogue.md`.
 
 ---
 
