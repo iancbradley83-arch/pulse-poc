@@ -252,12 +252,18 @@ def test_meta_no_duplicate_keys():
 
 
 def _market(_id, name, selections=None):
+    """Default selections are BB-eligible so existing tests continue to
+    exercise the multi-leg combo path under the new default
+    `require_bb_eligibility=True`. Tests that need non-BB-eligible
+    selections pass them explicitly."""
     return {
         "_id": _id,
         "Name": name,
         "Selections": selections or [
-            {"Id": f"{_id}-s0", "Name": "Yes"},
-            {"Id": f"{_id}-s1", "Name": "No"},
+            {"Id": f"{_id}-s0", "Name": "Yes",
+             "IsBetBuilderAvailable": True},
+            {"Id": f"{_id}-s1", "Name": "No",
+             "IsBetBuilderAvailable": True},
         ],
     }
 
@@ -375,6 +381,152 @@ def test_composer_does_not_explode_on_empty_pool():
     )
     thesis = build_thesis(n)
     assert compose_candidates(thesis, []) == []
+
+
+def test_composer_bb_eligibility_drops_non_eligible_legs():
+    """When require_bb_eligibility=True (default), a market whose
+    selections all have IsBetBuilderAvailable=False must not contribute
+    to a multi-leg combo. Mirrors the live MUN vs LIV finding: Player
+    To Be Booked is 0/51 BB-eligible — combos can't contain it."""
+    n = _news(
+        headline="Casemiro one yellow from suspension; target him",
+        summary="Booked in 5 of 6.",
+        hook=HookType.PREVIEW,
+        mentions=["Casemiro"],
+        injury_details=[{"player_name": "Casemiro", "team": "Manchester United",
+                         "position_guess": "defensive_mid", "is_out_confirmed": False}],
+    )
+    thesis = build_thesis(n)
+    pool = [
+        # BB-eligible: Cards FT O/U
+        {"_id": "m-cards", "Name": "Cards FT O/U",
+         "Selections": [{"Id": "c-o", "Name": "Over",
+                         "IsBetBuilderAvailable": True},
+                        {"Id": "c-u", "Name": "Under",
+                         "IsBetBuilderAvailable": True}]},
+        # BB-eligible: 1H Cards
+        {"_id": "m-1hcards", "Name": "Cards 1st Half O/U",
+         "Selections": [{"Id": "h-o", "Name": "Over",
+                         "IsBetBuilderAvailable": True},
+                        {"Id": "h-u", "Name": "Under",
+                         "IsBetBuilderAvailable": True}]},
+        # BB-eligible: Match fouls
+        {"_id": "m-fouls", "Name": "Total Match Fouls",
+         "Selections": [{"Id": "f-o", "Name": "Over",
+                         "IsBetBuilderAvailable": True}]},
+        # NOT BB-eligible: Player To Be Booked (matches live shape)
+        {"_id": "m-pbook", "Name": "Player To Be Booked",
+         "Selections": [{"Id": "p-1", "Name": "Casemiro",
+                         "IsBetBuilderAvailable": False}]},
+    ]
+    combos = compose_candidates(
+        thesis, pool, target_legs=4, min_legs=2,
+        require_bb_eligibility=True,
+        emit_singles_for_subject_misses=False,
+    )
+    bb_combos = [c for c in combos if c.bet_shape == "bet_builder"]
+    assert bb_combos, "should produce at least one BB combo from BB-eligible pool"
+    for combo in bb_combos:
+        for leg in combo.legs:
+            assert leg.market_meta_key != "player_to_be_booked", (
+                f"non-BB-eligible leg leaked into BB combo: {leg.market_meta_key}"
+            )
+
+
+def test_composer_emits_singles_for_subject_player_misses():
+    """Subject-player non-BB-eligible legs surface as `single`
+    Combinations so the narrative still appears — just split into its
+    own card downstream."""
+    n = _news(
+        headline="Casemiro one yellow from suspension; target him",
+        summary="Booked in 5 of 6 games.",
+        hook=HookType.PREVIEW,
+        mentions=["Casemiro"],
+        injury_details=[{"player_name": "Casemiro", "team": "Manchester United",
+                         "position_guess": "defensive_mid", "is_out_confirmed": False}],
+    )
+    thesis = build_thesis(n)
+    pool = [
+        {"_id": "m-cards", "Name": "Cards FT O/U",
+         "Selections": [{"Id": "c-o", "Name": "Over",
+                         "IsBetBuilderAvailable": True},
+                        {"Id": "c-u", "Name": "Under",
+                         "IsBetBuilderAvailable": True}]},
+        {"_id": "m-pbook", "Name": "Player To Be Booked",
+         "Selections": [{"Id": "p-1", "Name": "Casemiro",
+                         "IsBetBuilderAvailable": False}]},
+        {"_id": "m-pcarded", "Name": "Player To Be Carded First",
+         "Selections": [{"Id": "p-2", "Name": "Casemiro (Manchester United)",
+                         "IsBetBuilderAvailable": False}]},
+    ]
+    combos = compose_candidates(
+        thesis, pool, target_legs=3, min_legs=2,
+        require_bb_eligibility=True,
+        emit_singles_for_subject_misses=True,
+    )
+    singles = [c for c in combos if c.bet_shape == "single"]
+    assert singles, "subject-player non-BB-eligible legs should surface as singles"
+    for s in singles:
+        assert len(s.legs) == 1
+        assert "casemiro" in (s.legs[0].selection_name or "").lower()
+
+
+def test_composer_singles_capped_at_two_per_thesis():
+    n = _news(
+        headline="Casemiro one yellow from suspension; target him",
+        hook=HookType.PREVIEW,
+        mentions=["Casemiro"],
+        injury_details=[{"player_name": "Casemiro", "team": "Manchester United",
+                         "position_guess": "defensive_mid", "is_out_confirmed": False}],
+    )
+    thesis = build_thesis(n)
+    pool = [
+        {"_id": f"m-p{i}", "Name": "Player To Be Booked",
+         "Selections": [{"Id": f"p-{i}", "Name": "Casemiro",
+                         "IsBetBuilderAvailable": False}]}
+        for i in range(5)
+    ] + [
+        {"_id": f"m-f{i}", "Name": "Player Over Fouls",
+         "Selections": [{"Id": f"f-{i}", "Name": "Casemiro Over 3.5",
+                         "IsBetBuilderAvailable": False}]}
+        for i in range(5)
+    ]
+    combos = compose_candidates(thesis, pool, require_bb_eligibility=True,
+                                 emit_singles_for_subject_misses=True)
+    singles = [c for c in combos if c.bet_shape == "single"]
+    assert len(singles) <= 2
+
+
+def test_composer_bb_disabled_includes_non_bb_legs():
+    """When require_bb_eligibility=False, the composer can pick non-BB
+    legs in multi-leg combos (e.g. for system bets)."""
+    n = _news(
+        headline="Casemiro one yellow from suspension",
+        hook=HookType.PREVIEW,
+        mentions=["Casemiro"],
+        injury_details=[{"player_name": "Casemiro", "team": "Manchester United",
+                         "position_guess": "defensive_mid", "is_out_confirmed": False}],
+    )
+    thesis = build_thesis(n)
+    pool = [
+        {"_id": "m-cards", "Name": "Cards FT O/U",
+         "Selections": [{"Id": "c-o", "Name": "Over",
+                         "IsBetBuilderAvailable": True},
+                        {"Id": "c-u", "Name": "Under",
+                         "IsBetBuilderAvailable": True}]},
+        {"_id": "m-pbook", "Name": "Player To Be Booked",
+         "Selections": [{"Id": "p-1", "Name": "Casemiro",
+                         "IsBetBuilderAvailable": False}]},
+    ]
+    combos = compose_candidates(thesis, pool, target_legs=2, min_legs=2,
+                                 require_bb_eligibility=False)
+    bb_combos = [c for c in combos if c.bet_shape == "bet_builder"]
+    assert bb_combos, "should produce a multi-leg combo when BB-eligibility not required"
+    mixed_found = any(
+        any(l.market_meta_key == "player_to_be_booked" for l in c.legs)
+        for c in bb_combos
+    )
+    assert mixed_found
 
 
 def test_composer_rejects_combos_with_signal_conflict():
